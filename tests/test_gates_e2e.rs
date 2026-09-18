@@ -114,10 +114,37 @@ fn unanalysed_languages_are_named_not_silently_passed() {
         "tests/b.rs",
         "#[test]\nfn real() { assert_eq!(2 * 2, 4); }\n",
     );
-    rust_only.commit("test: add");
-    assert!(!rust_only.check(&[]).outcome("vacuous-tests")["notes"]
+    rust_only.commit("test: rust");
+    let rust_run = rust_only.check(&[]);
+    assert_eq!(rust_run.code, 0);
+    assert!(!rust_run.outcome("assertion-reduction")["notes"]
         .to_string()
         .contains("NOT analysed"));
+}
+
+#[test]
+fn unsupported_source_files_include_phpt_and_group_by_extension() {
+    let repo = Repo::new();
+    repo.write("ext/judy.c", "void foo() {}\n");
+    repo.write("ext/judy.h", "#define FOO 1\n");
+    repo.write("tests/001.phpt", "--TEST--\ntest\n");
+    repo.commit("feat: c and phpt");
+    let run = repo.check(&[]);
+    assert_eq!(run.code, 0);
+    for gate in [
+        "assertion-reduction",
+        "vacuous-tests",
+        "ignored-tests",
+        "unsafe-safety-comment",
+    ] {
+        let notes = run.outcome(gate)["notes"].to_string();
+        assert!(
+            notes.contains("3 changed source file(s)")
+                && notes.contains("2 .c/.h, 1 .phpt")
+                && notes.contains("NOT analysed"),
+            "gate {gate} should format extension breakdown: {notes}"
+        );
+    }
 }
 
 // ---- vacuous-tests ---------------------------------------------------------

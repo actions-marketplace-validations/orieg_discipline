@@ -104,6 +104,39 @@ pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
         unsafe_safety_comment(ctx, &rust)?,
     ];
 
+    fn format_unsupported_breakdown(paths: &[&str]) -> String {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for p in paths {
+            let ext = p.rsplit('.').next().unwrap_or("");
+            *counts.entry(ext).or_default() += 1;
+        }
+        let c_count = counts.remove("c").unwrap_or(0);
+        let h_count = counts.remove("h").unwrap_or(0);
+        let ch_count = c_count + h_count;
+
+        let mut cpp_count = 0;
+        for k in ["cpp", "cc", "cxx", "hpp", "hh"] {
+            cpp_count += counts.remove(k).unwrap_or(0);
+        }
+
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        if ch_count > 0 {
+            groups.push((".c/.h".to_string(), ch_count));
+        }
+        if cpp_count > 0 {
+            groups.push((".cpp/.hpp".to_string(), cpp_count));
+        }
+        for (ext, count) in counts {
+            groups.push((format!(".{ext}"), count));
+        }
+        groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        groups
+            .into_iter()
+            .map(|(ext, count)| format!("{count} {ext}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     // Named degradation: source files in a language with no extractor were
     // not analysed. Saying so keeps "0 violations" from reading as coverage.
     let unseen: Vec<&str> = changed
@@ -112,6 +145,7 @@ pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
         .map(|f| f.path.as_str())
         .collect();
     if !unseen.is_empty() {
+        let breakdown = format_unsupported_breakdown(&unseen);
         let sample = unseen
             .iter()
             .take(3)
@@ -119,7 +153,7 @@ pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
             .collect::<Vec<_>>()
             .join(", ");
         let note = format!(
-            "{} changed source file(s) are in a language with no extractor yet and were NOT \
+            "{} changed source file(s) are in a language with no extractor yet ({breakdown}) and were NOT \
              analysed by this gate (e.g. {sample})",
             unseen.len()
         );

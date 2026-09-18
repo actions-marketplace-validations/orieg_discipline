@@ -24,7 +24,7 @@ pub enum Language {
 /// touching these is *named* in the report: the AST gates did not look at it.
 const UNSUPPORTED_SOURCE_EXTS: &[&str] = &[
     "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "java", "kt", "kts", "scala", "go", "c", "h",
-    "cc", "cpp", "cxx", "hpp", "hh", "cs", "rb", "swift", "php", "m", "mm",
+    "cc", "cpp", "cxx", "hpp", "hh", "cs", "rb", "swift", "php", "phpt", "m", "mm",
 ];
 
 pub fn language_for(path: &str) -> Option<Language> {
@@ -641,6 +641,7 @@ unsafe impl Sync for X {}
         assert_eq!(language_for("src/a.py"), None);
         assert!(is_unsupported_source("pkg/mod/a.py"));
         assert!(is_unsupported_source("web/App.tsx"));
+        assert!(is_unsupported_source("tests/001.phpt"));
         assert!(!is_unsupported_source("src/a.rs"));
         assert!(!is_unsupported_source("docs/plan.md"));
         assert!(!is_unsupported_source("Makefile"));
