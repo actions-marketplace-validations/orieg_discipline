@@ -8,7 +8,7 @@ use crate::ast::{
 use crate::config::GateSettings;
 use crate::gitctx::{ChangeKind, ChangedFile};
 use crate::tokens::{self, covers, directive_reasons};
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 
 struct FileFacts {
     file: ChangedFile,
@@ -52,14 +52,39 @@ pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
         .iter()
         .filter(|f| language_for(&f.path).is_some() || language_for(&f.old_path).is_some())
     {
-        let base = match ctx.git.base_content(&file.old_path)? {
-            Some(src) => Some(analyze(&src, &vocab)?),
+        let base = match ctx.git.base_bytes(&file.old_path)? {
+            Some(bytes) => {
+                if bytes.contains(&0) {
+                    bail!(
+                        "source file `{}` on base contains a NUL byte; refusing to analyze corrupted or binary source",
+                        file.old_path
+                    );
+                }
+                let src = String::from_utf8(bytes).map_err(|e| {
+                    anyhow!(
+                        "source file `{}` on base is not valid UTF-8: {e}",
+                        file.old_path
+                    )
+                })?;
+                Some(analyze(&src, &vocab)?)
+            }
             None => None,
         };
         let head = match file.kind {
             ChangeKind::Deleted => None,
-            _ => match ctx.git.head_content(&file.path)? {
-                Some(src) => Some(analyze(&src, &vocab)?),
+            _ => match ctx.git.head_bytes(&file.path)? {
+                Some(bytes) => {
+                    if bytes.contains(&0) {
+                        bail!(
+                            "source file `{}` contains a NUL byte; refusing to analyze corrupted or binary source",
+                            file.path
+                        );
+                    }
+                    let src = String::from_utf8(bytes).map_err(|e| {
+                        anyhow!("source file `{}` is not valid UTF-8: {e}", file.path)
+                    })?;
+                    Some(analyze(&src, &vocab)?)
+                }
                 None => None,
             },
         };

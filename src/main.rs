@@ -76,6 +76,18 @@ fn load_config(args: &ConfigArgs, repo_root: Option<&Path>) -> Result<(Disciplin
     let config_path_for_ctx = config_path_for_ctx.trim_start_matches("./").to_string();
 
     if resolved_path.exists() {
+        let bytes = std::fs::read(&resolved_path).with_context(|| {
+            format!(
+                "failed to read configuration file {}",
+                resolved_path.display()
+            )
+        })?;
+        if bytes.contains(&0) {
+            bail!(
+                "configuration file {} contains a NUL byte",
+                resolved_path.display()
+            );
+        }
         let config = DisciplineConfig::resolve(Some(&resolved_path), &overrides)?;
         Ok((config, config_path_for_ctx))
     } else if explicit {

@@ -677,3 +677,71 @@ fn config_override_flag_compares_against_base_config() {
         run.stdout
     );
 }
+
+#[test]
+fn md_file_with_nul_byte_still_fires_time_estimates() {
+    let repo = Repo::new();
+    repo.write("docs/roadmap.md", "Ships in 3 weeks.\0\n");
+    repo.commit("docs: add roadmap");
+    let run = repo.check(&[]);
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.titles("time-estimates").len(), 1);
+}
+
+#[test]
+fn md_file_with_nul_byte_still_fires_pii() {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-q", "main"]);
+    repo.write(
+        "discipline.toml",
+        "[meta]\nversion = 1\nname = \"demo\"\n\n[gates.pii]\nenabled = true\nhostname_denylist = [\"leaked-host.corp\"]\nexempt_paths = [\"discipline.toml\"]\n",
+    );
+    repo.commit("chore: add discipline.toml");
+    repo.git(&["checkout", "-q", "-B", "work"]);
+
+    repo.write("docs/secret.md", "Host is leaked-host.corp.\0\n");
+    repo.commit("docs: add secret");
+    let run = repo.check(&[]);
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.titles("pii").len(), 1);
+}
+
+#[test]
+fn rs_file_with_nul_byte_fails_closed_exit_2() {
+    let repo = Repo::new();
+    repo.write("src/bad.rs", "pub fn foo() {}\0");
+    repo.commit("feat: add bad.rs");
+    let run = repo.check(&[]);
+    assert_eq!(
+        run.code, 2,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+}
+
+#[test]
+fn discipline_toml_with_nul_byte_fails_closed_exit_2() {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-q", "main"]);
+    repo.write(
+        "discipline.toml",
+        "[meta]\nversion = 1\nname = \"demo\"\0\n",
+    );
+    repo.commit("chore: add bad discipline.toml");
+    repo.git(&["checkout", "-q", "-B", "work"]);
+
+    let run = repo.check(&[]);
+    assert_eq!(
+        run.code, 2,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+}
