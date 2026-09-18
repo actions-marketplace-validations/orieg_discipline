@@ -1,0 +1,157 @@
+# discipline
+
+**CI gatekeeper and AI coding agent diff sentinel.** One static binary, the same in GitHub Actions, Gitea Actions, a pre-commit hook, and an agent's inner loop.
+
+Coding agents in an iterate-until-green loop weaken assertions, add tests that assert nothing, mark tests `#[ignore]`, delete what is in the way, drop `// SAFETY:` comments, and — when a gate blocks them — edit the gate. `discipline` inspects the *change* (tree-sitter over a `git2` merge-base diff) and refuses those moves, with the fail-closed engineering distilled from [`orieg/expanse`](https://github.com/orieg/expanse).
+
+> **Status: pre-release.** No version is published yet. Ten gates are implemented and tested; verification and benchmark gates are planned and the binary refuses to pretend otherwise. See [`docs/PRD.md`](docs/PRD.md) for the roadmap and §11 for known limits.
+
+## Gates
+
+`discipline gates` prints this table with each gate's effective state.
+
+| Gate | Suite | Languages | Rule |
+|---|---|---|---|
+| `assertion-reduction` | agent-guard | Rust | assertion count and strength may not drop in an existing test |
+| `vacuous-tests` | agent-guard | Rust | a new test needs a non-tautological assertion |
+| `ignored-tests` | agent-guard | Rust | a test may not become `#[ignore]` |
+| `unsafe-safety-comment` | agent-guard | Rust | `unsafe` needs a `// SAFETY:` comment; deleting one is caught |
+| `deletion-rationale` | agent-guard | any | deleted files and removed tests need a scoped `removes:` |
+| `agents-md` | agent-guard | any | `AGENTS.md` exists; `CLAUDE.md` / `GEMINI.md` do not fork it |
+| `time-estimates` | hygiene | any | no calendar or duration estimates in markdown or the PR body |
+| `pii` | hygiene | any | no home paths, LAN addresses, or denylisted hostnames in tracked text |
+| `agent-scratch` | hygiene | any | agent scratch state is never tracked |
+| `config-integrity` | integrity | any | a change cannot weaken its own `discipline.toml` without saying so |
+
+Six gates work on a repository in any language. The four AST gates use a per-language pack; Rust ships today, and Python, JavaScript / TypeScript, Java / Kotlin, C / C++ and Go are planned. When a change touches source in a language without a pack, the AST gates **say so in the report** rather than showing a clean zero.
+
+## Fail-closed by construction
+
+- Exit `0` pass, `1` violations, **`2` could not check**. An unresolvable base ref, a shallow clone, a missing repository, or a bad config is `2`, never an empty diff.
+- Every report lists each gate's state and **how many items it examined**, plus the planned gates under "not checked".
+- A planned gate cannot be enabled. Unknown config keys are errors.
+- Override directives are line-anchored and scoped: prose *about* a directive never arms it.
+
+## Use it
+
+### GitHub Actions
+
+```yaml
+jobs:
+  discipline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # the merge base must be reachable
+      - uses: orieg/discipline@v0
+```
+
+### Gitea Actions
+
+The action is shell-only (no JavaScript runtime), so the same step works under `act_runner`. For runners without internet access, build or mirror the binary and pass `binary_path` or `download_url`.
+
+```yaml
+      - uses: https://github.com/orieg/discipline@v0
+        with:
+          binary_path: /opt/discipline/discipline
+```
+
+### pre-commit
+
+```yaml
+repos:
+  - repo: https://github.com/orieg/discipline
+    rev: v0.1.0
+    hooks:
+      - id: discipline            # builds with cargo; `discipline-system` uses a binary on PATH
+```
+
+Or as a plain git hook: `discipline check --staged`. Staged mode runs before a commit message exists, so findings that an override directive could lift are warnings locally and errors in CI.
+
+### CLI
+
+```bash
+discipline check --base origin/main        # everything, against the merge base
+```
+
+```bash
+discipline check --staged                  # the index against HEAD
+```
+
+```bash
+discipline gates                           # registry and effective state
+```
+
+```bash
+discipline self-test                       # embedded positive / negative controls
+```
+
+## Configuration
+
+With no configuration, every available gate runs at severity `error`. Everything is tunable, and nothing turns off silently: a disabled gate shows as `OFF` in every report.
+
+Precedence, lowest to highest: built-in defaults → `discipline.toml` → `config_override` → `enable` / `disable` → `DISCIPLINE_HOSTNAME_DENYLIST`. Tables merge, **lists append**, scalars replace.
+
+```toml
+[meta]
+version = 1
+name = "my-project"
+
+[gates.time-estimates]
+enabled = false                        # any gate can be switched off ...
+
+[gates.vacuous-tests]
+severity = "warning"                   # ... or reported without blocking
+assert_helper_fns = ["check_invariants"]
+
+[gates.pii]
+lan_ips = false
+hostname_denylist = ["buildbox-7"]     # whole-token, never echoed in reports
+extra_patterns = ['[a-z0-9._-]+@corp\.example']
+exempt_paths = ["docs/archive/**"]
+```
+
+The same from a workflow, without touching the file:
+
+```yaml
+      - uses: orieg/discipline@v0
+        with:
+          disable: time-estimates
+          hostname_denylist: ${{ secrets.DOCS_HOSTNAME_DENYLIST }}
+          fail_on_warnings: true
+          config_override: |
+            [gates.pii]
+            extra_patterns = ['[a-z0-9._-]+@corp\.example']
+```
+
+A single line can opt out with `discipline:allow(<gate-id>)` (for markdown, inside an HTML comment). The report counts how many lines did.
+
+Loosening an existing `discipline.toml` (disabling a gate, lowering a severity, growing an exemption list, shrinking a denylist) is itself a violation of `config-integrity` unless the change says why. Full schema: [`docs/PRD.md` §5](docs/PRD.md).
+
+## Override directives
+
+On its own line in the PR body or a commit message; the reason must name what it covers.
+
+```
+removes: tests/legacy replaced by the property suite
+allow-assertion-drop: inserts_in_order second case moved to proptest
+allow-ignore: big_alloc needs the new allocator first
+allow-gate-weakening: vacuous-tests suite asserts through snapshot macros
+```
+
+## Action outputs
+
+`status`, `errors`, `warnings`, `failed_gates`, `report` (path of the JSON report), `install_error`.
+
+## Development
+
+```bash
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+```
+
+Every gate needs a unit test, an end-to-end test through the binary, a mutation that the suite kills, and a `self-test` case; see [`AGENTS.md`](AGENTS.md) §3.4. Releases are cut by pushing a `vX.Y.Z` tag ([`docs/PRD.md` §8.2](docs/PRD.md)).
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
