@@ -68,17 +68,22 @@ pub fn covers(reasons: &[String], subject: &str) -> bool {
 
 fn reason_names(reason: &str, subject: &str) -> bool {
     let is_token_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
-    let tokens = reason
+    let raw_tokens = reason
         .split(|c: char| !is_token_char(c))
-        .map(|t| t.trim_matches(|c| matches!(c, '.' | '/')))
         .filter(|t| !t.is_empty());
     let file_name = subject.rsplit('/').next().unwrap_or(subject);
-    for token in tokens {
+    for raw_token in raw_tokens {
+        let has_slash = raw_token.contains('/');
+        let token = raw_token.trim_matches(|c| matches!(c, '.' | '/'));
+        if token.is_empty() {
+            continue;
+        }
         if token == subject || token == file_name {
             return true;
         }
-        // Directory prefix: `removes: tests/legacy ...` covers tests/legacy/a.rs.
-        if subject.contains('/') && subject.starts_with(&format!("{token}/")) {
+        // Directory prefix: only when written with a slash (e.g. `tests/legacy` or `tests/`).
+        // A bare word like `tests` in ordinary prose never acts as a directory prefix.
+        if has_slash && subject.contains('/') && subject.starts_with(&format!("{token}/")) {
             return true;
         }
     }
@@ -172,6 +177,16 @@ removes: tests/old.rs inside a fence
         let by_name = directive_reasons("removes: old.rs, moved", REMOVES);
         assert!(covers(&by_name, "tests/old.rs"));
         assert!(!covers(&by_name, "tests/very_old.rs"));
+
+        // A bare word must NOT act as a directory prefix.
+        let bare = directive_reasons("removes: tests were refactored into benchmarks", REMOVES);
+        assert!(!covers(&bare, "tests/a.rs"));
+        assert!(!covers(&bare, "tests/legacy/a.rs"));
+
+        // But an explicit directory prefix with a slash DOES cover it.
+        let with_slash =
+            directive_reasons("removes: tests/ were refactored into benchmarks", REMOVES);
+        assert!(covers(&with_slash, "tests/a.rs"));
     }
 
     #[test]
