@@ -782,3 +782,75 @@ fn discipline_toml_with_nul_byte_fails_closed_exit_2() {
         run.stdout, run.stderr
     );
 }
+
+#[test]
+fn empty_tree_first_commit_staged_mode_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = dir.path();
+    std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(repo_path)
+        .status()
+        .unwrap();
+
+    let doc_path = repo_path.join("docs/plan.md");
+    std::fs::create_dir_all(doc_path.parent().unwrap()).unwrap();
+    std::fs::write(&doc_path, "# Plan\n\nPhase 1 then Phase 2.\n").unwrap();
+
+    std::fs::write(repo_path.join("AGENTS.md"), "# Agent Guide\n").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("AGENTS.md", repo_path.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", repo_path.join("GEMINI.md")).unwrap();
+    }
+
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_path)
+        .status()
+        .unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_discipline"));
+    cmd.args(["check", "--staged", "--format", "json"])
+        .current_dir(repo_path);
+    for var in [
+        "PR_BODY",
+        "GITHUB_STEP_SUMMARY",
+        "DISCIPLINE_CONFIG",
+        "DISCIPLINE_CONFIG_OVERRIDE",
+        "DISCIPLINE_ENABLE",
+        "DISCIPLINE_DISABLE",
+        "DISCIPLINE_BASE_REF",
+        "DISCIPLINE_FAIL_ON_WARNINGS",
+        "DISCIPLINE_HOSTNAME_DENYLIST",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["base"], "empty tree (first commit)");
+}
+
+#[test]
+fn empty_repo_unstaged_mode_fails_closed_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_path = dir.path();
+    std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(repo_path)
+        .status()
+        .unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_discipline"));
+    cmd.args(["check", "--base", "main", "--format", "json"])
+        .current_dir(repo_path);
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
