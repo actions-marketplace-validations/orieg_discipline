@@ -135,7 +135,12 @@ impl MarkdownTableTracker {
     }
 }
 
-fn is_exempt_time_estimate(line: &str, hit_start: usize, hit_end: usize, matched: &str) -> bool {
+pub(crate) fn is_exempt_time_estimate(
+    line: &str,
+    hit_start: usize,
+    hit_end: usize,
+    matched: &str,
+) -> bool {
     let before = &line[..hit_start];
     let after = &line[hit_end..];
 
@@ -506,7 +511,12 @@ pub fn pii_rules(settings: &PiiGate) -> Result<Vec<PiiRule>> {
     Ok(rules)
 }
 
-fn is_exempt_lan_ip(ip_str: &str, line: &str, _match_start: usize, match_end: usize) -> bool {
+pub(crate) fn is_exempt_lan_ip(
+    ip_str: &str,
+    line: &str,
+    _match_start: usize,
+    match_end: usize,
+) -> bool {
     let parts: Vec<&str> = ip_str.split('.').collect();
     if parts.len() != 4 {
         return false;

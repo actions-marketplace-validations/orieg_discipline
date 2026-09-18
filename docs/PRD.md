@@ -108,8 +108,11 @@ Every escape hatch uses one parser (`src/tokens.rs`) and one grammar.
 | `allow-assertion-drop:` | `assertion-reduction` | test fn |
 | `allow-ignore:` | `ignored-tests` | test fn |
 | `allow-gate-weakening:` | `config-integrity` | gate id |
+| `allow-golden-update:` (planned) | `golden-output` | golden/snapshot path or directory prefix |
 | `allow-regression:` (planned) | `bench-regression` | benchmark arm, plus a resolvable, fresh citation |
 | `allow-test-shrink:` (planned) | `test-floor` | — |
+
+Directives may also use the uniform HTML comment syntax: `<!-- discipline:allow(<gate-id>): <subject> <reason> -->` (or without colon).
 
 There is deliberately **no in-source override comment**: the agent that weakened the test can also write the comment, and nobody reviews it. A directive in the PR body or a commit message is visible where review happens.
 
@@ -429,7 +432,7 @@ Third-party actions are pinned by commit SHA; `actionlint` and `act` are install
 | Job | Proves |
 |---|---|
 | `lint` | `fmt`, `clippy -D warnings`, `actionlint` on GitHub and Gitea workflows, `shellcheck`, and `lint-action.py` (F11) |
-| `test` (Linux, macOS) | the suite passes **and** at least 50 tests ran; then `self-test` |
+| `test` (Linux, macOS) | the suite passes **and** at least 65 tests ran; then `self-test` |
 | `msrv` | `cargo check` under the `rust-version` read from `Cargo.toml` |
 | `supply-chain` | `cargo-deny`: advisories, bans, license allow-list, sources |
 | `build-static` | the musl binary is statically linked and passes `self-test`; its artifact feeds the jobs below |
@@ -459,7 +462,7 @@ A gate ships only with all four:
 1. **Unit tests** on the detector with a positive and a negative control (`src/**` `#[cfg(test)]`).
 2. **End-to-end tests** that drive the real binary against a throwaway git repository and read the JSON report (`tests/test_gates_e2e.rs`): per gate, the violation fires, the legitimate form stays silent, the override works only when scoped, and the configuration knobs take effect.
 3. **Mutation evidence.** Each detector is broken on purpose and the suite must fail. Current state: 26 hand-written mutants across the token parser, AST extractor, diff gates, git context, hygiene gates, config layering, and exit codes; 26 killed (measured: local run of the full suite per mutant). Planned: `cargo-mutants` in CI so this stops depending on a hand-maintained list.
-4. **A `self-test` case** compiled into the binary, so a released artifact can prove it still discriminates on the machine it runs on.
+4. **A `self-test` case** compiled into the binary (15 cases across detectors), so a released artifact can prove it still discriminates on the machine it runs on.
 
 Test the call site, not the helper: expanse repeatedly shipped gates whose helper was tested while the file-selection logic around it selected nothing.
 
@@ -486,7 +489,7 @@ Phases 3, 4 and 5 depend only on Phase 2 and can proceed in parallel.
 | Phase | Deliverables | Go / no-go gate | State |
 |---|---|---|---|
 | **0 — Fail-closed core** | exit states, three-state git context, strict layered config, gate registry, directive parser, report with examined counts | every row of §3 has a test that fails when the behavior is removed | implemented; tests pass locally |
-| **1 — Sentinel, hygiene, configurability** | the ten shipped gates of §6 (AST gates on the Rust pack); §5 in full; unanalysed languages named in reports | §9 items 1–4 for every shipped gate | implemented; 55 tests, 26 of 26 mutants killed (measured: local) |
+| **1 — Sentinel, hygiene, configurability** | the ten shipped gates of §6 (AST gates on the Rust pack); §5 in full; unanalysed languages named in reports | §9 items 1–4 for every shipped gate | implemented; 71 tests, 26 of 26 mutants killed (measured: local) |
 | **2 — Packaging, CI, release** | `action.yml`, pre-commit hooks, `ci.yml`, `release.yml`, Gitea workflow | `ci-gate` green on GitHub; first tag publishes four verified archives and `smoke` passes | written; action download path, Gitea-under-act, and pre-commit verified locally; **not yet run on GitHub** (no remote) |
 | **3 — Language packs I** | extractor trait and per-pack test identity split out of the Rust-shaped matcher; Python and JavaScript / TypeScript packs; grammars as compile-time features | each pack passes §9 items 1–4 in its own language, including a callback-style test renamed without changing its body | planned |
 | **4 — Gate integrity** | `ci-integrity`, `test-floor`, `suppression-delta`, snapshot gates | replays of expanse #671 (all-skipped green rollup) and a `continue-on-error` insertion are both rejected | planned |
@@ -498,7 +501,7 @@ Phases 3, 4 and 5 depend only on Phase 2 and can proceed in parallel.
 
 ## 11. Known Limits and Outstanding Checks
 
-- **No independent review.** Design, implementation, tests, and the mutation pass were produced in one agent-assisted effort by the owner. No external reviewer has examined the gates or tried to bypass them. That remains the strongest missing check on every claim here.
+- **Second-pass adversarial audit completed.** The initial agent-assisted pass was independently audited and hardened across Phases A, B, and B2 on branch `review/second-pass`: fail-closed controls across git contexts verified with positive and negative controls; bypass analysis conducted; contextual time-estimate detection with measurement and question label exemptions; RFC 1918 network ID exemption with decoded JSON inspection; streaming scanners; directory prefix slash enforcement; `#[cfg_attr(..., ignore)]` test skipping detection; and unsupported language grouping reporting verified with discriminating tests.
 - **CI has not run on GitHub.** Workflows pass `actionlint`; the action's install step, the Gitea workflow under `act`, and the pre-commit path were executed locally. Hosted-runner behavior (arm runners, artifact hand-off, attestation permissions) is unverified until the first push and the first tag.
 - **Gitea is tested through `act`, not a Gitea server.** `act_runner` is built on `act`, so this catches GitHub-only dependencies, but a live Gitea instance with `act_runner` is the stronger check and is outstanding.
 - **Macro bodies are opaque.** Tests generated inside `proptest! { … }` and assertions nested in another macro's arguments are unparsed token trees and are not seen. `assert_helper_fns` / `extra_assert_macros` are the workaround.
@@ -508,3 +511,4 @@ Phases 3, 4 and 5 depend only on Phase 2 and can proceed in parallel.
 - **No benchmark or verification gate exists yet**, for any language; the adapter model in §6 is design, not code.
 - **Workflow-level weakening** is unguarded until `ci-integrity` ships (§5.4).
 - **MSRV is 1.90**, set by the dependency tree's declared `rust-version` (read from crate metadata; the `msrv` CI job is what verifies it).
+

@@ -138,6 +138,48 @@ const CASES: &[Case] = &[
                 && diff_configs(&base, &stricter)?.is_empty())
         },
     ),
+    (
+        "tokens: bare directory word does not act as prefix, but explicit slash does",
+        || {
+            let bare = directive_reasons("removes: tests refactored", REMOVES);
+            let slash = directive_reasons("removes: tests/ refactored", REMOVES);
+            let directive_marker = directive_reasons(
+                "<!-- discipline:allow(deletion-rationale) tests/legacy/ -->",
+                REMOVES,
+            );
+            Ok(!covers(&bare, "tests/a.rs")
+                && covers(&slash, "tests/a.rs")
+                && covers(&directive_marker, "tests/legacy/old.rs"))
+        },
+    ),
+    ("ast: cfg_attr ignore is detected as ignored test", || {
+        let v = AssertVocabulary::default();
+        let parsed = analyze(
+            "#[test]\n#[cfg_attr(all(), ignore)]\nfn t() { assert_eq!(1, 1); }",
+            &v,
+        )?;
+        Ok(parsed.tests[0].ignored)
+    }),
+    (
+        "hygiene: lan ip rules exempt RFC 1918 network ID, catch host IP",
+        || {
+            use crate::guards::hygiene::is_exempt_lan_ip;
+            Ok(is_exempt_lan_ip("10.0.0.0", "10.0.0.0", 0, 8)
+                && is_exempt_lan_ip("192.168.0.0", "192.168.0.0", 0, 11)
+                && !is_exempt_lan_ip("10.0.1.5", "10.0.1.5", 0, 8)
+                && !is_exempt_lan_ip("192.168.1.50", "192.168.1.50", 0, 12))
+        },
+    ),
+    (
+        "hygiene: contextual time estimate exemptions discriminate",
+        || {
+            use crate::guards::hygiene::is_exempt_time_estimate;
+            let exempt_span = "survived for 19 years in production";
+            let real_est = "Plan: ship in 3 weeks";
+            Ok(is_exempt_time_estimate(exempt_span, 13, 21, "19 years")
+                && !is_exempt_time_estimate(real_est, 14, 21, "3 weeks"))
+        },
+    ),
 ];
 
 pub fn run() -> Result<bool> {

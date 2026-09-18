@@ -57,7 +57,7 @@ jobs:
           # A filter, cfg, or harness change that selects zero tests exits 0.
           total="$(grep -Eo 'test result: ok\. [0-9]+ passed' test.log | awk '{ s += $4 } END { print s + 0 }')"
           echo "tests passed: ${total}"
-          [ "${total}" -ge 50 ] || { echo "::error::only ${total} tests ran; the floor is 50"; exit 1; }
+          [ "${total}" -ge 65 ] || { echo "::error::only ${total} tests ran; the floor is 65"; exit 1; }
       - run: cargo run --locked --quiet -- self-test
 
   msrv:
