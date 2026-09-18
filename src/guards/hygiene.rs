@@ -6,10 +6,6 @@ use crate::config::{GateSettings, PiiGate};
 use anyhow::{Context as _, Result};
 use regex::Regex;
 
-/// Files larger than this are skipped by content scanners and named in the
-/// outcome notes rather than silently passed.
-const MAX_SCAN_BYTES: usize = 2 * 1024 * 1024;
-
 pub fn agents_md(ctx: &Context) -> Result<GateOutcome> {
     const GATE: &str = "agents-md";
     let settings = &ctx.config.gates.agents_md;
@@ -510,6 +506,130 @@ pub fn pii_rules(settings: &PiiGate) -> Result<Vec<PiiRule>> {
     Ok(rules)
 }
 
+fn is_exempt_lan_ip(ip_str: &str, line: &str, _match_start: usize, match_end: usize) -> bool {
+    let parts: Vec<&str> = ip_str.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let Ok(d) = parts[3].parse::<u8>() else {
+        return false;
+    };
+
+    // If the last octet is 0 (network address) or 255 (broadcast address), it's a network definition, not a host IP.
+    if d == 0 || d == 255 {
+        return true;
+    }
+
+    // Check for CIDR mask (e.g. /8, /12, /16, /24)
+    let after = &line[match_end..];
+    if let Some(rest) = after.strip_prefix('/') {
+        let mask_str = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(prefix_len) = mask_str.parse::<u32>() {
+            if (1..=32).contains(&prefix_len) {
+                if let (Ok(o0), Ok(o1), Ok(o2)) = (
+                    parts[0].parse::<u32>(),
+                    parts[1].parse::<u32>(),
+                    parts[2].parse::<u32>(),
+                ) {
+                    let ip_num = (o0 << 24) | (o1 << 16) | (o2 << 8) | (d as u32);
+                    let mask = if prefix_len == 0 {
+                        0
+                    } else {
+                        !0u32 << (32 - prefix_len)
+                    };
+                    if (ip_num & !mask) == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn collect_json_strings<'a>(val: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match val {
+        serde_json::Value::String(s) => out.push(s.as_str()),
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_json_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, v) in map {
+                out.push(key.as_str());
+                collect_json_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_json(
+    label: &str,
+    text: &str,
+    rules: &[PiiRule],
+    settings: &PiiGate,
+    allowed: &[Regex],
+    out: &mut GateOutcome,
+) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+
+    let mut tokens = Vec::new();
+    collect_json_strings(&val, &mut tokens);
+
+    for token in tokens {
+        for rule in rules {
+            for caps in rule.re.captures_iter(token) {
+                let m = caps.get(0).unwrap();
+                if rule.label == "private LAN address"
+                    && is_exempt_lan_ip(m.as_str(), token, m.start(), m.end())
+                {
+                    continue;
+                }
+                let allowed_user = rule.user_group
+                    && caps.get(1).is_some_and(|u| {
+                        settings
+                            .allowed_users
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(u.as_str()))
+                    });
+                if allowed_user {
+                    continue;
+                }
+                if allowed.iter().any(|re| re.is_match(token)) {
+                    continue;
+                }
+                let detail = match (rule.redact, m.as_str()) {
+                    (false, s) => format!("{} `{s}`", rule.label),
+                    _ => format!("{} (match not echoed)", rule.label),
+                };
+                let line_num = text
+                    .lines()
+                    .position(|l| l.contains(token))
+                    .map(|p| p + 1)
+                    .unwrap_or(1);
+                out.push(
+                    settings.severity(),
+                    "Host / PII Leak",
+                    Some(label),
+                    Some(line_num),
+                    format!("Found a {detail}."),
+                    "Replace it with a placeholder such as `<home>` or `<host>`. A line that must \
+                     keep it can carry `discipline:allow(pii)`.",
+                );
+            }
+        }
+    }
+    true
+}
+
 pub fn pii(ctx: &Context) -> Result<GateOutcome> {
     const GATE: &str = "pii";
     let settings = &ctx.config.gates.pii;
@@ -523,6 +643,12 @@ pub fn pii(ctx: &Context) -> Result<GateOutcome> {
         for (idx, line) in text.lines().enumerate() {
             let hit = rules.iter().find_map(|rule| {
                 rule.re.captures_iter(line).find_map(|caps| {
+                    let m = caps.get(0).unwrap();
+                    if rule.label == "private LAN address"
+                        && is_exempt_lan_ip(m.as_str(), line, m.start(), m.end())
+                    {
+                        return None;
+                    }
                     let allowed_user = rule.user_group
                         && caps.get(1).is_some_and(|u| {
                             settings
@@ -562,13 +688,15 @@ pub fn pii(ctx: &Context) -> Result<GateOutcome> {
             continue;
         }
         match ctx.git.head_content(&path)? {
-            Some(text) if text.len() <= MAX_SCAN_BYTES => {
+            Some(text) => {
                 out.examined += 1;
+                if path.ends_with(".json")
+                    && scan_json(&path, &text, &rules, settings, &allowed, &mut out)
+                {
+                    continue;
+                }
                 scan(&path, &text, &mut out);
             }
-            Some(_) => out
-                .notes
-                .push(format!("skipped `{path}` (over the size cap)")),
             None => binary += 1,
         }
     }

@@ -519,6 +519,57 @@ fn hostname_denylist_comes_from_config_or_secret_env_and_is_never_echoed() {
     assert_eq!(inline.code, 1);
 }
 
+#[test]
+fn pii_rfc1918_network_id_exemption_and_json_streaming() {
+    let repo = Repo::new();
+    repo.write(
+        "examples/ip-range-lookup.php",
+        r#"<?php
+$ranges = [
+    '10.0.0.0/8' => 'private-net',
+    '172.16.0.0/12' => 'private-net',
+    '192.168.0.0/16' => 'private-net',
+    '10.0.1.0' => 'subnet-base',
+    '10.0.1.255' => 'broadcast',
+];
+"#,
+    );
+    repo.write(
+        "data/clean.json",
+        r#"{"network": "192.168.0.0/16", "broadcast": "10.0.1.255"}"#,
+    );
+    // 2.5 MiB clean text file — must NOT be skipped with "over the size cap"
+    let large_clean = "clean line with no secrets\n".repeat(100_000);
+    repo.write("data/large_clean.txt", &large_clean);
+    repo.commit("feat: network config");
+
+    let clean_run = repo.check(&[]);
+    assert_eq!(
+        clean_run.code, 0,
+        "stdout: {}\nstderr: {}",
+        clean_run.stdout, clean_run.stderr
+    );
+    let pii_outcome = clean_run.outcome("pii");
+    assert_eq!(pii_outcome["violations"].as_array().unwrap().len(), 0);
+    let notes = pii_outcome["notes"].to_string();
+    assert!(!notes.contains("over the size cap"));
+
+    // Negative control: host IPs, JSON string leaks, and leaks inside > 2 MiB files
+    let bad_repo = Repo::new();
+    bad_repo.write("examples/lookup.php", "echo lookup('192.168.1.50');\n");
+    bad_repo.write("data/leak.json", r#"{"client_ip": "10.0.1.5"}"#);
+    let mut large_leak = "clean padding line\n".repeat(100_000);
+    large_leak.push_str("connect to 172.16.5.9\n");
+    bad_repo.write("data/large_leak.txt", &large_leak);
+    bad_repo.commit("feat: bad configs");
+
+    let bad_run = bad_repo.check(&[]);
+    assert_eq!(bad_run.code, 1);
+    let outcome = bad_run.outcome("pii");
+    let bad_violations = outcome["violations"].as_array().unwrap();
+    assert_eq!(bad_violations.len(), 3, "violations: {bad_violations:?}");
+}
+
 // ---- agent-scratch / agents-md ---------------------------------------------
 
 #[test]
