@@ -1,0 +1,280 @@
+pub mod agent_diff;
+pub mod hygiene;
+pub mod integrity;
+
+use crate::cli::SuiteChoice;
+use crate::config::{gate_info, DisciplineConfig, GateSettings, Severity, Suite, GATES};
+use crate::gitctx::GitCtx;
+use anyhow::{anyhow, bail, Context as _, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Violation {
+    pub gate: &'static str,
+    pub severity: Severity,
+    pub title: String,
+    pub file: Option<String>,
+    pub line: Option<usize>,
+    pub message: String,
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GateOutcome {
+    pub gate: &'static str,
+    pub suite: &'static str,
+    pub enabled: bool,
+    /// How many items (files, tests, config keys ...) the gate looked at. A
+    /// report always shows this, so "0 violations" over "0 examined" is visible.
+    pub examined: usize,
+    /// Lines skipped through an inline `discipline:allow(<gate>)` marker.
+    pub inline_exemptions: usize,
+    /// Named degradations: what the gate could not verify, and why.
+    pub notes: Vec<String>,
+    pub violations: Vec<Violation>,
+}
+
+impl GateOutcome {
+    pub fn new(gate: &'static str) -> Self {
+        let info = gate_info(gate).expect("gate id registered in config::GATES");
+        Self {
+            gate,
+            suite: info.suite.label(),
+            enabled: true,
+            examined: 0,
+            inline_exemptions: 0,
+            notes: Vec::new(),
+            violations: Vec::new(),
+        }
+    }
+
+    pub fn push(
+        &mut self,
+        severity: Severity,
+        title: &str,
+        file: Option<&str>,
+        line: Option<usize>,
+        message: String,
+        remediation: &str,
+    ) {
+        self.violations.push(Violation {
+            gate: self.gate,
+            severity,
+            title: title.to_string(),
+            file: file.map(str::to_string),
+            line,
+            message,
+            remediation: Some(remediation.to_string()),
+        });
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckSummary {
+    pub base: String,
+    pub errors: usize,
+    pub warnings: usize,
+    pub outcomes: Vec<GateOutcome>,
+    /// Gates the PRD plans but this binary does not ship. Listed in every
+    /// report so their absence is never mistaken for coverage.
+    pub planned_gates: Vec<&'static str>,
+}
+
+impl CheckSummary {
+    pub fn is_success(&self, fail_on_warnings: bool) -> bool {
+        self.errors == 0 && (!fail_on_warnings || self.warnings == 0)
+    }
+
+    pub fn violations(&self) -> impl Iterator<Item = &Violation> {
+        self.outcomes.iter().flat_map(|o| o.violations.iter())
+    }
+}
+
+/// Everything a gate needs.
+pub struct Context<'a> {
+    pub config: &'a DisciplineConfig,
+    pub git: &'a GitCtx,
+    /// Repo-relative path of the configuration file (for config-integrity).
+    pub config_path: &'a str,
+    pub staged: bool,
+    pub pr_body: Option<String>,
+    /// PR body plus commit messages: where override directives are read from.
+    pub directive_text: String,
+}
+
+impl Context<'_> {
+    /// A finding that an override directive could lift is only a warning in
+    /// `--staged` mode without a PR body: a pre-commit hook runs before the
+    /// commit message exists, so there is nowhere to put the directive yet.
+    /// CI, which sees the message and the PR body, stays authoritative.
+    pub fn overridable(&self, severity: Severity) -> Severity {
+        if self.staged && self.pr_body.is_none() {
+            Severity::Warning
+        } else {
+            severity
+        }
+    }
+}
+
+pub fn run_checks(
+    config: &DisciplineConfig,
+    suite: SuiteChoice,
+    ctx: &Context,
+) -> Result<CheckSummary> {
+    let wanted: Vec<Suite> = match suite {
+        SuiteChoice::All => vec![
+            Suite::AgentGuard,
+            Suite::Hygiene,
+            Suite::Integrity,
+            Suite::Quality,
+            Suite::Verification,
+            Suite::Bench,
+        ],
+        SuiteChoice::AgentGuard => vec![Suite::AgentGuard],
+        SuiteChoice::Hygiene => vec![Suite::Hygiene],
+        SuiteChoice::Integrity => vec![Suite::Integrity],
+        SuiteChoice::Quality => vec![Suite::Quality],
+        SuiteChoice::Verification => vec![Suite::Verification],
+        SuiteChoice::Bench => vec![Suite::Bench],
+    };
+
+    let selected: Vec<_> = GATES
+        .iter()
+        .filter(|g| g.available && wanted.contains(&g.suite))
+        .collect();
+    if selected.is_empty() {
+        // Asking for a suite with nothing in it must not print "PASSED".
+        bail!(
+            "suite `{}` has no gates available in this version of discipline \
+             (its gates are planned); nothing was checked",
+            wanted[0].label()
+        );
+    }
+
+    if ctx.git.tracked_files()?.is_empty() {
+        bail!("git tracks no files here; refusing to report a pass over an empty tree");
+    }
+
+    let mut outcomes = Vec::new();
+    let mut ast_outcomes = None;
+    for gate in selected {
+        let settings = config
+            .gates
+            .settings(gate.id)
+            .ok_or_else(|| anyhow!("gate `{}` has no settings entry", gate.id))?;
+        if !settings.enabled() {
+            let mut o = GateOutcome::new(gate.id);
+            o.enabled = false;
+            outcomes.push(o);
+            continue;
+        }
+        let outcome = match gate.id {
+            "agents-md" => hygiene::agents_md(ctx),
+            "time-estimates" => hygiene::time_estimates(ctx),
+            "pii" => hygiene::pii(ctx),
+            "agent-scratch" => hygiene::agent_scratch(ctx),
+            "config-integrity" => integrity::config_integrity(ctx),
+            "assertion-reduction"
+            | "vacuous-tests"
+            | "ignored-tests"
+            | "unsafe-safety-comment"
+            | "deletion-rationale" => {
+                if ast_outcomes.is_none() {
+                    ast_outcomes = Some(agent_diff::run(ctx)?);
+                }
+                let all: &Vec<GateOutcome> = ast_outcomes.as_ref().expect("just set");
+                Ok(all
+                    .iter()
+                    .find(|o| o.gate == gate.id)
+                    .cloned()
+                    .expect("agent_diff returns every agent-guard diff gate"))
+            }
+            other => bail!("gate `{other}` is marked available but has no implementation"),
+        }
+        .with_context(|| format!("gate `{}` could not run", gate.id))?;
+        outcomes.push(outcome);
+    }
+
+    let count = |s: Severity| {
+        outcomes
+            .iter()
+            .flat_map(|o| &o.violations)
+            .filter(|v| v.severity == s)
+            .count()
+    };
+    Ok(CheckSummary {
+        base: ctx.git.base_label().to_string(),
+        errors: count(Severity::Error),
+        warnings: count(Severity::Warning),
+        planned_gates: GATES
+            .iter()
+            .filter(|g| !g.available)
+            .map(|g| g.id)
+            .collect(),
+        outcomes,
+    })
+}
+
+/// Glob set over repo-relative, `/`-separated paths.
+pub struct PathFilter(GlobSet);
+
+impl PathFilter {
+    pub fn new(globs: &[String]) -> Result<Self> {
+        let mut b = GlobSetBuilder::new();
+        for g in globs {
+            b.add(Glob::new(g).with_context(|| format!("invalid glob `{g}` in configuration"))?);
+        }
+        Ok(Self(b.build()?))
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.0.is_match(path)
+    }
+}
+
+pub fn exempt_filter(settings: &dyn GateSettings) -> Result<PathFilter> {
+    PathFilter::new(settings.exempt_paths())
+}
+
+/// `discipline:allow(gate-a, gate-b)` anywhere on a line exempts that line.
+pub fn line_allows(line: &str, gate: &str) -> bool {
+    const MARKER: &str = "discipline:allow(";
+    let Some(start) = line.find(MARKER) else {
+        return false;
+    };
+    let rest = &line[start + MARKER.len()..];
+    let Some(end) = rest.find(')') else {
+        return false;
+    };
+    rest[..end].split(',').any(|g| g.trim() == gate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_marker_is_scoped_to_the_named_gate() {
+        assert!(line_allows("x <!-- discipline:allow(pii) -->", "pii"));
+        assert!(line_allows(
+            "x // discipline:allow(time-estimates, pii)",
+            "pii"
+        ));
+        assert!(!line_allows(
+            "x <!-- discipline:allow(time-estimates) -->",
+            "pii"
+        ));
+        assert!(!line_allows("discipline:allow(pii", "pii"));
+        assert!(!line_allows("we allow pii here", "pii"));
+    }
+
+    #[test]
+    fn path_filter_matches_globs_and_rejects_bad_ones() {
+        let f = PathFilter::new(&["docs/archive/**".into(), "*.lock".into()]).unwrap();
+        assert!(f.matches("docs/archive/2020/x.md"));
+        assert!(f.matches("Cargo.lock"));
+        assert!(!f.matches("docs/PRD.md"));
+        assert!(PathFilter::new(&["[".into()]).is_err());
+    }
+}

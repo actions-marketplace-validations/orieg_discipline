@@ -1,0 +1,36 @@
+[package]
+name = "discipline"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+authors = ["Nicolas Brousse <nicolas@brousse.info>"]
+license = "MIT OR Apache-2.0"
+description = "Universal CI/CD gatekeeper and AI coding agent diff sentinel"
+readme = "README.md"
+repository = "https://github.com/orieg/discipline"
+homepage = "https://github.com/orieg/discipline"
+keywords = ["ci", "testing", "ai-agents", "tree-sitter", "quality-gate"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"
+regex = "1.10"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+# No network features: discipline only reads the local object database, and
+# dropping `https` keeps openssl out of the static musl build.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+globset = "0.4"
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
