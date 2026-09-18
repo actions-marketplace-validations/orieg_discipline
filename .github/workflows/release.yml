@@ -6,11 +6,9 @@ name: Release
 # only moves once that proof passes.
 on:
   push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
 
 permissions:
   contents: read
@@ -239,6 +237,9 @@ jobs:
     if: needs.verify.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: move-major-tag
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -250,6 +251,17 @@ jobs:
         run: |
           set -euo pipefail
           major="v${VERSION%%.*}"
+          git fetch origin "refs/tags/${major}:refs/tags/${major}" || true
+          if git rev-parse -q --verify "refs/tags/${major}" >/dev/null; then
+            current_version="$(git show "refs/tags/${major}:Cargo.toml" 2>/dev/null | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1 || true)"
+            if [ -n "${current_version}" ]; then
+              older="$(printf '%s\n%s\n' "${VERSION}" "${current_version}" | sort -V | head -n 1)"
+              if [ "${VERSION}" = "${current_version}" ] || [ "${older}" = "${VERSION}" ]; then
+                echo "::notice::Refusing to move ${major} backwards: target has version ${current_version} >= ${VERSION}"
+                exit 0
+              fi
+            fi
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag --force "${major}" "${GITHUB_SHA}"
