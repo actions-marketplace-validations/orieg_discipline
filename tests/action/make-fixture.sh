@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Builds a throwaway git repository for exercising the action / hook end to end.
 #
-#   make-fixture.sh <dir> clean   a change every gate accepts
-#   make-fixture.sh <dir> bad     a change that trips five named gates
-#   make-fixture.sh <dir> staged  the `bad` change left staged, uncommitted
+#   make-fixture.sh <dir> clean    a change every gate accepts
+#   make-fixture.sh <dir> bad      a change that trips five named gates
+#   make-fixture.sh <dir> staged   the `bad` change left staged, uncommitted
+#   make-fixture.sh <dir> deletion a change that deletes a file in a subdirectory
 #
 # The repository has a `main` branch (the base) and a `work` branch (the change).
 set -euo pipefail
 
-dir="${1:?usage: make-fixture.sh <dir> clean|bad|staged}"
-kind="${2:?usage: make-fixture.sh <dir> clean|bad|staged}"
+dir="${1:?usage: make-fixture.sh <dir> clean|bad|staged|deletion}"
+kind="${2:?usage: make-fixture.sh <dir> clean|bad|staged|deletion}"
 
 rm -rf "${dir}"
-mkdir -p "${dir}/src" "${dir}/tests" "${dir}/docs"
+mkdir -p "${dir}/src" "${dir}/tests/legacy" "${dir}/docs"
 cd "${dir}"
 git init -q -b main
 git config user.email "fixture@example.invalid"
@@ -33,6 +34,12 @@ cat > tests/arith.rs <<'RS'
 fn adds() {
     assert_eq!(1 + 1, 2);
     assert_eq!(2 + 2, 4);
+}
+RS
+cat > tests/legacy/old.rs <<'RS'
+#[test]
+fn legacy_test() {
+    assert_eq!(1, 1);
 }
 RS
 cat > docs/plan.md <<'MD'
@@ -80,6 +87,10 @@ RS
     if [ "${kind}" = "bad" ]; then
       git commit -q -m "test: simplify"
     fi
+    ;;
+  deletion)
+    git rm -q tests/legacy/old.rs
+    git commit -q -m "chore: drop legacy test"
     ;;
   *)
     echo "unknown fixture kind: ${kind}" >&2

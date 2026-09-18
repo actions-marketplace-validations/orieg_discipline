@@ -12,10 +12,29 @@
 
 use regex::Regex;
 
-pub const REMOVES: &[&str] = &["removes", "deletes", "remove", "delete"];
-pub const ALLOW_ASSERTION_DROP: &[&str] = &["allow-assertion-drop"];
-pub const ALLOW_IGNORE: &[&str] = &["allow-ignore"];
-pub const ALLOW_GATE_WEAKENING: &[&str] = &["allow-gate-weakening"];
+pub const REMOVES: &[&str] = &[
+    "removes",
+    "deletes",
+    "remove",
+    "delete",
+    "discipline:allow(deletion-rationale)",
+    "allow(deletion-rationale)",
+];
+pub const ALLOW_ASSERTION_DROP: &[&str] = &[
+    "allow-assertion-drop",
+    "discipline:allow(assertion-reduction)",
+    "allow(assertion-reduction)",
+];
+pub const ALLOW_IGNORE: &[&str] = &[
+    "allow-ignore",
+    "discipline:allow(ignored-tests)",
+    "allow(ignored-tests)",
+];
+pub const ALLOW_GATE_WEAKENING: &[&str] = &[
+    "allow-gate-weakening",
+    "discipline:allow(config-integrity)",
+    "allow(config-integrity)",
+];
 
 const PLACEHOLDERS: &[&str] = &[
     "todo", "tbd", "none", "n/a", "na", "reason", "why", "...", "xxx", "fixme", "-",
@@ -23,13 +42,20 @@ const PLACEHOLDERS: &[&str] = &[
 
 /// Reasons of every well-formed directive named in `names` found in `text`.
 pub fn directive_reasons(text: &str, names: &[&str]) -> Vec<String> {
-    let alternation = names
+    let patterns = names
         .iter()
-        .map(|n| regex::escape(n))
+        .map(|n| {
+            let esc = regex::escape(n);
+            if n.ends_with(')') {
+                format!("{esc}(?::|[ \\t])")
+            } else {
+                format!("{esc}:")
+            }
+        })
         .collect::<Vec<_>>()
         .join("|");
     let re = Regex::new(&format!(
-        r"(?i)^[ \t]*(?:<!--[ \t]*)?(?:{alternation}):[ \t]*(.*)$"
+        r"(?i)^[ \t]*(?:<!--[ \t]*)?(?:{patterns})[ \t]*(.*)$"
     ))
     .expect("directive regex is static");
 
@@ -195,5 +221,18 @@ removes: tests/old.rs inside a fence
         let r = directive_reasons("allow-ignore: flaky_test on CI", ALLOW_IGNORE);
         assert!(covers(&r, "flaky_test"));
         assert!(!covers(&r, "flaky"));
+    }
+
+    #[test]
+    fn discipline_allow_directive_form_accepted() {
+        let bare = "<!-- discipline:allow(deletion-rationale) tests -->";
+        let bare_reasons = directive_reasons(bare, REMOVES);
+        assert_eq!(bare_reasons, vec!["tests"]);
+        assert!(!covers(&bare_reasons, "tests/legacy/old.rs"));
+
+        let scoped = "<!-- discipline:allow(deletion-rationale) tests/legacy/ -->";
+        let scoped_reasons = directive_reasons(scoped, REMOVES);
+        assert_eq!(scoped_reasons, vec!["tests/legacy/"]);
+        assert!(covers(&scoped_reasons, "tests/legacy/old.rs"));
     }
 }

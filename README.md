@@ -37,6 +37,10 @@ Six gates work on a repository in any language. The four AST gates use a per-lan
 ### GitHub Actions
 
 ```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
 jobs:
   discipline:
     runs-on: ubuntu-latest
@@ -46,6 +50,9 @@ jobs:
           fetch-depth: 0          # the merge base must be reachable
       - uses: orieg/discipline@v0
 ```
+
+> **Note on `edited`:** GitHub Actions does not trigger workflows on PR description edits by default. Specifying `types: [opened, synchronize, reopened, edited]` ensures that updating the PR body (such as adding a `removes:` directive or resolving a PR-body hygiene finding) immediately re-runs the gate without requiring an empty commit.
+
 
 ### Gitea Actions
 

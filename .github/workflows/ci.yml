@@ -134,6 +134,7 @@ jobs:
         run: |
           tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-clean" clean
           tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-bad" bad
+          tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-del" deletion
 
       - name: "Positive control: clean change passes"
         id: clean
@@ -210,6 +211,64 @@ jobs:
           set -euo pipefail
           [ "${OUTCOME}" = "failure" ] || { echo "::error::unknown base passed"; exit 1; }
           [ -z "${STATUS}" ] || { echo "::error::a verdict was produced without a base"; exit 1; }
+
+      - name: "PR-body hygiene: time estimate in PR body fails"
+        id: pr_time
+        continue-on-error: true
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-clean
+          base_ref: main
+          pr_body: "Plan: ship in 3 weeks."
+      - name: PR body time estimate fails with time-estimates gate
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.pr_time.outcome }}
+          STATUS: ${{ steps.pr_time.outputs.status }}
+          REPORT: ${{ steps.pr_time.outputs.report }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::PR body with time estimate did not fail"; exit 1; }
+          [ "${STATUS}" = "fail" ] || { echo "::error::status output was '${STATUS}'"; exit 1; }
+          tests/action/assert-report.sh "${REPORT}" fail time-estimates
+
+      - name: "PR-body override: bare-word directive fails to excuse directory deletion"
+        id: pr_bare
+        continue-on-error: true
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-del
+          base_ref: main
+          pr_body: "<!-- discipline:allow(deletion-rationale) tests -->"
+      - name: Bare-word directive was rejected by deletion-rationale gate
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.pr_bare.outcome }}
+          STATUS: ${{ steps.pr_bare.outputs.status }}
+          REPORT: ${{ steps.pr_bare.outputs.report }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::bare-word directive incorrectly allowed deletion"; exit 1; }
+          [ "${STATUS}" = "fail" ] || { echo "::error::status output was '${STATUS}'"; exit 1; }
+          tests/action/assert-report.sh "${REPORT}" fail deletion-rationale
+
+      - name: "PR-body override: scoped directory prefix directive allows deletion"
+        id: pr_scoped
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-del
+          base_ref: main
+          pr_body: "<!-- discipline:allow(deletion-rationale) tests/legacy/ -->"
+      - name: Scoped directory prefix directive passed
+        shell: bash
+        env:
+          REPORT: ${{ steps.pr_scoped.outputs.report }}
+        run: |
+          set -euo pipefail
+          tests/action/assert-report.sh "${REPORT}" pass
 
       # The download path, before any real release exists: a local release
       # store laid out like GitHub's, served over HTTP.
