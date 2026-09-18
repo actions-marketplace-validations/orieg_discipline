@@ -176,6 +176,25 @@ fn ignored_tests_fire_and_accept_a_scoped_override() {
     assert!(run.titles("ignored-tests").is_empty(), "{}", run.stdout);
 }
 
+#[test]
+fn ignored_tests_fire_on_cfg_attr_ignore() {
+    let repo = Repo::new();
+    repo.write(
+        "tests/a.rs",
+        &GOOD_TEST.replace(
+            "#[test]\nfn orders",
+            "#[test]\n#[cfg_attr(all(), ignore)]\nfn orders",
+        ),
+    );
+    repo.commit("test: conditional ignore");
+    let run = repo.check(&[]);
+    assert_eq!(run.code, 1);
+    assert_eq!(
+        run.titles("ignored-tests"),
+        vec!["Test Newly Marked #[ignore]"]
+    );
+}
+
 // ---- unsafe-safety-comment -------------------------------------------------
 
 #[test]

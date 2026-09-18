@@ -202,11 +202,19 @@ impl<'a> Extractor<'a> {
         while let Some(p) = prev {
             match p.kind() {
                 "attribute_item" => {
-                    match attribute_name(self.text(p)).as_str() {
+                    let text = self.text(p);
+                    let name = attribute_name(text);
+                    let mut check_attr = |n: &str| match n {
                         "test" | "rstest" | "test_case" | "quickcheck" => is_test = true,
                         "ignore" => ignored = true,
                         "should_panic" => should_panic = true,
                         _ => {}
+                    };
+                    check_attr(&name);
+                    if name == "cfg_attr" {
+                        for sub in parse_cfg_attr_sub_attributes(text) {
+                            check_attr(&attribute_name(&sub));
+                        }
                     }
                     prev = p.prev_sibling();
                 }
@@ -361,6 +369,75 @@ impl<'a> Extractor<'a> {
     }
 }
 
+fn parse_cfg_attr_sub_attributes(attr_text: &str) -> Vec<String> {
+    let Some(start) = attr_text.find("cfg_attr") else {
+        return Vec::new();
+    };
+    let rest = &attr_text[start + "cfg_attr".len()..];
+    let Some(open_paren) = rest.find('(') else {
+        return Vec::new();
+    };
+    let inside = &rest[open_paren + 1..];
+
+    // Find first comma at paren depth 0 (relative to inside)
+    let mut depth = 0;
+    let mut condition_end = None;
+    for (i, c) in inside.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => {
+                condition_end = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(comma_pos) = condition_end else {
+        return Vec::new();
+    };
+
+    let sub_attrs_text = &inside[comma_pos + 1..];
+    let mut sub_attrs = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    for c in sub_attrs_text.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' if depth == 0 => {
+                break;
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    sub_attrs.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        sub_attrs.push(trimmed.to_string());
+    }
+
+    sub_attrs
+}
+
 fn attribute_name(attr_text: &str) -> String {
     // `#[tokio::test(flavor = "multi_thread")]` -> `test`
     let inner = attr_text
@@ -485,6 +562,15 @@ mod tests {
     fn ignore_attribute_is_detected() {
         let f = facts("#[test]\n#[ignore = \"flaky\"]\nfn t() { assert_eq!(a(), 1); }");
         assert!(f.tests[0].ignored);
+
+        let f2 = facts("#[test]\n#[cfg_attr(all(), ignore)]\nfn t2() { assert_eq!(a(), 1); }");
+        assert!(f2.tests[0].ignored);
+
+        let f3 = facts(
+            "#[cfg_attr(feature = \"ignore_something\", test)]\nfn t3() { assert_eq!(a(), 1); }",
+        );
+        assert!(!f3.tests[0].ignored);
+        assert_eq!(f3.tests.len(), 1);
     }
 
     #[test]
