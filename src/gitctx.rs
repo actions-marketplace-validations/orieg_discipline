@@ -93,6 +93,12 @@ impl GitCtx {
         &self.base_label
     }
 
+    pub fn root(&self) -> &std::path::Path {
+        self.repo
+            .workdir()
+            .expect("repo is not bare, validated in open()")
+    }
+
     fn base_tree(&self) -> Result<Option<Tree<'_>>> {
         match self.base {
             Some(oid) => Ok(Some(self.repo.find_commit(oid)?.tree()?)),

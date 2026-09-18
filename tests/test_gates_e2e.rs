@@ -584,3 +584,77 @@ fn init_writes_a_config_that_loads_and_refuses_to_overwrite() {
     );
     assert_eq!(repo.run(&["init"], &[]).code, 2);
 }
+
+#[test]
+fn running_from_subdirectory_resolves_repo_config() {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-q", "main"]);
+    repo.write(
+        "discipline.toml",
+        "[meta]\nversion = 1\nname = \"demo\"\n\n[gates.pii]\nenabled = true\nhostname_denylist = [\"secret-internal.corp\"]\nexempt_paths = [\"discipline.toml\"]\n",
+    );
+    repo.commit("chore: add repo discipline.toml with denylist");
+    repo.git(&["checkout", "-q", "-B", "work"]);
+
+    repo.write(
+        "docs/architecture.md",
+        "Contact secret-internal.corp for keys.\n",
+    );
+    repo.commit("docs: mention host");
+
+    // Running from subdirectory 'docs' must find root discipline.toml and fail on pii.
+    let run = repo.run_in_dir(
+        "docs",
+        &["check", "--format", "json", "--base", "main"],
+        &[],
+    );
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert!(!run
+        .stderr
+        .contains("no discipline.toml; using built-in defaults"));
+    assert_eq!(run.titles("pii").len(), 1);
+}
+
+#[test]
+fn config_override_flag_compares_against_base_config() {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-q", "main"]);
+    repo.write(
+        "discipline.toml",
+        "[meta]\nversion = 1\nname = \"demo\"\n\n[gates.time-estimates]\nenabled = true\n",
+    );
+    repo.commit("chore: add discipline.toml");
+    repo.git(&["checkout", "-q", "-B", "work"]);
+
+    // Agent introduces a loose config and tries to use it via --config.
+    repo.write(
+        "loose.toml",
+        "[meta]\nversion = 1\nname = \"demo\"\n\n[gates.time-estimates]\nenabled = false\n",
+    );
+    repo.commit("chore: add loose config");
+
+    let run = repo.check(&["--config", "loose.toml"]);
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(
+        run.titles("config-integrity").len(),
+        1,
+        "stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.outcome("config-integrity")["violations"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("time-estimates"),
+        "stdout: {}",
+        run.stdout
+    );
+}

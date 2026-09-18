@@ -33,7 +33,12 @@ pub fn config_integrity(ctx: &Context) -> Result<GateOutcome> {
     let settings = &ctx.config.gates.config_integrity;
     let mut out = GateOutcome::new(GATE);
 
-    let Some(base_src) = ctx.git.base_content(ctx.config_path)? else {
+    let base_src = match ctx.git.base_content(ctx.config_path)? {
+        Some(s) => Some(s),
+        None if ctx.config_path != "discipline.toml" => ctx.git.base_content("discipline.toml")?,
+        None => None,
+    };
+    let Some(base_src) = base_src else {
         out.notes.push(format!(
             "`{}` does not exist on the base side; nothing to compare against",
             ctx.config_path
@@ -55,16 +60,9 @@ pub fn config_integrity(ctx: &Context) -> Result<GateOutcome> {
             return Ok(out);
         }
     };
-    let head = if ctx.git.is_tracked(ctx.config_path)? {
-        match ctx.git.head_content(ctx.config_path)? {
-            Some(src) => DisciplineConfig::from_toml_str(&src)?,
-            None => DisciplineConfig::default_for_repo(&base.meta.name),
-        }
-    } else {
-        DisciplineConfig::default_for_repo(&base.meta.name)
-    };
+    let head = ctx.config;
 
-    let weakenings = diff_configs(&base, &head)?;
+    let weakenings = diff_configs(&base, head)?;
     out.examined = Value::try_from(&base.gates)?
         .as_table()
         .map(|t| t.len())

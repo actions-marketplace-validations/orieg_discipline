@@ -46,7 +46,7 @@ fn run() -> Result<bool> {
     }
 }
 
-fn load_config(args: &ConfigArgs) -> Result<DisciplineConfig> {
+fn load_config(args: &ConfigArgs, repo_root: Option<&Path>) -> Result<(DisciplineConfig, String)> {
     let overrides = Overrides {
         config_override: args
             .config_override
@@ -59,8 +59,25 @@ fn load_config(args: &ConfigArgs) -> Result<DisciplineConfig> {
             .unwrap_or_default(),
     };
     let explicit = args.config != Path::new("discipline.toml");
-    if args.config.exists() {
-        DisciplineConfig::resolve(Some(&args.config), &overrides)
+    let resolved_path = match repo_root {
+        Some(root) if !args.config.is_absolute() => root.join(&args.config),
+        _ => args.config.clone(),
+    };
+
+    let config_path_for_ctx = if let Some(root) = repo_root {
+        if let Ok(rel) = resolved_path.strip_prefix(root) {
+            rel.to_string_lossy().replace('\\', "/")
+        } else {
+            args.config.to_string_lossy().replace('\\', "/")
+        }
+    } else {
+        args.config.to_string_lossy().replace('\\', "/")
+    };
+    let config_path_for_ctx = config_path_for_ctx.trim_start_matches("./").to_string();
+
+    if resolved_path.exists() {
+        let config = DisciplineConfig::resolve(Some(&resolved_path), &overrides)?;
+        Ok((config, config_path_for_ctx))
     } else if explicit {
         bail!(
             "configuration file {} does not exist",
@@ -71,13 +88,14 @@ fn load_config(args: &ConfigArgs) -> Result<DisciplineConfig> {
             "{} no discipline.toml; using built-in defaults (every available gate on).",
             style::yellow("note:")
         );
-        DisciplineConfig::resolve(None, &overrides)
+        let config = DisciplineConfig::resolve(None, &overrides)?;
+        Ok((config, config_path_for_ctx))
     }
 }
 
 fn check(args: CheckArgs) -> Result<bool> {
-    let config = load_config(&args.config)?;
     let git = GitCtx::open(&args.base, args.staged)?;
+    let (config, config_path) = load_config(&args.config, Some(git.root()))?;
 
     let pr_body = match &args.pr_body_file {
         Some(p) => Some(
@@ -94,11 +112,10 @@ fn check(args: CheckArgs) -> Result<bool> {
         directive_text.push_str(&msg);
     }
 
-    let config_path = args.config.config.to_string_lossy().replace('\\', "/");
     let ctx = Context {
         config: &config,
         git: &git,
-        config_path: config_path.trim_start_matches("./"),
+        config_path: &config_path,
         staged: args.staged,
         pr_body,
         directive_text,
@@ -113,7 +130,11 @@ fn check(args: CheckArgs) -> Result<bool> {
 }
 
 fn init(name: Option<String>) -> Result<bool> {
-    let config_path = Path::new("discipline.toml");
+    let repo = git2::Repository::discover(".").ok();
+    let repo_root = repo.as_ref().and_then(|r| r.workdir());
+    let config_path = repo_root
+        .map(|r| r.join("discipline.toml"))
+        .unwrap_or_else(|| std::path::PathBuf::from("discipline.toml"));
     if config_path.exists() {
         bail!("discipline.toml already exists");
     }
@@ -124,7 +145,7 @@ fn init(name: Option<String>) -> Result<bool> {
             .unwrap_or_else(|| "my-project".to_string())
     });
     let config = DisciplineConfig::default_for_repo(&project_name);
-    std::fs::write(config_path, toml::to_string_pretty(&config)?)?;
+    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     println!(
         "{} wrote discipline.toml for `{project_name}` with every available gate on.",
         style::green("ok:")
@@ -133,7 +154,9 @@ fn init(name: Option<String>) -> Result<bool> {
 }
 
 fn gates(args: &ConfigArgs) -> Result<bool> {
-    let config = load_config(args)?;
+    let repo = git2::Repository::discover(".").ok();
+    let repo_root = repo.as_ref().and_then(|r| r.workdir());
+    let (config, _) = load_config(args, repo_root)?;
     println!("{:<24} {:<13} {:<9} SUMMARY", "GATE", "SUITE", "STATE");
     for g in GATES {
         let state = match config.gates.settings(g.id) {

@@ -153,4 +153,29 @@ impl Repo {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
     }
+
+    pub fn run_in_dir(&self, rel_dir: &str, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_discipline"));
+        cmd.args(args).current_dir(self.file(rel_dir));
+        for var in [
+            "PR_BODY",
+            "GITHUB_STEP_SUMMARY",
+            "DISCIPLINE_CONFIG",
+            "DISCIPLINE_CONFIG_OVERRIDE",
+            "DISCIPLINE_ENABLE",
+            "DISCIPLINE_DISABLE",
+            "DISCIPLINE_BASE_REF",
+            "DISCIPLINE_FAIL_ON_WARNINGS",
+            "DISCIPLINE_HOSTNAME_DENYLIST",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.envs(env.iter().copied());
+        let out = cmd.output().unwrap();
+        Run {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
 }
