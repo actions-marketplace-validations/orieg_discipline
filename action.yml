@@ -1,0 +1,220 @@
+name: 'Discipline CI Gate'
+description: 'Agent diff sentinel and repository hygiene gates for GitHub Actions and Gitea Actions'
+author: 'orieg'
+branding:
+  icon: 'shield'
+  color: 'gray-dark'
+
+# Every input reaches the shell through `env:`, never through inline
+# `${{ }}` interpolation: a PR body or a branch name is attacker-controlled
+# text and must not be parsed as shell.
+inputs:
+  config:
+    description: 'Path to discipline.toml. When the file is absent, built-in defaults apply (every available gate on).'
+    required: false
+    default: 'discipline.toml'
+  suite:
+    description: 'Suite to run: all, agent-guard, hygiene, integrity'
+    required: false
+    default: 'all'
+  base_ref:
+    description: 'Branch or commit the change is measured against. Default: PR base branch, else the pushed-from commit, else the default branch.'
+    required: false
+    default: ''
+  enable:
+    description: 'Gate ids to force on (comma or newline separated). See `discipline gates`.'
+    required: false
+    default: ''
+  disable:
+    description: 'Gate ids to force off (comma or newline separated), e.g. "time-estimates, pii".'
+    required: false
+    default: ''
+  config_override:
+    description: 'Inline TOML merged over discipline.toml: tables merge, lists append, scalars replace.'
+    required: false
+    default: ''
+  hostname_denylist:
+    description: 'Hostnames the pii gate must reject (comma or newline separated). Pass a secret; matches are never echoed.'
+    required: false
+    default: ''
+  fail_on_warnings:
+    description: 'Treat warnings as failures.'
+    required: false
+    default: 'false'
+  pr_body:
+    description: 'PR description: carries override directives and is itself scanned by hygiene gates.'
+    required: false
+    default: ${{ github.event.pull_request.body }}
+  working_directory:
+    description: 'Directory of the repository to check.'
+    required: false
+    default: '.'
+  version:
+    description: 'Release to download (e.g. v0.1.0). Default: the tag this action was referenced by, else the latest release.'
+    required: false
+    default: ''
+  binary_path:
+    description: 'Use this discipline binary instead of downloading one (air-gapped Gitea runners, self-tests).'
+    required: false
+    default: ''
+  download_url:
+    description: 'Base URL of the release store, for mirrors.'
+    required: false
+    default: 'https://github.com/orieg/discipline/releases'
+
+outputs:
+  status:
+    description: 'pass or fail'
+    value: ${{ steps.run.outputs.status }}
+  errors:
+    description: 'Number of blocking violations'
+    value: ${{ steps.run.outputs.errors }}
+  warnings:
+    description: 'Number of non-blocking violations'
+    value: ${{ steps.run.outputs.warnings }}
+  failed_gates:
+    description: 'Comma separated ids of the gates that reported a violation'
+    value: ${{ steps.run.outputs.failed_gates }}
+  report:
+    description: 'Path of the JSON report'
+    value: ${{ steps.run.outputs.report }}
+  install_error:
+    description: 'Why installing the binary failed (empty on success)'
+    value: ${{ steps.install.outputs.install_error }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install discipline
+      id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_BINARY_PATH: ${{ inputs.binary_path }}
+        INPUT_DOWNLOAD_URL: ${{ inputs.download_url }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        fail() {
+          echo "::error title=discipline install::$*"
+          # Lets a caller assert on *why* the install failed.
+          echo "install_error=$*" >> "${GITHUB_OUTPUT}"
+          exit 1
+        }
+
+        if [ -n "${INPUT_BINARY_PATH}" ]; then
+          [ -x "${INPUT_BINARY_PATH}" ] || fail "binary_path '${INPUT_BINARY_PATH}' is not an executable file"
+          bin="$(cd "$(dirname "${INPUT_BINARY_PATH}")" && pwd)/$(basename "${INPUT_BINARY_PATH}")"
+        else
+          case "$(uname -m)" in
+            x86_64|amd64) arch="x86_64" ;;
+            aarch64|arm64) arch="aarch64" ;;
+            *) fail "unsupported architecture: $(uname -m)" ;;
+          esac
+          case "$(uname -s)" in
+            Linux) triple="${arch}-unknown-linux-musl" ;;
+            Darwin) triple="${arch}-apple-darwin" ;;
+            *) fail "unsupported OS: $(uname -s) (pass binary_path to use your own build)" ;;
+          esac
+
+          version="${INPUT_VERSION}"
+          if [ -z "${version}" ] && [[ "${ACTION_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            version="${ACTION_REF}"
+          fi
+          if [ -n "${version}" ]; then
+            base="${INPUT_DOWNLOAD_URL}/download/${version}"
+          else
+            base="${INPUT_DOWNLOAD_URL}/latest/download"
+          fi
+
+          dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/discipline-${version:-latest}"
+          mkdir -p "${dir}"
+          archive="discipline-${triple}.tar.gz"
+          fetch() {
+            if command -v curl >/dev/null 2>&1; then
+              curl --fail --silent --show-error --location --retry 3 --output "$2" "$1"
+            elif command -v wget >/dev/null 2>&1; then
+              wget --quiet --tries=3 --output-document="$2" "$1"
+            else
+              fail "neither curl nor wget is available"
+            fi
+          }
+          fetch "${base}/${archive}" "${dir}/${archive}" || fail "could not download ${base}/${archive}"
+          fetch "${base}/SHA256SUMS" "${dir}/SHA256SUMS" || fail "could not download ${base}/SHA256SUMS"
+
+          # No opt-out: an unverified binary deciding whether CI passes is
+          # worse than no gate.
+          expected="$(awk -v f="${archive}" '$2 == f || $2 == "*" f { print $1 }' "${dir}/SHA256SUMS")"
+          [ -n "${expected}" ] || fail "${archive} is not listed in SHA256SUMS"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "${dir}/${archive}" | awk '{ print $1 }')"
+          else
+            actual="$(shasum -a 256 "${dir}/${archive}" | awk '{ print $1 }')"
+          fi
+          [ "${expected}" = "${actual}" ] || fail "checksum mismatch for ${archive}: expected ${expected}, got ${actual}"
+
+          tar -xzf "${dir}/${archive}" -C "${dir}"
+          bin="${dir}/discipline"
+          [ -x "${bin}" ] || fail "archive did not contain an executable 'discipline'"
+        fi
+
+        "${bin}" --version
+        echo "bin=${bin}" >> "${GITHUB_OUTPUT}"
+
+    - name: Resolve base ref
+      id: base
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        INPUT_BASE_REF: ${{ inputs.base_ref }}
+        PR_BASE_REF: ${{ github.base_ref }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+        base="${INPUT_BASE_REF:-${PR_BASE_REF}}"
+        if [ -z "${base}" ] && [ -n "${PUSH_BEFORE}" ] && ! [[ "${PUSH_BEFORE}" =~ ^0+$ ]]; then
+          base="${PUSH_BEFORE}"
+        fi
+        base="${base:-${DEFAULT_BRANCH:-main}}"
+
+        resolves() {
+          git rev-parse --verify --quiet "$1^{commit}" >/dev/null \
+            || git rev-parse --verify --quiet "origin/$1^{commit}" >/dev/null
+        }
+        # Best effort only. The binary is the arbiter: if the base still does
+        # not resolve it exits 2, it never falls back to an empty diff.
+        if ! resolves "${base}"; then
+          echo "base '${base}' is not available locally; fetching it"
+          git fetch --no-tags origin "+refs/heads/${base}:refs/remotes/origin/${base}" \
+            || git fetch --no-tags origin "${base}" || true
+        fi
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "shallow clone; fetching history so a merge base exists"
+          git fetch --no-tags --unshallow origin || true
+        fi
+        echo "ref=${base}" >> "${GITHUB_OUTPUT}"
+
+    - name: Run discipline gates
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        DISCIPLINE_BIN: ${{ steps.install.outputs.bin }}
+        DISCIPLINE_CONFIG: ${{ inputs.config }}
+        DISCIPLINE_BASE_REF: ${{ steps.base.outputs.ref }}
+        DISCIPLINE_ENABLE: ${{ inputs.enable }}
+        DISCIPLINE_DISABLE: ${{ inputs.disable }}
+        DISCIPLINE_CONFIG_OVERRIDE: ${{ inputs.config_override }}
+        DISCIPLINE_HOSTNAME_DENYLIST: ${{ inputs.hostname_denylist }}
+        DISCIPLINE_FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings == 'true' && 'true' || 'false' }}
+        INPUT_SUITE: ${{ inputs.suite }}
+        PR_BODY: ${{ inputs.pr_body }}
+      run: |
+        set -euo pipefail
+        report="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/discipline-report-${GITHUB_RUN_ID:-0}-${GITHUB_ACTION:-step}.json"
+        echo "report=${report}" >> "${GITHUB_OUTPUT}"
+        "${DISCIPLINE_BIN}" check \
+          --suite "${INPUT_SUITE}" \
+          --format github-summary \
+          --json-out "${report}"

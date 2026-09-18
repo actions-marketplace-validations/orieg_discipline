@@ -1,0 +1,32 @@
+# Hook definitions for the pre-commit framework (https://pre-commit.com).
+#
+#   repos:
+#     - repo: https://github.com/orieg/discipline
+#       rev: v0.1.0
+#       hooks:
+#         - id: discipline
+#
+# Both hooks inspect the *staged* change against HEAD. Findings that an override
+# directive could lift (`removes:`, `allow-ignore:` ...) are warnings here,
+# because no commit message exists yet to carry the directive; CI stays
+# authoritative for those.
+
+# Builds the binary from source with cargo on first use.
+- id: discipline
+  name: discipline (staged change)
+  description: Agent diff sentinel and repository hygiene gates
+  entry: discipline check --staged
+  language: rust
+  pass_filenames: false
+  always_run: true
+  require_serial: true
+
+# Uses a `discipline` binary already on PATH (release download, cargo install).
+- id: discipline-system
+  name: discipline (staged change, binary from PATH)
+  description: Agent diff sentinel and repository hygiene gates
+  entry: discipline check --staged
+  language: system
+  pass_filenames: false
+  always_run: true
+  require_serial: true
