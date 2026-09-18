@@ -402,6 +402,71 @@ fn pr_body_is_scanned_for_time_estimates() {
     );
 }
 
+#[test]
+fn time_estimates_contextual_exemptions_and_discrimination() {
+    let repo = Repo::new();
+    repo.write(
+        "docs/good.md",
+        r#"# System Architecture
+Expanse is a replacement for the 20-year-old C library.
+Invariants unchecked for 20 years (§6.5) hold.
+The 20-year invariants hold.
+Bug survived 19 years before discovery.
+Went undetected for ~19 years.
+
+**Q1 — what do our patches buy?**
+### Q2: Why judy?
+Q3. How does this scale?
+(Q1) What is the throughput?
+Both numbers are true; only Q1's is ours.
+Quoting Q2 as the vendoring speedup.
+
+Budget: each shard has its own 180-minute budget.
+Cancelled at its 60-minute cap on every scheduled run.
+Half of GitHub's 6-hour default.
+The 6-hour gap between runs.
+Ran for over two hours of wall time on the same core.
+Loadavg: that is a 1-min average decaying from build (5-min 1.32, 15-min 0.47).
+Citation: Doug Baskins, [*A 10-Minute Description of How Judy Arrays Work*](https://judy.sourceforge.net/doc/10minutes.htm) (2002).
+
+| shard | Miri-visible tests | wall, reference host | job, hosted runner | note |
+|---|---:|---:|---:|---|
+| `lib-set` | 44 | 1,119 s | 29 min | largest remaining item |
+| `lib-cursor` | 12 | 873 s | 22 min | model unchanged |
+"#,
+    );
+    repo.commit("docs: good");
+    let clean_run = repo.check(&[]);
+    assert_eq!(
+        clean_run.code, 0,
+        "clean docs should pass with 0 time-estimate violations: stdout: {}\nstderr: {}",
+        clean_run.stdout, clean_run.stderr
+    );
+
+    // Negative control: planning durations and bypassed lines MUST fire
+    let bad_repo = Repo::new();
+    bad_repo.write(
+        "docs/bad.md",
+        r#"# Roadmap
+Ship in 3 weeks; update cache ttl.
+Target: Q2.
+Done in Q3.
+Working for 3 weeks on migration.
+
+| Phase | Duration |
+|---|---|
+| Phase 1 | 2 weeks |
+"#,
+    );
+    bad_repo.commit("docs: bad");
+    let bad_run = bad_repo.check(&[]);
+    assert_eq!(bad_run.code, 1);
+    let outcome = bad_run.outcome("time-estimates");
+    let violations = outcome["violations"].as_array().unwrap();
+    // Must catch: "3 weeks" on line 2, "Q2" on line 3, "Q3" on line 4, "3 weeks" on line 5, "2 weeks" on line 9
+    assert_eq!(violations.len(), 5, "violations: {violations:?}");
+}
+
 // ---- pii -------------------------------------------------------------------
 
 #[test]

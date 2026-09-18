@@ -342,9 +342,7 @@ impl Default for TimeEstimateGate {
             exempt_paths: Vec::new(),
             include: vec!["**/*.md".to_string()],
             extra_patterns: Vec::new(),
-            allow_patterns: vec![
-                r"(?i)\b(retention|ttl|timeout|expir\w*|cache[ds]?|stale|rotat\w*)\b".to_string(),
-            ],
+            allow_patterns: Vec::new(),
             scan_pr_body: true,
         }
     }
