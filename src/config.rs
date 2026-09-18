@@ -144,6 +144,13 @@ pub const GATES: &[GateInfo] = &[
         available: false,
     },
     GateInfo {
+        id: "golden-output",
+        suite: Suite::Integrity,
+        summary:
+            "prevents stealth edits to committed golden/test output files without explicit override",
+        available: false,
+    },
+    GateInfo {
         id: "pr-checklist",
         suite: Suite::Hygiene,
         summary: "ticked PR checkboxes are reconciled against the diff",

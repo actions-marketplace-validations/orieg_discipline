@@ -14,7 +14,7 @@ Engine design for `discipline`. Requirements and roadmap live in `docs/PRD.md`; 
 | `src/ast.rs` | Language dispatch and the Rust fact extractor (tree-sitter) |
 | `src/guards/agent_diff.rs` | Diff gates over base-vs-head facts |
 | `src/guards/hygiene.rs` | Whole-tree sweeps: `time-estimates`, `pii`, `agent-scratch`, `agents-md` |
-| `src/guards/integrity.rs` | `config-integrity` |
+| `src/guards/integrity.rs` | `config-integrity` (shipped), `golden-output` (planned) |
 | `src/guards/mod.rs` | Gate scheduling, `GateOutcome`, path filters, inline markers |
 | `src/report/` | Terminal, annotations, job summary, step outputs, JSON |
 | `src/selftest.rs` | Controls compiled into the binary |
@@ -60,12 +60,19 @@ Scope: a site is reported when its line was added, or when the file's count of u
 
 Two levels: *strong* (names containing `_eq`, `_ne`, `matches`) and everything else. A drop in either the effective total or the strong count is a reduction. Tautologies (`assert!(true)`, `assert_eq!(x, x)` with textually identical arguments) are subtracted from the effective total. This is a deliberately coarse proxy; PRD §11 lists what it misses.
 
+## Golden-output gate design
+
+The planned `golden-output` gate guards against stealth re-blessing or silent modification of committed test outputs, snapshots (e.g. `insta` `.snap`), and serialized test fixtures.
+- **Diff inspection:** Compares base vs. head blobs for all modified or deleted paths matching the gate's `paths` pattern.
+- **Scoped escape hatch:** Requires an explicit `allow-golden-update: <path> <reason>` or `discipline:allow(golden-output): <path> <reason>` directive parsed through `src/tokens.rs`.
+- **Integrity synergy:** Complements AST gates (`vacuous-tests`, `assertion-reduction`) by ensuring that tests asserting against external serialized data cannot be weakened by mutating the baseline fixture.
+
 ## Known limits
 
 - Macro bodies are unparsed token trees: tests generated inside `proptest! { … }` and assertions nested inside another macro's arguments are invisible. `assert_helper_fns` and `extra_assert_macros` are the workaround.
 - Syntax newer than the bundled grammar is a parse error, which blocks by design; `exempt_paths` is the escape.
 - Untracked files are not part of a non-staged diff. CI sees only commits, so this affects local runs only.
-- Content scanners skip files over 2 MiB and name them in the gate's notes.
+- Content scanners stream text files line-by-line without arbitrary size caps; lossy UTF-8 conversion scans NUL-containing text files.
 
 ## Exit codes
 
@@ -74,3 +81,4 @@ Two levels: *strong* (names containing `_eq`, `_ne`, `matches`) and everything e
 | `0` | every enabled gate ran and found nothing blocking |
 | `1` | violations (errors, or warnings under `--fail-on-warnings`) |
 | `2` | the check could not run: bad configuration, no repository, unresolvable base, unreadable input, a suite with no available gates |
+

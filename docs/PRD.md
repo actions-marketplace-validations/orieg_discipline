@@ -212,7 +212,59 @@ Outputs: `status`, `errors`, `warnings`, `failed_gates`, `report` (JSON path), `
 - **Residual gap, stated plainly.** Action inputs live in the workflow file, which a `pull_request` run takes from the PR itself, so `disable:` added in a workflow edit is not seen by `config-integrity`. Two mitigations: the planned `ci-integrity` gate (§6, Phase 3) diffs workflow files for exactly this, and until it ships the consuming repository should protect `.github/workflows/` and `discipline.toml` with branch rules or CODEOWNERS.
 - Every report prints each gate's state, so a disabled gate shows as `OFF` in the terminal, the job summary, and the JSON.
 
+### 5.5 Adoption configurations
+
+Minimal adoption configurations verified against existing repositories:
+
+#### `orieg/expanse` (High-assurance Rust algorithms)
+```toml
+[meta]
+version = 1
+name = "expanse"
+
+[gates.vacuous-tests]
+assert_helper_fns = [
+    "check_invariants",
+    "assert_bounds",
+    "verify_distribution",
+]
+
+[gates.pii]
+# Synthetic IP ranges in test suites and examples
+exempt_paths = [
+    "tests/**",
+    "examples/**",
+    "docs/archive/**",
+]
+
+[gates.time-estimates]
+# Archival documentation containing historical research chronicles
+exempt_paths = [
+    "docs/archive/**",
+]
+```
+
+#### `orieg/php-judy` (C extension & PHP runtime)
+A non-Rust repository: AST gates report 27 unanalysed files `(12 .php, 10 .phpt, 5 .c/.h)` while hygiene, integrity, and file deletion gates remain active.
+```toml
+[meta]
+version = 1
+name = "php-judy"
+
+[gates.pii]
+# Example script demonstrating IP lookups
+exempt_paths = [
+    "examples/ip-range-lookup.php",
+]
+
+[gates.time-estimates]
+exempt_paths = [
+    "docs/archive/**",
+]
+```
+
 ---
+
 
 ## 6. Gate Catalog
 
@@ -271,7 +323,33 @@ Design rules for packs:
 | `config-integrity` | shipped | §5.4. |
 | `ci-integrity` | planned | Workflow diffs: a job removed from the rollup's `needs`, new `continue-on-error`, `\|\| true`, a dropped `-D warnings`, an action unpinned from its SHA, a rollup that accepts anything but `success` / a consistent `skipped`, `disable:` added to the discipline step. Expanse polices rollup completeness and skip consistency but not step-level weakening. |
 | `test-floor` | planned | Test-count ratchet with the floor read from the base ref; zero tests selected is a failure; `allow-test-shrink:`. |
+| `golden-output` | planned | Stealth edits to committed golden files, test outputs, or recorded test fixtures are rejected without an explicit scoped rationale (`allow-golden-update: <path> <reason>`). |
 | `snapshot gates` | planned | Public API and exported-symbol snapshots as reviewed diffs, regenerated with `--write`. |
+
+#### Design specification: `golden-output` gate
+
+Committed test outputs, snapshots (such as `insta` `.snap` files), golden test data, and serialized fixtures are high-leverage drift vectors: an agent can silently re-bless or modify expected outputs to make an erosion pass rather than fixing the underlying implementation.
+
+- **Objective:** Detect edits to committed baseline output files and require explicit, scoped human intent to approve updates.
+- **Config schema:**
+  ```toml
+  [gates.golden-output]
+  enabled = true
+  severity = "error"
+  paths = [
+      "**/golden/**",
+      "**/snapshots/**",
+      "**/*.snap",
+      "tests/fixtures/**/output*",
+  ]
+  exempt_paths = []
+  ```
+- **Detection invariant:**
+  1. For every modified or deleted file in the merge-base diff matching `paths` (and not excluded by `exempt_paths`), a violation is raised unless covered by a directive.
+  2. Escape hatch directive: `allow-golden-update: <path-or-prefix> <reason>` or `discipline:allow(golden-output): <path-or-prefix> <reason>`.
+  3. Directives are parsed through `src/tokens.rs` and validated with `tokens::covers`: bare directory words without a slash are rejected, and placeholder reasons (`TODO`, `update`, `none`) do not arm the override.
+- **Fail-closed contract:** Any matching golden file modified without a scoped directive exits with code `1`.
+
 
 ### Pillar 4 — Verification orchestration (`quality`, `verification`)
 
