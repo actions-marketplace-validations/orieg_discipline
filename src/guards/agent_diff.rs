@@ -128,8 +128,81 @@ pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
         }
     }
 
-    ast_gates.push(deletion_rationale(ctx, &changed, &removed)?);
+    ast_gates.push(deletion_rationale(ctx, &changed, &removed, &added)?);
     Ok(ast_gates)
+}
+
+pub const RENAME_NAME_SIMILARITY_THRESHOLD: f64 = 0.5;
+
+pub fn name_similarity(a: &str, b: &str) -> f64 {
+    let a_leaf = a.rsplit("::").next().unwrap_or(a);
+    let b_leaf = b.rsplit("::").next().unwrap_or(b);
+    if a_leaf == b_leaf {
+        return 1.0;
+    }
+    if a_leaf.is_empty() || b_leaf.is_empty() {
+        return 0.0;
+    }
+    // Character bigram Sorensen-Dice similarity
+    let bigrams = |s: &str| -> Vec<(char, char)> {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() < 2 {
+            return Vec::new();
+        }
+        chars.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    let bg_a = bigrams(a_leaf);
+    let bg_b = bigrams(b_leaf);
+    let bigram_sim = if bg_a.is_empty() || bg_b.is_empty() {
+        if a_leaf == b_leaf {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        let mut matches = 0;
+        let mut b_used = vec![false; bg_b.len()];
+        for ga in &bg_a {
+            for (i, gb) in bg_b.iter().enumerate() {
+                if !b_used[i] && ga == gb {
+                    b_used[i] = true;
+                    matches += 1;
+                    break;
+                }
+            }
+        }
+        (2.0 * matches as f64) / ((bg_a.len() + bg_b.len()) as f64)
+    };
+
+    // Word-level token Dice similarity
+    let clean_a = a_leaf.strip_prefix("test_").unwrap_or(a_leaf);
+    let clean_b = b_leaf.strip_prefix("test_").unwrap_or(b_leaf);
+    let w_a: Vec<&str> = clean_a
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let w_b: Vec<&str> = clean_b
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let word_sim = if !w_a.is_empty() && !w_b.is_empty() {
+        let mut w_matches = 0;
+        let mut wb_used = vec![false; w_b.len()];
+        for wa in &w_a {
+            for (i, wb) in w_b.iter().enumerate() {
+                if !wb_used[i] && wa == wb {
+                    wb_used[i] = true;
+                    w_matches += 1;
+                    break;
+                }
+            }
+        }
+        (2.0 * w_matches as f64) / ((w_a.len() + w_b.len()) as f64)
+    } else {
+        0.0
+    };
+
+    bigram_sim.max(word_sim)
 }
 
 /// Pair tests by name within a file, then pair the leftovers across files so a
@@ -143,6 +216,9 @@ fn match_tests(rust: &[FileFacts]) -> (Vec<TestPair<'_>>, Vec<Located<'_>>, Vec<
         let base_tests: &[TestFn] = ff.base.as_ref().map(|f| &f.tests[..]).unwrap_or(&[]);
         let head_tests: &[TestFn] = ff.head.as_ref().map(|f| &f.tests[..]).unwrap_or(&[]);
         let mut taken = vec![false; head_tests.len()];
+        let mut file_unmatched_base = Vec::new();
+
+        // 1. Exact name match within file
         for b in base_tests {
             let hit = head_tests
                 .iter()
@@ -157,13 +233,42 @@ fn match_tests(rust: &[FileFacts]) -> (Vec<TestPair<'_>>, Vec<Located<'_>>, Vec<
                         head: h,
                     });
                 }
-                None => removed.push(Located {
+                None => file_unmatched_base.push(b),
+            }
+        }
+
+        // 2. Name similarity pairing within file for renames
+        let mut file_unmatched_head: Vec<(usize, &TestFn)> = head_tests
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !taken[*i])
+            .collect();
+
+        for b in file_unmatched_base {
+            let best = file_unmatched_head
+                .iter()
+                .enumerate()
+                .map(|(idx, &(orig_i, h))| (idx, orig_i, h, name_similarity(&b.name, &h.name)))
+                .filter(|&(_, _, _, sim)| sim >= RENAME_NAME_SIMILARITY_THRESHOLD)
+                .max_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+
+            if let Some((idx, orig_i, h, _sim)) = best {
+                taken[orig_i] = true;
+                file_unmatched_head.remove(idx);
+                pairs.push(TestPair {
+                    path: &ff.file.path,
+                    base: b,
+                    head: h,
+                });
+            } else {
+                removed.push(Located {
                     path: &ff.file.path,
                     file_survives: ff.head.is_some(),
                     test: b,
-                }),
+                });
             }
         }
+
         for (i, h) in head_tests.iter().enumerate() {
             if !taken[i] {
                 added.push(Located {
@@ -410,6 +515,7 @@ fn deletion_rationale(
     ctx: &Context,
     changed: &[ChangedFile],
     removed: &[Located],
+    added: &[Located],
 ) -> Result<GateOutcome> {
     const GATE: &str = "deletion-rationale";
     let settings = &ctx.config.gates.deletion_rationale;
@@ -444,10 +550,25 @@ fn deletion_rationale(
         );
     }
 
+    let mut file_removed_counts = std::collections::BTreeMap::new();
+    for r in removed.iter().filter(|r| r.file_survives) {
+        *file_removed_counts.entry(r.path).or_insert(0usize) += 1;
+    }
+    let mut file_added_counts = std::collections::BTreeMap::new();
+    for a in added.iter() {
+        *file_added_counts.entry(a.path).or_insert(0usize) += 1;
+    }
+
     // Tests removed from a file that still exists. Tests inside a deleted file
     // are covered by that file's own rationale.
+    // Require `removes:` only when removed tests outnumber added tests in that file.
     for r in removed.iter().filter(|r| r.file_survives) {
         if !watched.matches(r.path) || exempt.matches(r.path) {
+            continue;
+        }
+        let rem = file_removed_counts.get(r.path).copied().unwrap_or(0);
+        let add = file_added_counts.get(r.path).copied().unwrap_or(0);
+        if rem <= add {
             continue;
         }
         out.examined += 1;
@@ -459,10 +580,7 @@ fn deletion_rationale(
             "Test Removed Without Rationale",
             Some(r.path),
             None,
-            format!(
-                "Test `{}` was removed (or renamed) from `{}`.",
-                r.test.name, r.path
-            ),
+            format!("Test `{}` was removed from `{}`.", r.test.name, r.path),
             &format!(
                 "State why on its own line in the PR body or a commit message: \
                  `removes: {} <reason>`.",
@@ -471,4 +589,29 @@ fn deletion_rationale(
         );
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_similarity_discriminates_renames_from_unrelated_tests() {
+        assert_eq!(name_similarity("adds", "adds"), 1.0);
+        assert!(name_similarity("adds", "adds_integers") >= RENAME_NAME_SIMILARITY_THRESHOLD);
+        assert!(
+            name_similarity(
+                "ablation_sharded_alloc_counts_per_stripe",
+                "alloc_counts_per_stripe"
+            ) >= RENAME_NAME_SIMILARITY_THRESHOLD
+        );
+        assert!(
+            name_similarity(
+                "str_node_is_just_the_map_core",
+                "map_core_is_just_the_str_node"
+            ) >= RENAME_NAME_SIMILARITY_THRESHOLD
+        );
+        assert!(name_similarity("test_alpha", "test_beta") < RENAME_NAME_SIMILARITY_THRESHOLD);
+        assert!(name_similarity("adds", "orders") < RENAME_NAME_SIMILARITY_THRESHOLD);
+    }
 }

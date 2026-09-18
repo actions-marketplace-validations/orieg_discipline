@@ -284,6 +284,43 @@ fn rename_is_not_a_deletion_but_a_removed_test_is() {
     );
 }
 
+#[test]
+fn rename_test_by_name_similarity_passes_without_removes_directive() {
+    let repo = Repo::new();
+    repo.write(
+        "tests/a.rs",
+        &GOOD_TEST.replace("#[test]\nfn adds()", "#[test]\nfn adds_integers()"),
+    );
+    repo.commit("test: rename adds to adds_integers");
+    let run = repo.check(&[]);
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert!(run.titles("deletion-rationale").is_empty());
+    assert!(run.titles("assertion-reduction").is_empty());
+}
+
+#[test]
+fn rename_and_gut_fires_assertion_reduction() {
+    let repo = Repo::new();
+    // Rename adds to adds_integers and gut its assertions
+    let gutted = GOOD_TEST.replace(
+        "#[test]\nfn adds() {\n    assert_eq!(1 + 1, 2);\n    assert_eq!(2 + 2, 4);\n}",
+        "#[test]\nfn adds_integers() {\n    assert!(1 + 1 == 2);\n}",
+    );
+    repo.write("tests/a.rs", &gutted);
+    repo.commit("test: rename and reduce assertions");
+    let run = repo.check(&[]);
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.titles("assertion-reduction").len(), 1);
+}
+
 // ---- time-estimates --------------------------------------------------------
 
 #[test]
