@@ -1,0 +1,343 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+# Third-party actions are pinned by commit SHA. No job uses path filters, so
+# `skipped` is never a legitimate result and `ci-gate` accepts only `success`.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Install actionlint (pinned, checksum-verified)
+        run: tests/action/install-tool.sh actionlint
+      - run: actionlint -color .github/workflows/*.yml .gitea/workflows/*.yml
+      - run: shellcheck tests/action/*.sh
+      - name: Composite action shell blocks pass shellcheck
+        run: python3 tests/action/lint-action.py action.yml
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked 2>&1 | tee test.log
+          # A filter, cfg, or harness change that selects zero tests exits 0.
+          total="$(grep -Eo 'test result: ok\. [0-9]+ passed' test.log | awk '{ s += $4 } END { print s + 0 }')"
+          echo "tests passed: ${total}"
+          [ "${total}" -ge 50 ] || { echo "::error::only ${total} tests ran; the floor is 50"; exit 1; }
+      - run: cargo run --locked --quiet -- self-test
+
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          [ -n "${v}" ] || { echo "::error::Cargo.toml declares no rust-version"; exit 1; }
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --all-targets --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+
+  # The artifact every downstream job exercises: the same static binary shape
+  # the release pipeline ships.
+  build-static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Binary is static and its detectors discriminate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release/discipline
+          file "${bin}" | tee file.txt
+          grep -Eq 'statically linked|static-pie linked' file.txt
+          "${bin}" self-test
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/discipline
+          if-no-files-found: error
+          retention-days: 3
+
+  # The composite action on a real GitHub runner.
+  action-github:
+    needs: build-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: .ci-bin
+      - run: chmod +x .ci-bin/discipline
+      - name: Build fixtures
+        run: |
+          tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-clean" clean
+          tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-bad" bad
+
+      - name: "Positive control: clean change passes"
+        id: clean
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-clean
+          base_ref: main
+      - run: tests/action/assert-report.sh "${{ steps.clean.outputs.report }}" pass
+
+      - name: "Negative control: bad change is rejected"
+        id: bad
+        continue-on-error: true
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-bad
+          base_ref: main
+      # Assert the *reason*, not only the failure: a missing binary fails too.
+      - name: Rejection names the expected gates
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.bad.outcome }}
+          STATUS: ${{ steps.bad.outputs.status }}
+          REPORT: ${{ steps.bad.outputs.report }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::bad fixture did not fail the action"; exit 1; }
+          [ "${STATUS}" = "fail" ] || { echo "::error::status output was '${STATUS}'"; exit 1; }
+          tests/action/assert-report.sh "${REPORT}" fail \
+            assertion-reduction vacuous-tests unsafe-safety-comment time-estimates pii
+
+      - name: "Configurability: gates disabled through inputs stay silent"
+        id: tuned
+        continue-on-error: true
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-bad
+          base_ref: main
+          disable: |
+            time-estimates
+            pii
+          config_override: |
+            [gates.vacuous-tests]
+            severity = "warning"
+      - name: Only the still-enabled blocking gates fired
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.tuned.outcome }}
+          WARNINGS: ${{ steps.tuned.outputs.warnings }}
+          REPORT: ${{ steps.tuned.outputs.report }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ]
+          [ "${WARNINGS}" = "1" ] || { echo "::error::expected 1 warning, got '${WARNINGS}'"; exit 1; }
+          tests/action/assert-report.sh "${REPORT}" fail \
+            assertion-reduction vacuous-tests unsafe-safety-comment
+
+      - name: "Fail closed: an unresolvable base is an error, not a pass"
+        id: nobase
+        continue-on-error: true
+        uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+          working_directory: ${{ runner.temp }}/fx-clean
+          base_ref: no-such-branch
+      - name: Unresolvable base failed the step
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.nobase.outcome }}
+          STATUS: ${{ steps.nobase.outputs.status }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::unknown base passed"; exit 1; }
+          [ -z "${STATUS}" ] || { echo "::error::a verdict was produced without a base"; exit 1; }
+
+      # The download path, before any real release exists: a local release
+      # store laid out like GitHub's, served over HTTP.
+      - name: Serve a fake release store
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests/action/fake-release.sh .ci-bin/discipline "${RUNNER_TEMP}/store" v0.0.0-ci
+          tests/action/fake-release.sh .ci-bin/discipline "${RUNNER_TEMP}/store" v0.0.0-tampered tamper
+          (cd "${RUNNER_TEMP}/store" && nohup python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          for _ in 1 2 3 4 5; do
+            curl --fail --silent --output /dev/null http://127.0.0.1:8765/download/v0.0.0-ci/SHA256SUMS && exit 0
+            sleep 1
+          done
+          echo "::error::fake release store did not come up"; exit 1
+      - name: "Download path: checksum-verified install works"
+        id: download
+        uses: ./
+        with:
+          version: v0.0.0-ci
+          download_url: http://127.0.0.1:8765
+          working_directory: ${{ runner.temp }}/fx-clean
+          base_ref: main
+      - run: tests/action/assert-report.sh "${{ steps.download.outputs.report }}" pass
+      - name: "Download path: a tampered archive is refused"
+        id: tampered
+        continue-on-error: true
+        uses: ./
+        with:
+          version: v0.0.0-tampered
+          download_url: http://127.0.0.1:8765
+          working_directory: ${{ runner.temp }}/fx-clean
+          base_ref: main
+      - name: Refusal was the checksum, and no verdict was produced
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.tampered.outcome }}
+          INSTALL_ERROR: ${{ steps.tampered.outputs.install_error }}
+          STATUS: ${{ steps.tampered.outputs.status }}
+        run: |
+          set -euo pipefail
+          [ "${OUTCOME}" = "failure" ] || { echo "::error::tampered archive was installed"; exit 1; }
+          case "${INSTALL_ERROR}" in
+            *"checksum mismatch"*) ;;
+            *) echo "::error::failed for another reason: '${INSTALL_ERROR}'"; exit 1 ;;
+          esac
+          [ -z "${STATUS}" ] || { echo "::error::a verdict was produced by an unverified binary"; exit 1; }
+
+  # Gitea's act_runner is built on nektos/act: run the Gitea workflow under act
+  # with Gitea's runner image. A live Gitea server is the stronger check and is
+  # tracked in docs/PRD.md; this proves the action has no GitHub-only dependency.
+  action-gitea:
+    needs: build-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: .ci-bin
+      - run: chmod +x .ci-bin/discipline
+      - name: Install act (pinned, checksum-verified)
+        run: tests/action/install-tool.sh act
+      - name: Run .gitea/workflows/action-selftest.yml under act
+        shell: bash
+        run: |
+          set -euo pipefail
+          act push \
+            --workflows .gitea/workflows/action-selftest.yml \
+            --platform ubuntu-latest=gitea/runner-images:ubuntu-latest \
+            --bind 2>&1 | tee act.log
+          # act exits 0 when it matched no job; require proof the jobs ran.
+          grep -q 'report matches expectation: pass' act.log
+          grep -q 'report matches expectation: fail' act.log
+
+  # The local pre-commit path, through the pre-commit framework.
+  pre-commit:
+    needs: build-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: .ci-bin
+      - name: Put the binary on PATH and install pre-commit
+        run: |
+          chmod +x .ci-bin/discipline
+          echo "${GITHUB_WORKSPACE}/.ci-bin" >> "${GITHUB_PATH}"
+          pipx install pre-commit
+      - run: tests/action/test-pre-commit.sh "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}"
+
+  # discipline gates its own repository.
+  dogfood:
+    needs: build-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: .ci-bin
+      - run: chmod +x .ci-bin/discipline
+      - uses: ./
+        with:
+          binary_path: .ci-bin/discipline
+
+  ci-gate:
+    if: always()
+    needs: [lint, test, msrv, supply-chain, build-static, action-github, action-gitea, pre-commit, dogfood]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        shell: bash
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          set -euo pipefail
+          echo "${NEEDS}" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # Allow-list, not deny-list: anything other than `success` — including
+          # `skipped`, `cancelled`, or a result string added later — fails.
+          bad="$(echo "${NEEDS}" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
+          count="$(echo "${NEEDS}" | jq 'length')"
+          [ "${count}" -eq 9 ] || { echo "::error::expected 9 needed jobs, saw ${count}"; exit 1; }
+          [ -z "${bad}" ] || { echo "::error::not successful: ${bad}"; exit 1; }
