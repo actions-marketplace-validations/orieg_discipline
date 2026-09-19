@@ -33,6 +33,59 @@ pub struct GitCtx {
     staged: bool,
 }
 
+/// Detect the target base git ref for diff inspection.
+///
+/// Precedence:
+/// 1. Explicit CLI argument (`--base <ref>`)
+/// 2. `DISCIPLINE_BASE_REF` environment variable
+/// 3. GitLab Merge Request Target Branch: `CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (`origin/<branch>`)
+/// 4. GitLab Merge Request Diff Base SHA: `CI_MERGE_REQUEST_DIFF_BASE_SHA`
+/// 5. GitLab Default Branch: `CI_DEFAULT_BRANCH` (`origin/<branch>`)
+/// 6. Default fallback: `"origin/main"`
+pub fn detect_base_ref(explicit_base: Option<&str>) -> String {
+    detect_base_ref_with_env(explicit_base, |k| std::env::var(k).ok())
+}
+
+pub fn detect_base_ref_with_env<F>(explicit_base: Option<&str>, get_env: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(b) = explicit_base.filter(|s| !s.trim().is_empty()) {
+        return b.to_string();
+    }
+    if let Some(b) = get_env("DISCIPLINE_BASE_REF") {
+        if !b.trim().is_empty() {
+            return b.trim().to_string();
+        }
+    }
+    if let Some(target_branch) = get_env("CI_MERGE_REQUEST_TARGET_BRANCH_NAME") {
+        if !target_branch.trim().is_empty() {
+            let trimmed = target_branch.trim();
+            if trimmed.starts_with("origin/") {
+                return trimmed.to_string();
+            } else {
+                return format!("origin/{}", trimmed);
+            }
+        }
+    }
+    if let Some(diff_base) = get_env("CI_MERGE_REQUEST_DIFF_BASE_SHA") {
+        if !diff_base.trim().is_empty() {
+            return diff_base.trim().to_string();
+        }
+    }
+    if let Some(default_branch) = get_env("CI_DEFAULT_BRANCH") {
+        if !default_branch.trim().is_empty() {
+            let trimmed = default_branch.trim();
+            if trimmed.starts_with("origin/") {
+                return trimmed.to_string();
+            } else {
+                return format!("origin/{}", trimmed);
+            }
+        }
+    }
+    "origin/main".to_string()
+}
+
 impl GitCtx {
     /// `staged = true` inspects the index against `HEAD` (pre-commit hook).
     /// Otherwise the working tree is measured against the merge base of
@@ -59,7 +112,13 @@ impl GitCtx {
             let head = head.ok_or_else(|| {
                 anyhow!("repository has no commits; use --staged for the first commit")
             })?;
-            let base_commit = [base_ref.to_string(), format!("origin/{base_ref}")]
+            let mut candidates = vec![base_ref.to_string()];
+            if let Some(stripped) = base_ref.strip_prefix("origin/") {
+                candidates.push(stripped.to_string());
+            } else {
+                candidates.push(format!("origin/{base_ref}"));
+            }
+            let base_commit = candidates
                 .iter()
                 .find_map(|name| Some(repo.revparse_single(name).ok()?.peel_to_commit().ok()?.id()))
                 .ok_or_else(|| {
@@ -422,4 +481,76 @@ pub fn is_binary_file(path: &str, bytes: &[u8]) -> bool {
     // 3. For files with unknown or no extension: if the first 1024 bytes contain NUL, treat as binary.
     let check_len = bytes.len().min(1024);
     bytes[..check_len].contains(&0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_base_ref_explicit() {
+        assert_eq!(
+            detect_base_ref_with_env(Some("my-branch"), |_| None),
+            "my-branch"
+        );
+    }
+
+    #[test]
+    fn test_detect_base_ref_discipline_base_ref() {
+        let lookup = |k: &str| {
+            if k == "DISCIPLINE_BASE_REF" {
+                Some("upstream/dev".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(detect_base_ref_with_env(None, lookup), "upstream/dev");
+    }
+
+    #[test]
+    fn test_detect_base_ref_gitlab_target_branch() {
+        let lookup = |k: &str| {
+            if k == "CI_MERGE_REQUEST_TARGET_BRANCH_NAME" {
+                Some("feature/pr-123".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            detect_base_ref_with_env(None, lookup),
+            "origin/feature/pr-123"
+        );
+    }
+
+    #[test]
+    fn test_detect_base_ref_gitlab_diff_base_sha() {
+        let lookup = |k: &str| {
+            if k == "CI_MERGE_REQUEST_DIFF_BASE_SHA" {
+                Some("1234567890abcdef1234567890abcdef12345678".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            detect_base_ref_with_env(None, lookup),
+            "1234567890abcdef1234567890abcdef12345678"
+        );
+    }
+
+    #[test]
+    fn test_detect_base_ref_gitlab_default_branch() {
+        let lookup = |k: &str| {
+            if k == "CI_DEFAULT_BRANCH" {
+                Some("master".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(detect_base_ref_with_env(None, lookup), "origin/master");
+    }
+
+    #[test]
+    fn test_detect_base_ref_fallback() {
+        assert_eq!(detect_base_ref_with_env(None, |_| None), "origin/main");
+    }
 }
