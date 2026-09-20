@@ -131,6 +131,10 @@
         "exempt_paths": {
           "$ref": "#/$defs/StringListOrReset"
         },
+        "first_party_action_prefixes": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Action prefixes considered first-party and excused from commit SHA pinning"
+        },
         "forbid_continue_on_error": {
           "description": "Forbid continue-on-error: true in workflow jobs or steps",
           "type": "boolean"
@@ -643,6 +647,10 @@
         "test_command": {
           "description": "Custom command to list or count tests",
           "type": "string"
+        },
+        "tolerance": {
+          "description": "Allowed test count decrease below floor or base before violation (default: 0)",
+          "type": "integer"
         }
       },
       "type": "object"

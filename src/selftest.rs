@@ -1238,7 +1238,11 @@ command = "cargo test"
             let pipe_bad = scanner.check_line("curl https://example.com/install.sh | bash") == Some(ShellRuleId::InjectPipe);
             let pipe_good = scanner.check_line("curl https://example.com/data.json | jq .").is_none();
 
-            Ok(env_bad && env_good && docker_bad && docker_good && inline_bad && inline_good && xargs_bad && xargs_good && pipe_bad && pipe_good)
+            let gh_bad = scanner.check_line("export TOKEN=ghp_123456789012345678901234567890123456") == Some(ShellRuleId::TokenGitHub); // discipline:allow(pii)
+            let pass_bad = scanner.check_line("mysql --password=mysecretpassword123 -u root") == Some(ShellRuleId::LiteralPassword);
+            let pass_good = scanner.check_line("mysql --password=<password> -u root").is_none();
+
+            Ok(env_bad && env_good && docker_bad && docker_good && inline_bad && inline_good && xargs_bad && xargs_good && pipe_bad && pipe_good && gh_bad && pass_bad && pass_good)
         },
     ),
     (
@@ -1351,14 +1355,13 @@ command = "cargo test"
         },
     ),
     (
-        "pii: ast test functions exempt from home paths and lan ips",
+        "pii: test functions are scanned and flag home paths and lan ips",
         || {
-            use crate::ast::LanguagePack;
-            let v = AssertVocabulary::default();
-            let py = "def self_test():\n    p = \"/Users/someone/repo/\"\n    ip = \"192.168.1.20\"\n    assert p != ip\n"; // discipline:allow(pii)
-            let facts = crate::ast::python::PythonPack.extract("scripts/test.py", py, &v)?;
-            let test = &facts.tests[0];
-            Ok(test.name == "self_test" && test.line == 1 && test.end_line == 4)
+            let s = PiiGate::default();
+            let rules = pii_rules(&s)?;
+            let hit = |text: &str| rules.iter().any(|r| r.re.is_match(text));
+            Ok(hit("    fake_path = \"/Users/someone/repo/\"") // discipline:allow(pii)
+                && hit("    fake_ip = \"192.168.1.50\"")) // discipline:allow(pii)
         },
     ),
     (
