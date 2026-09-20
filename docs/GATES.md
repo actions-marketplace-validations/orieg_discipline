@@ -342,6 +342,10 @@ When a change touches source files in a language without an active pack, each AS
   - `ARGV-INLINE`: Expanding secret variables inside inline script strings `sh -c "... $SECRET ..."`.
   - `INJECT-XARGS`: Metacharacter command injection via `xargs -I {} sh -c '... {} ...'`.
   - `INJECT-PIPE`: Piping remote network downloads directly into shell interpreters `curl ... | bash`.
+- **Installer & `INJECT-PIPE` Rationale:**
+  - `INJECT-PIPE` flags piping remote network streams directly into shell interpreters (`curl ... | sh` / `curl ... | bash`) because uninspected piped execution is vulnerable to network truncation, connection drops leading to partial execution, and unverified execution.
+  - Checksum-verifying installers that inspect payloads internally: when an installer script internally fetches release assets, verifies their cryptographic SHA-256 checksum against `SHA256SUMS`, and only unpacks or executes upon hash verification, the downloaded binary payload is verified.
+  - However, download-verify-run (`curl -fsSL -o install.sh ... && bash install.sh`) remains the primary recommended pattern so operators can inspect the script before execution and avoid partial execution on interrupted connections.
 - **Lifting directive:** `secrets-argv-ok: <file-or-line> <reason>` in PR body or commit, or inline `discipline:allow(shell-secrets)`.
 - **Config keys:** `enabled`, `severity`, `exempt_paths`, `extra_secret_patterns`, `allow_patterns`, `diff_only`.
 
@@ -867,6 +871,26 @@ Discipline provides universal static binary drop-in replacements for the legacy 
 | `bench-regression` | `scripts/perf_report.py`, `scripts/wasm_fuel.py` | In-job dual-file mode (`--bench-base-file` and `--bench-head-file`), `iai-callgrind` console line and neutral JSON parsers, two-tier threshold (single-worst >5% or $\ge 2$ arms regressing >0.5% noise floor, advisory 0.1%), declared arm exemptions, sourced overrides verifying CI URL or committed artifact and named arms, missing-baseline fatal fail-closed. |
 | `provenance-tags` | `scripts/check_docs_hygiene.py` | Table numeric provenance (`(measured: host, commit)`, `(target)`, `(projected)`), mechanism claim hardware counter citations, wall-clock intervals, paired comparison tags (`(workload: id)`). |
 | `command` | Bespoke shell runner wrappers | Universal fail-closed timeout wrapper, zero-tests guards, turnkey presets (`cargo-public-api`, `miri`, `sanitizers`, `loom`, `cargo-deny`, `cargo-mutants`). |
+
+---
+
+## Repository Security Boundary & Workspace Ownership
+
+Discipline inspects git history and diffs using `libgit2`. Access to the underlying git repository enforces strict security boundaries that differ between host workstations and containerized environments:
+
+### Host Binary Enforcement (CVE-2022-24765 Protection)
+On developer workstations and multi-tenant hosts, the native `discipline` binary enforces strict repository owner validation by default.
+- **Threat Model (CVE-2022-24765):** In multi-user systems, an attacker can create a malicious `.git` directory in a shared location (such as `/tmp` or a shared parent directory) with poisoned configuration, hooks, or executable aliases. If a tool traverses into that directory without checking ownership, it could execute arbitrary code under the invoking user's credentials.
+- **Fail-Closed Guard:** If the repository at the discovered path is not owned by the current user, `discipline` fails closed with code `code=Owner (-36)` and prints an actionable diagnostic naming the cause and resolution paths.
+- **Opt-In Override:** In automated or specialized host environments where cross-user repository access is intentional and audited, owner validation can be disabled via the `--trust-workspace` CLI flag or by passing `DISCIPLINE_TRUST_WORKSPACE=1`.
+
+### Container Image Relaxation
+The official container image (`ghcr.io/orieg/discipline`) intentionally relaxes repository owner validation out-of-the-box (via system-wide `safe.directory '*'`, an entrypoint wrapper registering the active directory, and `ENV DISCIPLINE_TRUST_WORKSPACE=1`).
+- **Operational Reality:** In containerized CI/CD runners (Docker volume mounts, Gitea Act Runner, Forgejo Runner, GitLab CI `/builds`, Kubernetes/Argo `/workspace`), checkout volumes are frequently owned by root (`0:0`) or the host runner UID, while the container executes as unprivileged `USER 10001:10001`. Requiring manual `--user` overrides or volume-mounted git configs adds significant friction and causes false-positive failures on normal setups.
+- **Security Assessment:** Relaxing owner validation within the official container image is safe because:
+  1. **Ephemeral Single-Purpose Sandbox:** The container executes inside an isolated container namespace with a dedicated filesystem and unprivileged user credentials (`USER 10001:10001`).
+  2. **No Hook or Pager Execution:** `discipline` and `libgit2` do not invoke external git hooks, custom diff filters, or pager binaries, which eliminated the execution vector exploited in CVE-2022-24765.
+  3. **No Root Escalation:** The container lacks `setuid` binaries or root escalation capabilities.
 
 ---
 
