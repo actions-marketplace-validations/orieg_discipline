@@ -6490,10 +6490,27 @@ enabled = true
     );
     repo.commit("chore: enable miri gate");
 
-    // 1. Negative control: execution without waiver fails (exit 1)
+    // 1. Negative control. Two legitimate outcomes, and the REASON must match
+    //    the exit code (fail-closed contract, docs/ARCHITECTURE.md §3 F1/F2):
+    //      exit 2 = the toolchain is absent, so the gate could not check;
+    //      exit 1 = miri ran and found undefined behavior.
+    //    Reporting a missing component as detected UB is the defect this pins.
     let run_bad = repo.check(&[]);
-    assert_eq!(run_bad.code, 1);
-    assert!(!run_bad.titles("miri").is_empty());
+    match run_bad.code {
+        2 => assert!(
+            run_bad.stderr.contains("miri could not run"),
+            "exit 2 must name the environment fault, got: {}",
+            run_bad.stderr
+        ),
+        1 => assert!(
+            !run_bad.titles("miri").is_empty(),
+            "exit 1 must carry a miri finding"
+        ),
+        other => panic!(
+            "unexpected exit {other}: {}{}",
+            run_bad.stdout, run_bad.stderr
+        ),
+    }
 
     // 2. With waiver directive, execution or missing cargo-miri is waived
     repo.commit(
@@ -6527,10 +6544,25 @@ canary = false
     );
     repo.commit("chore: enable sanitizers gate");
 
-    // 1. Negative control: execution without waiver fails (exit 1)
+    // 1. Negative control. As for miri: exit 2 when the nightly toolchain is
+    //    absent (could not check), exit 1 only when a sanitizer actually ran
+    //    and reported a memory-safety or race violation.
     let run_bad = repo.check(&[]);
-    assert_eq!(run_bad.code, 1);
-    assert!(!run_bad.titles("sanitizers").is_empty());
+    match run_bad.code {
+        2 => assert!(
+            run_bad.stderr.contains("could not run"),
+            "exit 2 must name the environment fault, got: {}",
+            run_bad.stderr
+        ),
+        1 => assert!(
+            !run_bad.titles("sanitizers").is_empty(),
+            "exit 1 must carry a sanitizers finding"
+        ),
+        other => panic!(
+            "unexpected exit {other}: {}{}",
+            run_bad.stdout, run_bad.stderr
+        ),
+    }
 
     // 2. With waiver directive, execution on non-nightly host is waived
     repo.commit("chore: run sanitizers with waiver\n\ndiscipline:allow(sanitizers): nightly toolchain unavailable");
@@ -7135,4 +7167,49 @@ fn completions_subcommand_outputs_valid_shell_script() {
         assert_eq!(run.code, 0);
         assert!(!run.stdout.is_empty(), "completions for {shell} was empty");
     }
+}
+
+#[test]
+fn submodule_gitlink_entries_do_not_break_the_run() {
+    // A gitlink (mode 160000) is a directory on disk, not a file. Every
+    // file-reading gate used to hit it in turn and abort the whole run with
+    // "failed to read `<path>`: Is a directory (os error 21)", so any change
+    // that bumped a submodule pointer turned the gate red with no route
+    // forward. Shipping since the first release; reported by a consumer.
+    let repo = Repo::new();
+
+    // Build a real mode-160000 index entry without needing a second clone.
+    let head = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    repo.git(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("160000,{head},third_party/dep"),
+    ]);
+    repo.write(".gitmodules", "[submodule \"third_party/dep\"]\n\tpath = third_party/dep\n\turl = https://example.invalid/dep.git\n");
+    repo.git(&["add", ".gitmodules"]);
+    // The directory must exist on disk: that is what turns a read of the
+    // gitlink path into "Is a directory (os error 21)".
+    std::fs::create_dir_all(repo.file("third_party/dep")).unwrap();
+    std::fs::write(repo.file("third_party/dep/README"), "vendored\n").unwrap();
+    repo.git(&["commit", "-q", "-m", "feat: vendor a submodule"]);
+
+    let run = repo.check(&["--base", "main"]);
+    assert_ne!(
+        run.code, 2,
+        "a gitlink must not abort the run: {}{}",
+        run.stdout, run.stderr
+    );
+    assert!(
+        !run.stderr.contains("Is a directory"),
+        "gitlink surfaced as a read error: {}",
+        run.stderr
+    );
 }
