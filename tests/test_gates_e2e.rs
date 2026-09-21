@@ -6909,3 +6909,156 @@ fn test_owner_validation_actionable_error_diagnostic_r1() {
     assert!(owner_remediation.contains("--user"));
     assert!(owner_remediation.contains("safe.directory"));
 }
+
+#[test]
+fn test_conflicting_cli_options_fail_closed_exit_2() {
+    let repo = Repo::new();
+
+    // 1. --commit vs --commit-range
+    let run1 = repo.run(
+        &[
+            "check",
+            "--commit",
+            "abcdef1",
+            "--commit-range",
+            "HEAD~1..HEAD",
+        ],
+        &[],
+    );
+    assert_eq!(
+        run1.code, 2,
+        "conflicting commit options must exit with code 2"
+    );
+    assert!(
+        run1.stderr.contains("cannot be used with") || run1.stderr.contains("conflict"),
+        "stderr: {}",
+        run1.stderr
+    );
+
+    // 2. --staged vs --commit
+    let run2 = repo.run(&["check", "--staged", "--commit", "abcdef1"], &[]);
+    assert_eq!(run2.code, 2, "--staged and --commit must exit with code 2");
+    assert!(
+        run2.stderr.contains("cannot be used with") || run2.stderr.contains("conflict"),
+        "stderr: {}",
+        run2.stderr
+    );
+
+    // 3. --staged vs --commit-range
+    let run3 = repo.run(
+        &["check", "--staged", "--commit-range", "HEAD~1..HEAD"],
+        &[],
+    );
+    assert_eq!(
+        run3.code, 2,
+        "--staged and --commit-range must exit with code 2"
+    );
+    assert!(
+        run3.stderr.contains("cannot be used with") || run3.stderr.contains("conflict"),
+        "stderr: {}",
+        run3.stderr
+    );
+}
+
+#[test]
+fn test_check_fatal_error_emits_configured_reports() {
+    let repo = Repo::new();
+    let run = repo.run(
+        &[
+            "check",
+            "--base",
+            "nonexistent-branch-ref-that-fails-git",
+            "--report-junit",
+            "junit.xml",
+            "--report-sarif",
+            "sarif.json",
+            "--report-gitlab",
+            "gitlab.json",
+            "--json-out",
+            "report.json",
+        ],
+        &[],
+    );
+    assert_eq!(run.code, 2, "fatal check error must exit with code 2");
+
+    let junit_path = repo.file("junit.xml");
+    assert!(
+        junit_path.exists(),
+        "junit.xml must be created on fatal error"
+    );
+    let junit_content = std::fs::read_to_string(&junit_path).unwrap();
+    assert!(
+        junit_content.contains("<testsuite name=\"engine\""),
+        "expected engine testsuite in junit: {junit_content}"
+    );
+    assert!(
+        junit_content.contains("<failure message=\"fatal error during check execution:"),
+        "expected fatal error failure in junit: {junit_content}"
+    );
+
+    let sarif_path = repo.file("sarif.json");
+    assert!(
+        sarif_path.exists(),
+        "sarif.json must be created on fatal error"
+    );
+    let sarif_content = std::fs::read_to_string(&sarif_path).unwrap();
+    let sarif_json: serde_json::Value = serde_json::from_str(&sarif_content).unwrap();
+    assert_eq!(
+        sarif_json["runs"][0]["results"][0]["ruleId"], "engine",
+        "expected engine rule in sarif: {sarif_content}"
+    );
+    assert_eq!(
+        sarif_json["runs"][0]["results"][0]["level"], "error",
+        "expected error level in sarif"
+    );
+
+    let gitlab_path = repo.file("gitlab.json");
+    assert!(
+        gitlab_path.exists(),
+        "gitlab.json must be created on fatal error"
+    );
+    let gitlab_content = std::fs::read_to_string(&gitlab_path).unwrap();
+    let gitlab_json: serde_json::Value = serde_json::from_str(&gitlab_content).unwrap();
+    assert_eq!(
+        gitlab_json[0]["check_name"], "engine::engine",
+        "expected engine::engine in gitlab: {gitlab_content}"
+    );
+
+    let report_path = repo.file("report.json");
+    assert!(
+        report_path.exists(),
+        "report.json must be created on fatal error"
+    );
+    let report_content = std::fs::read_to_string(&report_path).unwrap();
+    let report_json: serde_json::Value = serde_json::from_str(&report_content).unwrap();
+    assert_eq!(report_json["errors"], 1);
+    assert_eq!(report_json["outcomes"][0]["gate"], "engine");
+}
+
+#[test]
+fn test_version_and_help_exit_code_zero() {
+    let repo = Repo::new();
+    let run_version = repo.run(&["--version"], &[]);
+    assert_eq!(
+        run_version.code, 0,
+        "discipline --version must exit code 0, got {}",
+        run_version.code
+    );
+    assert!(
+        run_version.stdout.contains("discipline"),
+        "version output: {}",
+        run_version.stdout
+    );
+
+    let run_help = repo.run(&["--help"], &[]);
+    assert_eq!(
+        run_help.code, 0,
+        "discipline --help must exit code 0, got {}",
+        run_help.code
+    );
+    assert!(
+        run_help.stdout.contains("Usage:"),
+        "help output: {}",
+        run_help.stdout
+    );
+}

@@ -2,7 +2,7 @@
 //!
 //! Allows teams adopting discipline on mature repositories to grandfather pre-existing
 //! findings into `discipline-baseline.toml` using `discipline baseline --write`.
-//! Subsequent runs report baselined findings as non-blocking notes ("N baselined findings not blocking")
+//! Subsequent runs report baselined findings as non-blocking notes ("N findings grandfathered by baseline in this gate (not blocking)")
 //! and fail only on NEW violations.
 //!
 //! Fingerprints are stable and decoupled from line numbers:
@@ -70,15 +70,15 @@ impl DisciplineBaseline {
     }
 }
 
-/// Compute a stable finding fingerprint decoupled from line numbers.
-///
-/// Formula: sha256(gate + ":" + rule + ":" + path + ":" + sha256(normalized_line_content))
-pub fn compute_violation_fingerprint(repo_root: &Path, v: &Violation) -> String {
+/// Compute a stable finding fingerprint decoupled from line numbers using a custom content reader.
+pub fn compute_violation_fingerprint_with_content<F>(v: &Violation, read_file: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
     let path = v.file.as_deref().unwrap_or("");
     let line_content = match (&v.file, v.line) {
         (Some(f), Some(l)) if l > 0 => {
-            let full_path = repo_root.join(f);
-            if let Ok(content) = std::fs::read_to_string(&full_path) {
+            if let Some(content) = read_file(f) {
                 content
                     .lines()
                     .nth(l - 1)
@@ -96,6 +96,16 @@ pub fn compute_violation_fingerprint(repo_root: &Path, v: &Violation) -> String 
     sha256_hex(source.as_bytes())
 }
 
+/// Compute a stable finding fingerprint decoupled from line numbers.
+///
+/// Formula: sha256(gate + ":" + rule + ":" + path + ":" + sha256(normalized_line_content))
+pub fn compute_violation_fingerprint(repo_root: &Path, v: &Violation) -> String {
+    compute_violation_fingerprint_with_content(v, |f| {
+        let full_path = repo_root.join(f);
+        std::fs::read_to_string(&full_path).ok()
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct BaselineMatchResult {
     pub baselined_count: usize,
@@ -103,17 +113,40 @@ pub struct BaselineMatchResult {
     pub stale_by_gate: BTreeMap<String, usize>,
 }
 
-/// Match detected violations against the baseline.
-///
-/// Grandfathered violations are removed from `outcome.violations` and accounted for
-/// in `outcome.baselined` and `outcome.notes`.
-/// Stale baseline entries (entries in baseline with no matching violation in this run)
-/// are reported as non-blocking notes prompting ratcheting down.
+/// Match detected violations against the baseline using repository root path.
 pub fn apply_baseline(
     repo_root: &Path,
     baseline: &DisciplineBaseline,
     outcomes: &mut [GateOutcome],
 ) -> BaselineMatchResult {
+    apply_baseline_with_reader(
+        |f| {
+            let full_path = repo_root.join(f);
+            std::fs::read_to_string(&full_path).ok()
+        },
+        baseline,
+        outcomes,
+    )
+}
+
+/// Match detected violations against the baseline using GitCtx (supports staged index blobs).
+pub fn apply_baseline_with_git(
+    git: &crate::gitctx::GitCtx,
+    baseline: &DisciplineBaseline,
+    outcomes: &mut [GateOutcome],
+) -> BaselineMatchResult {
+    apply_baseline_with_reader(|f| git.head_content(f).ok().flatten(), baseline, outcomes)
+}
+
+/// Match detected violations against the baseline with custom line reader.
+pub fn apply_baseline_with_reader<F>(
+    read_file: F,
+    baseline: &DisciplineBaseline,
+    outcomes: &mut [GateOutcome],
+) -> BaselineMatchResult
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut available_fps: HashMap<String, usize> = HashMap::new();
     for entry in &baseline.findings {
         *available_fps.entry(entry.fingerprint.clone()).or_insert(0) += 1;
@@ -131,7 +164,7 @@ pub fn apply_baseline(
         let mut gate_baselined = 0;
 
         for v in outcome.violations.drain(..) {
-            let fp = compute_violation_fingerprint(repo_root, &v);
+            let fp = compute_violation_fingerprint_with_content(&v, &read_file);
             if let Some(count) = available_fps.get_mut(&fp) {
                 if *count > 0 {
                     *count -= 1;
@@ -150,13 +183,13 @@ pub fn apply_baseline(
         if gate_baselined > 0 {
             let suffix = if gate_baselined == 1 { "" } else { "s" };
             outcome.notes.push(format!(
-                "{gate_baselined} baselined finding{suffix} not blocking"
+                "{gate_baselined} finding{suffix} grandfathered by baseline in this gate (not blocking)"
             ));
         }
     }
 
     let mut stale_count = 0;
-    let mut stale_by_gate: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stale_entries_by_gate: BTreeMap<String, Vec<&BaselineEntry>> = BTreeMap::new();
 
     let mut consumed_fps = matched_by_entry;
     for entry in &baseline.findings {
@@ -167,17 +200,43 @@ pub fn apply_baseline(
             }
         }
         stale_count += 1;
-        *stale_by_gate.entry(entry.gate.clone()).or_insert(0) += 1;
+        stale_entries_by_gate
+            .entry(entry.gate.clone())
+            .or_default()
+            .push(entry);
     }
 
-    if stale_count > 0 {
-        for (gate, count) in &stale_by_gate {
-            if let Some(outcome) = outcomes.iter_mut().find(|o| o.gate == gate) {
-                let suffix = if *count == 1 { "y" } else { "ies" };
-                outcome.notes.push(format!(
-                    "{count} stale baseline entr{suffix} (resolved findings): run `discipline baseline --write` to ratchet down"
-                ));
+    let mut stale_by_gate: BTreeMap<String, usize> = BTreeMap::new();
+    for (gate, entries) in &stale_entries_by_gate {
+        stale_by_gate.insert(gate.clone(), entries.len());
+        if let Some(outcome) = outcomes.iter_mut().find(|o| o.gate == *gate) {
+            if !outcome.enabled {
+                continue;
             }
+            let count = entries.len();
+            let suffix = if count == 1 { "y" } else { "ies" };
+            let sample = entries
+                .iter()
+                .take(2)
+                .map(|e| {
+                    if e.path.is_empty() {
+                        format!("`{}`", e.rule)
+                    } else {
+                        format!("`{}` in `{}`", e.rule, e.path)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sample_str = if sample.is_empty() {
+                String::new()
+            } else if count > 2 {
+                format!(" (e.g. {sample}, ...)")
+            } else {
+                format!(" ({sample})")
+            };
+            outcome.notes.push(format!(
+                "{count} stale baseline entr{suffix} (resolved findings){sample_str}: run `discipline baseline --write` to ratchet down"
+            ));
         }
     }
 
