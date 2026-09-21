@@ -204,6 +204,15 @@ Every gate in Discipline must satisfy the following 12 load-bearing invariant ru
 | **F11** | **Untrusted text never reaches a shell parser.** All action inputs pass through `env:`, never inline `${{ }}` interpolation. | Inline shell injection vulnerabilities in workflow expressions. |
 | **F12** | **The installer verifies what it runs.** Actions download release archives and verify them against `SHA256SUMS` with no opt-out; no fallbacks to unverified compilation. | Scaffold download failure falling back to unverified local build. |
 
+### 3.1 Defaults Are Part of the Compatibility Contract
+
+A consumer who runs Discipline with zero configuration, or who configures only some gates, relies on the built-in default **enablement** and **severity** of every other gate. A default that becomes looser (a gate turned off, or moved from `error` to `warning` or `note`) silently stops blocking for that consumer, with no diff in their repository to review. Defaults are therefore versioned like the configuration schema:
+
+- **Within a major version, a default may only become stricter** (off to on, `note` to `warning`, `warning` to `error`) without further ceremony.
+- **A looser default within a major version requires a release-note entry** in the [Default Changes ledger](ROADMAP.md#default-changes-compatibility-ledger) naming the gate, the old and new default, the reason, and the one-line configuration that restores the old behaviour. The entry lands in the same pull request as the change.
+- **Every default is pinned by a test.** `tests/test_config.rs::default_enablement_and_severity_match_snapshot` compares the compiled defaults of every available gate against a committed snapshot. Changing a default fails that test until the snapshot is edited, so the change is visible in review next to its ledger entry.
+- **The reference is generated.** The *Default* column of the configuration table in `docs/CONFIGURATION.md` is rendered by `discipline docs` from the compiled defaults and the JSON Schema, so documentation cannot claim a default the binary does not ship. Per-gate rationale lives in `docs/GATES.md` ("Default Severity by Gate").
+
 ---
 
 ## 4. Module Map
@@ -329,14 +338,14 @@ Static security analysis runs on pull requests, pushes to `main`, and on a sched
 - **Query suite:** Configured with `queries: security-extended` for deep vulnerability scanning.
 - **Toolchain:** Pins `dtolnay/rust-toolchain` stable for Rust AST and macro expansion.
 
-#### CodeQL Rust Build Mode Evaluation (`none` vs Built)
-- **Supported Modes:** GitHub CodeQL for Rust officially supports two build modes: `none` and `autobuild`. The `manual` build mode is explicitly unsupported for Rust and produces an engine error.
-- **Mechanism:** In `build-mode: none`, CodeQL does not invoke `cargo build` or a C compiler. Instead, it runs `rust-analyzer` to parse source syntax, resolve types, and expand macros into CodeQL AST representations.
-- **Analysis & False-Positive Delta:** In `build-mode: none`, CodeQL applies generalized taint-tracking and heuristic patterns. For example, Alert #1 (CWE-312: Cleartext Logging of Sensitive Information) was flagged on variable names matching `secret` in report generation code (`markdown`, `terminal`, `gitlab`), despite the fact that the engine explicitly redacts secrets before reporting. Under `autobuild` (which runs `cargo build`), the underlying AST and variable bindings analyzed by CodeQL are identical, producing the exact same naming-heuristic alert while adding compilation overhead and runner dependencies.
-- **Decision:** Discipline retains `build-mode: none` for Rust analysis, backed by a pinned stable Rust toolchain so `rust-analyzer` has access to standard library symbols. This provides fast, deterministic AST analysis without pulling build dependencies into the security analysis runner.
+#### CodeQL Rust Build Mode
+- **Mode:** Rust is analysed with `build-mode: none` (source-only extraction), as are `actions` and `python`.
+- **Why not a built mode:** a built mode would be the more precise model, and switching was attempted. CodeQL CLI 2.27.0, the version `github/codeql-action` v4.38.1 installs, rejects it at `database init` with "Rust does not support the autobuild build mode. Please try using one of the following build modes instead: none." (run 35563423549, job `Analyze (rust)`). `manual` is not offered either. Revisit when a CodeQL release adds a built mode for Rust.
+- **Known consequence:** source-only extraction produced alert `rust/cleartext-logging` (CWE-312) on `src/report/mod.rs`. It was triaged as a false positive: no report format echoes a detected secret, and `tests/test_report_redaction.rs` pins redaction across every output format. Expect heuristic alerts of this kind until a built mode exists.
 
 #### Advisory Security Sentinel Contract & Triage Procedures
-- **Advisory Status:** CodeQL operates as an **advisory security sentinel**, intentionally independent of the blocking `ci-gate` rollup in `ci.yml`. This design prevents false-positive security heuristics or uncalibrated upstream rules from blocking development or emergency PR merges.
+- **Advisory, not blocking:** CodeQL is **not** a member of the `ci-gate` rollup's `needs` list and is not counted in its asserted job count. It runs in its own workflow (`codeql.yml`); a job's `needs` can only name jobs of the same workflow, so joining the rollup would mean moving the analysis into `ci.yml`. It stays separate by decision: a query-suite update or a heuristic false positive must not block an unrelated merge, while the gates in `ci-gate` are ones this repository controls and tests.
+- **Who reviews results:** the repository maintainer. Pull-request runs surface new alerts on the pull request itself, and the maintainer reviews them before merging; scheduled runs are triaged in the repository's code-scanning alert list as described below. A true positive is treated as a blocking defect even though the check itself is advisory.
 - **Scheduled Triage Procedures:** Maintainers audit newly surfaced alerts following each scheduled run:
   1. **Triage:** Review all open alerts in GitHub Advanced Security across `rust`, `actions`, and `python`.
   2. **True Positives:** Classified as blocking security defects. Remediated immediately via prioritized patches with dedicated unit and end-to-end regression tests.
