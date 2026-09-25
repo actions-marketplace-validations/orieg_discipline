@@ -778,7 +778,7 @@ jobs:
           fail_on_warnings: true
 ```
 
-A repository that runs the default `ci-integrity` gate reports a tag ref (`@v0`, `@v0.13.0`) as an unpinned action. Pin the action to a commit SHA (`uses: orieg/discipline@<commit-sha> # v0.13.0`): a SHA ref runs the binary of the release that commit's `Cargo.toml` names, and `version:` picks another release.
+A repository that runs the default `ci-integrity` gate reports a tag ref (`@v0`, `@v0.13.1`) as an unpinned action. Pin the action to a commit SHA (`uses: orieg/discipline@<commit-sha> # v0.13.1`): a SHA ref runs the binary of the release that commit's `Cargo.toml` names, and `version:` picks another release.
 
 ### GitLab CI/CD
 
@@ -786,7 +786,7 @@ Include the remote pipeline template directly:
 
 ```yaml
 include:
-  - remote: 'https://raw.githubusercontent.com/orieg/discipline/v0.13.0/templates/discipline.gitlab-ci.yml'
+  - remote: 'https://raw.githubusercontent.com/orieg/discipline/v0.13.1/templates/discipline.gitlab-ci.yml'
 ```
 
 Or configure a standalone job emitting native GitLab Code Quality diffs:
@@ -865,7 +865,7 @@ Use [`templates/argo-workflow-template.yaml`](https://github.com/orieg/disciplin
 ```yaml
 repos:
   - repo: https://github.com/orieg/discipline
-    rev: v0.13.0
+    rev: v0.13.1
     hooks:
       - id: discipline          # compiles via cargo
       # Or: - id: discipline-system # uses pre-installed binary on PATH
@@ -958,6 +958,8 @@ discipline replay --last 100 --config candidate.toml --ref origin/main --json
 Replays the last N first-parent commits of a branch (default: `origin`'s default branch, else `main` / `master`), one merged change each, through a configuration, and prints which would have been blocked and by which gate. Each change is rebuilt in a throwaway repository that borrows the source repository's objects: its parent with the configuration under test as the base, and the change on top with the same configuration (a change to `discipline.toml` itself is not replayed), then `discipline check` runs on it. Nothing is written to the source repository, and the throwaway repository is removed when the replay ends.
 
 The directives each change carried are read from the body of the pull request it was merged through, by the same forge lookup as the `merged-pr-body` source (a token that can read pull requests: `DISCIPLINE_FORGE_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`, `GITEA_TOKEN`, ...; unauthenticated lookups hit the forge's rate limit after a few dozen changes). With no forge (no `origin` on a known forge) or no merged pull request, only the commit message is read, and each case says so (`directives_from`). When the forge is found but cannot be read (a rate limit, a private repository without a token, or `DISCIPLINE_NO_NETWORK=1`), a change that would be blocked is `could_not_check` instead: its pull request body may hold the directive that lifts the finding.
+
+Each change is checked with its pull request's author as the actor (`--actor`), the login the action judges against `directives.allowed_override_actors` by default; an actor set in the replaying shell (`DISCIPLINE_ACTOR`, `GITHUB_ACTOR`, `GITEA_ACTOR`, ...) is ignored, and a change with no merged pull request has no actor. Under `fail_on_overrides = true`, a change whose author is not an allowed actor is blocked with no `error` finding: its case lists the gates whose overrides were refused in `blocking_gates` and says why in `detail`.
 
 The configuration under test is usually newer than the history it replays. A file it names for `version-lockstep` or `manifest-sync` that neither side of a replayed change has yet skips that group or rule with a note, rather than failing the whole change; outside replay, the same missing file is a configuration error (exit 2).
 
@@ -1058,7 +1060,7 @@ Every tool is read-only (`readOnlyHint`): none writes a file, a directive or a b
 Official multi-arch (`linux/amd64`, `linux/arm64`) minimal OCI container images are published to GitHub Container Registry:
 - `ghcr.io/orieg/discipline:latest`
 - `ghcr.io/orieg/discipline:v0`
-- `ghcr.io/orieg/discipline:v0.13.0`
+- `ghcr.io/orieg/discipline:v0.13.1`
 
 Images are built on Alpine Linux with the statically linked musl `discipline` binary and `git` on `PATH`.
 
@@ -1102,7 +1104,7 @@ The job also has to hand the binary what the composite action would: the base br
    ```
 
 2. **Job container, no `uses:` (Gitea Actions, Forgejo Actions, GitHub Actions):**
-   The job runs inside the pinned image on a registered label and performs its own checkout. Pin the image by tag **and** digest: when a reference carries both, the digest is what runs and the tag is only a comment, so the tag must name the release the digest is. A line reading `:latest@sha256:...` runs whatever the digest was when it was written, not the latest release, and reports nothing. Never pair a digest with `latest`. Read the digest of a release with `docker buildx imagetools inspect ghcr.io/orieg/discipline:v0.13.0`.
+   The job runs inside the pinned image on a registered label and performs its own checkout. Pin the image by tag **and** digest: when a reference carries both, the digest is what runs and the tag is only a comment, so the tag must name the release the digest is. A line reading `:latest@sha256:...` runs whatever the digest was when it was written, not the latest release, and reports nothing. Never pair a digest with `latest`. Read the digest of a release with `docker buildx imagetools inspect ghcr.io/orieg/discipline:v0.13.1`.
    <!-- snippet: gitea-container-recipe (executed in CI by tests/action/test-container-recipe.sh) -->
    ```yaml
    name: CI Sentinel
@@ -1115,7 +1117,7 @@ The job also has to hand the binary what the composite action would: the base br
      discipline:
        runs-on: ubuntu-latest # a label the runner registers, never an image
        container:
-         image: ghcr.io/orieg/discipline:v0.13.0@sha256:<digest of that release>
+         image: ghcr.io/orieg/discipline:v0.13.1@sha256:<digest of that release>
        defaults:
          run:
            shell: sh # the image has no bash
