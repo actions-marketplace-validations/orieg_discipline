@@ -6,14 +6,18 @@ use crate::config::{GateSettings, PiiGate};
 use anyhow::{Context as _, Result};
 use regex::Regex;
 
-pub fn agents_md(ctx: &Context) -> Result<GateOutcome> {
+pub fn evaluate_agents_guide(
+    has_agents_md: bool,
+    canonical_content: Option<&str>,
+    aliases: &[(&str, bool, bool, Option<&str>)],
+    settings: &crate::config::AgentsMdGate,
+) -> Result<GateOutcome> {
     const GATE: &str = "agents-md";
-    let settings = &ctx.config.gates.agents_md;
     let exempt = exempt_filter(settings)?;
     let mut out = GateOutcome::new(GATE);
     out.examined = 1;
 
-    if !ctx.git.is_tracked("AGENTS.md")? {
+    if !has_agents_md {
         out.push(
             settings.severity(),
             "Missing AGENTS.md",
@@ -25,13 +29,12 @@ pub fn agents_md(ctx: &Context) -> Result<GateOutcome> {
         return Ok(out);
     }
 
-    let canonical = ctx.git.head_content("AGENTS.md")?;
-    for alias in ["CLAUDE.md", "GEMINI.md"] {
-        if exempt.matches(alias) || !ctx.git.is_tracked(alias)? || ctx.git.is_symlink(alias)? {
+    for (alias, is_tracked, is_symlink, head_content) in aliases {
+        if exempt.matches(alias) || !*is_tracked || *is_symlink {
             continue;
         }
         out.examined += 1;
-        if ctx.git.head_content(alias)? != canonical {
+        if *head_content != canonical_content {
             out.push(
                 settings.severity(),
                 "Forked Agent Guide",
@@ -43,6 +46,36 @@ pub fn agents_md(ctx: &Context) -> Result<GateOutcome> {
         }
     }
     Ok(out)
+}
+
+pub fn agents_md(ctx: &Context) -> Result<GateOutcome> {
+    let settings = &ctx.config.gates.agents_md;
+    let has_agents_md = ctx.git.is_tracked("AGENTS.md")?;
+    let canonical = if has_agents_md {
+        ctx.git.head_content("AGENTS.md")?
+    } else {
+        None
+    };
+    let mut aliases = Vec::new();
+    for alias in ["CLAUDE.md", "GEMINI.md"] {
+        let tracked = ctx.git.is_tracked(alias)?;
+        let symlink = if tracked {
+            ctx.git.is_symlink(alias)?
+        } else {
+            false
+        };
+        let content = if tracked && !symlink {
+            ctx.git.head_content(alias)?
+        } else {
+            None
+        };
+        aliases.push((alias, tracked, symlink, content));
+    }
+    let alias_refs: Vec<(&str, bool, bool, Option<&str>)> = aliases
+        .iter()
+        .map(|(a, t, s, c)| (*a, *t, *s, c.as_deref()))
+        .collect();
+    evaluate_agents_guide(has_agents_md, canonical.as_deref(), &alias_refs, settings)
 }
 
 /// Base patterns for calendar / duration estimates. Kept as data so the
@@ -120,6 +153,13 @@ impl MarkdownTableTracker {
         if !self.in_table || self.exempt_cols.is_empty() {
             return false;
         }
+        if !line.is_char_boundary(hit_start)
+            || !line.is_char_boundary(hit_end)
+            || hit_start > hit_end
+            || hit_end > line.len()
+        {
+            return false;
+        }
         let pipe_count = line[..hit_start].chars().filter(|&c| c == '|').count();
         let col_idx = pipe_count.saturating_sub(1);
         if !self.exempt_cols.get(col_idx).copied().unwrap_or(false) {
@@ -161,23 +201,26 @@ pub(crate) fn split_into_clauses(line: &str) -> Vec<(usize, &str)> {
     while i < len {
         let (byte_idx, ch) = chars[i];
         let mut is_delim = false;
-        let mut delim_len = ch.len_utf8();
+        let mut delim_bytes = ch.len_utf8();
+        let mut delim_chars = 1;
 
         if ch == ';' || ch == '—' {
             is_delim = true;
         } else if ch == '-' && i + 1 < len && chars[i + 1].1 == '-' {
             is_delim = true;
-            delim_len = 2;
+            delim_bytes = 2;
+            delim_chars = 2;
         } else if ch == '.' || ch == '!' || ch == '?' {
             if i + 1 == len {
                 is_delim = true;
             } else {
                 let next_ch = chars[i + 1].1;
-                if next_ch.is_whitespace()
+                if (next_ch.is_whitespace()
                     || next_ch == '"'
                     || next_ch == '\''
                     || next_ch == ')'
-                    || next_ch == ']'
+                    || next_ch == ']')
+                    && start <= byte_idx
                 {
                     let before = &line[start..byte_idx];
                     let is_num = before.chars().last().is_some_and(|c| c.is_ascii_digit());
@@ -187,7 +230,7 @@ pub(crate) fn split_into_clauses(line: &str) -> Vec<(usize, &str)> {
                     }
                 }
             }
-        } else if ch == ',' {
+        } else if ch == ',' && start <= byte_idx {
             let before = &line[start..byte_idx];
             let is_num = before.chars().last().is_some_and(|c| c.is_ascii_digit());
             let next_is_num = chars.get(i + 1).is_some_and(|(_, c)| c.is_ascii_digit());
@@ -197,27 +240,36 @@ pub(crate) fn split_into_clauses(line: &str) -> Vec<(usize, &str)> {
         }
 
         if is_delim {
-            let slice = line[start..byte_idx].trim();
-            if !slice.is_empty() {
-                clauses.push((start, slice));
+            if start <= byte_idx {
+                let raw_slice = &line[start..byte_idx];
+                let trimmed = raw_slice.trim();
+                if !trimmed.is_empty() {
+                    let offset = trimmed.as_ptr() as usize - line.as_ptr() as usize;
+                    clauses.push((offset, trimmed));
+                }
             }
-            start = byte_idx + delim_len;
-            if delim_len > 1 {
-                i += delim_len - 1;
+            start = byte_idx + delim_bytes;
+            if delim_chars > 1 {
+                i += delim_chars - 1;
             }
         }
         i += 1;
     }
 
-    let tail = line[start..].trim();
-    if !tail.is_empty() {
-        clauses.push((start, tail));
+    if start < line.len() {
+        let raw_tail = &line[start..];
+        let trimmed = raw_tail.trim();
+        if !trimmed.is_empty() {
+            let offset = trimmed.as_ptr() as usize - line.as_ptr() as usize;
+            clauses.push((offset, trimmed));
+        }
     }
 
     if clauses.is_empty() {
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            clauses.push((0, trimmed));
+            let offset = trimmed.as_ptr() as usize - line.as_ptr() as usize;
+            clauses.push((offset, trimmed));
         }
     }
 
@@ -277,7 +329,7 @@ fn has_exemption_cue(clause: &str, line: &str, _matched: &str) -> bool {
 
     // 4. Historical durations / ages / production stability / historical narration / commit ordering
     let hist_re = Regex::new(
-        r"(?i)\b(?:\d+[- ](?:years?|months?|days?|hours?|mins?)[- ]old|(?:a|an)\s+(?:years?|months?|days?)[- ]old|\d+\s+(?:years?|months?|days?|weeks?|months?)\s+ago|a\s+day\s+ago|shipped\s+a\s+day|for\s+(?:the\s+past|the\s+last|about|over|~)?\s*\d+\s*(?:years?|months?)|stable\s+for\s+\d+|compatibility\s+for\s+(?:over\s+)?\d+|history\s+spans\s+\d+|survived\s+\d+\s+years|undetected\s+for\s+[~]?\d+\s+years|invariants?|unchecked\s+for\s+\d+|written\s+\d+\s+years\s+ago|issue\s+was\s+resolved|production\s+history\s+spans|commit\s+ordering|(?:minutes?|hours?|days?|weeks?)\s+later|(?:minutes?|hours?|days?|weeks?)\s+earlier)\b",
+        r"(?i)\b(?:\d+[- ](?:years?|months?|days?|hours?|mins?)[- ]old|(?:a|an)\s+(?:years?|months?|days?)[- ]old|\d+\s+(?:years?|months?|days?|weeks?|months?)\s+ago|a\s+day\s+ago|shipped\s+a\s+day|for\s+(?:the\s+past|the\s+last|about|over|~)?\s*\d+\s*(?:years?|months?)|stable\s+for\s+\d+|compatibility\s+for\s+(?:over\s+)?\d+|history\s+spans\s+\d+|survived\s+\d+\s+years|undetected\s+for\s+[~]?\d+\s+years|invariants?|unchecked\s+for\s+\d+|written\s+\d+\s+years\s+ago|issue\s+was\s+resolved|production\s+history\s+spans|commit\s+ordering|(?:minutes?|hours?|days?|weeks?)\s+later|(?:minutes?|hours?|days?|weeks?)\s+earlier|\d+[- ]?(?:minutes?|hours?|days?|weeks?|months?)[- ]gap\s+between|gap\s+of\s+\d+\s+(?:minutes?|hours?|days?|weeks?|months?)|\d+\s+(?:minutes?|hours?|days?|weeks?|months?)\s+between\s+(?:the|two|each|its))\b",
     )
     .unwrap();
     if hist_re.is_match(clause)
@@ -360,6 +412,79 @@ pub(crate) fn is_exempt_time_estimate(
     !is_time_estimate_violation(line, line, matched, false)
 }
 
+/// Byte spans, per line, of the text matched by any `allow_pattern`.
+///
+/// Each pattern is matched twice: against every line on its own (so `^` and
+/// `$` keep their per-line meaning) and against every paragraph with its
+/// soft-wrapped lines joined by a single space (so a phrase that wraps across
+/// a line break can still be matched). A paragraph ends at a blank line or a
+/// code fence. A paragraph match is mapped back onto the part of each line it
+/// covers; the exemption therefore binds to the matched text, never to the
+/// whole line or paragraph.
+fn allow_pattern_spans(text: &str, allowed: &[Regex]) -> Vec<Vec<(usize, usize)>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut spans: Vec<Vec<(usize, usize)>> = vec![Vec::new(); lines.len()];
+    if allowed.is_empty() {
+        return spans;
+    }
+
+    for (idx, line) in lines.iter().enumerate() {
+        for re in allowed {
+            spans[idx].extend(re.find_iter(line).map(|m| (m.start(), m.end())));
+        }
+    }
+
+    // (line index, start in joined text, leading-whitespace bytes, content length)
+    let mut para: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut joined = String::new();
+    let mut flush = |para: &mut Vec<(usize, usize, usize, usize)>, joined: &mut String| {
+        if para.len() > 1 {
+            for re in allowed {
+                for m in re.find_iter(joined) {
+                    for &(line_idx, seg_start, lead, len) in para.iter() {
+                        let seg_end = seg_start + len;
+                        let (a, b) = (m.start().max(seg_start), m.end().min(seg_end));
+                        if a < b {
+                            spans[line_idx].push((a - seg_start + lead, b - seg_start + lead));
+                        }
+                    }
+                }
+            }
+        }
+        para.clear();
+        joined.clear();
+    };
+
+    let mut fence: Option<&str> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(m) = ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m)) {
+            flush(&mut para, &mut joined);
+            fence = match fence {
+                None => Some(m),
+                Some(open) if open == m => None,
+                keep => keep,
+            };
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        let content = trimmed.trim_end();
+        if content.is_empty() {
+            flush(&mut para, &mut joined);
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        para.push((idx, joined.len(), line.len() - trimmed.len(), content.len()));
+        joined.push_str(content);
+    }
+    flush(&mut para, &mut joined);
+    spans
+}
+
 pub(crate) fn scan_text_for_time_estimates(
     text: &str,
     banned: &[Regex],
@@ -368,6 +493,7 @@ pub(crate) fn scan_text_for_time_estimates(
     let mut violations = Vec::new();
     let mut fence: Option<&str> = None;
     let mut table = MarkdownTableTracker::default();
+    let allowed_spans = allow_pattern_spans(text, allowed);
 
     for (idx, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
@@ -388,9 +514,7 @@ pub(crate) fn scan_text_for_time_estimates(
         if line_allows(line, "time-estimates") {
             continue;
         }
-        if allowed.iter().any(|re| re.is_match(line)) {
-            continue;
-        }
+        let exempt_spans = allowed_spans.get(idx).map(Vec::as_slice).unwrap_or(&[]);
 
         let clauses = split_into_clauses(line);
         let mut seen_spans: Vec<(usize, usize)> = Vec::new();
@@ -399,6 +523,14 @@ pub(crate) fn scan_text_for_time_estimates(
                 for hit in re.find_iter(clause) {
                     let abs_start = clause_start + hit.start();
                     let abs_end = clause_start + hit.end();
+                    // An allow_pattern exempts the text it matched, never the
+                    // rest of the line or paragraph.
+                    if exempt_spans
+                        .iter()
+                        .any(|(s, e)| abs_start < *e && abs_end > *s)
+                    {
+                        continue;
+                    }
                     if seen_spans
                         .iter()
                         .any(|(s, e)| !(abs_end <= *s || abs_start >= *e))
@@ -574,7 +706,7 @@ pub fn pii_rules(settings: &PiiGate) -> Result<Vec<PiiRule>> {
             )?,
             label: "private LAN address",
             user_group: false,
-            redact: false,
+            redact: settings.redact_lan_ips,
         });
     }
     if settings.secrets {
@@ -837,17 +969,60 @@ pub fn pii(ctx: &Context) -> Result<GateOutcome> {
         l == c || l == "discipline.toml"
     };
 
+    // Lines inside a function the repository declares as a test entry point, or in a file
+    // it declares as test scope, hold fixtures by definition and are not leaks.
+    let declared = &ctx.config.tests;
+    let registry = crate::ast::default_registry();
+    let vocab = crate::ast::AssertVocabulary {
+        test_functions: declared.functions.clone(),
+        test_paths: declared.paths.clone(),
+        ..Default::default()
+    };
+    let declared_test_spans = |path: &str, text: &str| -> (bool, Vec<(usize, usize)>) {
+        if declared.functions.is_empty() && declared.paths.is_empty() {
+            return (false, Vec::new());
+        }
+        if crate::ast::functions::declared_test_path(path, &declared.paths) {
+            return (true, Vec::new());
+        }
+        let spans = registry
+            .find_pack(path)
+            .and_then(|pack| pack.extract(path, text, &vocab).ok())
+            .map(|facts| {
+                facts
+                    .tests
+                    .iter()
+                    .filter(|t| {
+                        let leaf = t.name.rsplit("::").next().unwrap_or(&t.name);
+                        declared.functions.iter().any(|f| f == leaf)
+                    })
+                    .map(|t| (t.line, t.end_line.max(t.line)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (false, spans)
+    };
     let scan = |label: &str,
                 text: &str,
                 added_lines: Option<&std::collections::BTreeSet<usize>>,
                 out: &mut GateOutcome| {
         let active_cfg = is_active_config(label);
+        let (whole_file_is_test, test_spans) = declared_test_spans(label, text);
+        if whole_file_is_test {
+            return;
+        }
         for (idx, line) in text.lines().enumerate() {
             let line_num = idx + 1;
             if let Some(lines) = added_lines {
                 if !lines.contains(&line_num) {
                     continue;
                 }
+            }
+            if test_spans
+                .iter()
+                .any(|(a, b)| *a <= line_num && line_num <= *b)
+            {
+                continue;
             }
             let hit = rules.iter().find_map(|rule| {
                 if active_cfg && rule.label == "denylisted hostname" {
@@ -1027,6 +1202,90 @@ mod tests {
         ] {
             assert!(!any_match(&banned, good), "false positive: {good}");
         }
+    }
+
+    #[test]
+    fn split_into_clauses_preserves_exact_byte_offsets_with_unicode() {
+        let line = "  | latency | Phase 2 (≤ 2 weeks) |";
+        let clauses = split_into_clauses(line);
+        for (start, clause) in clauses {
+            assert_eq!(
+                &line[start..start + clause.len()],
+                clause,
+                "clause at {start} does not match slice"
+            );
+        }
+
+        let emdash_line = "Step 1 — Phase 2 (≤ 2 weeks); note";
+        let clauses = split_into_clauses(emdash_line);
+        for (start, clause) in clauses {
+            assert_eq!(
+                &emdash_line[start..start + clause.len()],
+                clause,
+                "clause at {start} does not match slice in emdash line"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_pattern_exempts_a_phrase_wrapped_across_lines() {
+        let banned = compile(time_estimate_patterns(), "t").unwrap();
+        let wrapped = "The run held the one-minute load\naverage below 1.5.\n";
+        // Control: without an allow pattern the wrapped term of art fires.
+        let bare = scan_text_for_time_estimates(wrapped, &banned, &[]);
+        assert_eq!(bare, vec![(1, "one-minute".to_string())]);
+
+        let allowed = compile(["one-minute load average"], "allow").unwrap();
+        assert_eq!(
+            scan_text_for_time_estimates(wrapped, &banned, &allowed),
+            Vec::<(usize, String)>::new(),
+            "a multi-word allow_pattern must match across a soft wrap"
+        );
+
+        // An indented continuation (list item) is still one paragraph.
+        let listed = "- The run held the one-minute load\n  average below 1.5.\n";
+        assert!(scan_text_for_time_estimates(listed, &banned, &allowed).is_empty());
+
+        // A blank line ends the paragraph: the phrase no longer exists.
+        let split = "The run held the one-minute load\n\naverage below 1.5.\n";
+        assert_eq!(
+            scan_text_for_time_estimates(split, &banned, &allowed),
+            vec![(1, "one-minute".to_string())]
+        );
+    }
+
+    #[test]
+    fn allow_pattern_binds_to_the_match_not_the_paragraph() {
+        let banned = compile(time_estimate_patterns(), "t").unwrap();
+        let allowed = compile(["one-minute load average"], "allow").unwrap();
+
+        // Unrelated estimate on the wrapped line, after the exempted phrase.
+        let para = "The run held the one-minute load\naverage below 1.5, so we ship in 3 weeks.\n";
+        assert_eq!(
+            scan_text_for_time_estimates(para, &banned, &allowed),
+            vec![(2, "3 weeks".to_string())]
+        );
+
+        // Unrelated estimate on the SAME line as the exempted phrase.
+        let same = "The one-minute load average held, so we ship in 3 weeks.\n";
+        assert_eq!(
+            scan_text_for_time_estimates(same, &banned, &allowed),
+            vec![(1, "3 weeks".to_string())]
+        );
+
+        // Line anchors keep their per-line meaning.
+        let anchored = compile([r"^timeout: \d+"], "allow").unwrap();
+        let text = "Config notes\ntimeout: 30 minutes per shard\n";
+        assert!(scan_text_for_time_estimates(text, &banned, &anchored).is_empty());
+    }
+
+    #[test]
+    fn time_estimates_table_cell_with_unicode_does_not_panic() {
+        let banned = compile(time_estimate_patterns(), "t").unwrap();
+        let allowed = Vec::new();
+        let text = "| Latency | Status |\n|---|---|\n  | 50ms | Phase 2 (≤ 2 weeks) |\n";
+        let violations = scan_text_for_time_estimates(text, &banned, &allowed);
+        assert!(!violations.is_empty());
     }
 
     #[test]
@@ -1316,5 +1575,50 @@ mod tests {
         assert!(scan_json(&opts, text, &mut out));
         assert_eq!(out.violations.len(), 1);
         assert_eq!(out.violations[0].line, Some(2));
+    }
+
+    #[test]
+    fn test_lan_ip_redaction_config() {
+        let json_text = "{\"target\": \"192.168.1.42\"}"; // discipline:allow(pii)
+
+        // Default: redact_lan_ips = false -> IP is echoed for triage
+        let default_settings = PiiGate::default();
+        assert!(!default_settings.redact_lan_ips);
+        let rules_default = pii_rules(&default_settings).unwrap();
+        let mut out_default = GateOutcome::new("pii");
+        let allowed = vec![];
+        let opts_default = PiiScanOptions {
+            label: "test.json",
+            rules: &rules_default,
+            settings: &default_settings,
+            allowed: &allowed,
+            is_active_config: false,
+            added_lines: None,
+        };
+        assert!(scan_json(&opts_default, json_text, &mut out_default));
+        assert_eq!(out_default.violations.len(), 1);
+        assert!(out_default.violations[0].message.contains("192.168.1.42")); // discipline:allow(pii)
+
+        // Opt-in: redact_lan_ips = true -> IP is masked
+        let masked_settings = PiiGate {
+            redact_lan_ips: true,
+            ..Default::default()
+        };
+        let rules_masked = pii_rules(&masked_settings).unwrap();
+        let mut out_masked = GateOutcome::new("pii");
+        let opts_masked = PiiScanOptions {
+            label: "test.json",
+            rules: &rules_masked,
+            settings: &masked_settings,
+            allowed: &allowed,
+            is_active_config: false,
+            added_lines: None,
+        };
+        assert!(scan_json(&opts_masked, json_text, &mut out_masked));
+        assert_eq!(out_masked.violations.len(), 1);
+        assert!(!out_masked.violations[0].message.contains("192.168.1.42")); // discipline:allow(pii)
+        assert!(out_masked.violations[0]
+            .message
+            .contains("(match not echoed)"));
     }
 }

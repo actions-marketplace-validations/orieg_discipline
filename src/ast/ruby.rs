@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use super::{AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts, TestFn};
+use super::functions::{self, FunctionSpec};
+use super::{AssertVocabulary, EscapeHatchSite, Fact, LanguagePack, ParsedFileFacts, TestFn};
 
 /// Ruby language pack implementing [`LanguagePack`].
 pub struct RubyPack;
@@ -11,6 +12,13 @@ pub struct RubyPack;
 impl LanguagePack for RubyPack {
     fn id(&self) -> &'static str {
         "ruby"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -34,6 +42,7 @@ impl LanguagePack for RubyPack {
         let root = tree.root_node();
 
         let mut extractor = RubyExtractor {
+            dead: super::reach::dead_ranges(root, src, &RUBY_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_ruby_test_path(path),
@@ -48,9 +57,112 @@ impl LanguagePack for RubyPack {
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
         extractor.resolve_same_file_helpers();
+        extractor.facts.functions = functions::extract(root, src, path, &RUBY_FUNCTIONS);
+        super::mocks::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &RUBY_MOCKS,
+            &vocab.mock_setup_fns,
+            &vocab.mock_assert_fns,
+        );
+        {
+            let tests = &extractor.facts.tests;
+            let spans: Vec<(usize, usize)> = tests
+                .iter()
+                .map(|t| (t.line, t.end_line.max(t.line)))
+                .collect();
+            let whole_file = is_ruby_test_path(path)
+                || functions::test_path(path)
+                || functions::declared_test_path(path, &vocab.test_paths);
+            let is_test_line =
+                |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+            extractor.facts.swallowed =
+                super::handlers::extract(root, src, &RUBY_HANDLERS, &is_test_line);
+        }
+        super::retries::mark(root, src, &mut extractor.facts.tests, &RUBY_RETRIES);
+        if functions::declared_test_path(path, &vocab.test_paths) {
+            for f in &mut extractor.facts.functions {
+                f.is_test = true;
+            }
+        }
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &RUBY_MOCKS,
+            super::calls::SLEEP_VOCAB,
+            super::calls::sleeps,
+        );
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &RUBY_MOCKS,
+            super::calls::TRIVIAL_ASSERT_VOCAB,
+            super::calls::trivial_asserts,
+        );
+        extractor.facts.prose =
+            super::prose::extract(root, src, &["comment", "string", "heredoc_body"]);
         Ok(extractor.facts)
     }
 }
+
+fn ruby_fn_is_test(node: Node, src: &str, path: &str) -> bool {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+        .unwrap_or("");
+    name.starts_with("test_")
+        || name == "test"
+        || is_ruby_test_path(path)
+        || functions::test_path(path)
+}
+
+pub const RUBY_FUNCTIONS: FunctionSpec = FunctionSpec {
+    // `def x; end` has no body node and is not described.
+    function_kinds: &["method", "singleton_method"],
+    name_fields: &["name"],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    skip: functions::skip_none,
+    is_test: ruby_fn_is_test,
+    classify: functions::classify_ruby,
+};
+
+pub const RUBY_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &["call"],
+    callee_fields: &["method"],
+};
+
+pub const RUBY_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    // A `rescue` with no body has no `body` field and is judged by its own text.
+    handler_kinds: &["rescue"],
+    arm_of: &[],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    trivial: &[
+        "nil",
+        "false",
+        "return",
+        "return nil",
+        "return false",
+        "next",
+        "[]",
+        "{}",
+    ],
+    discard_kinds: &[],
+    discards: super::handlers::no_discard,
+    classify_discard: None,
+    call_value_kinds: &[],
+    // `call rescue nil`: the modifier form, when its handler is a constant.
+    silence_kinds: &["rescue_modifier"],
+    silences: super::handlers::ruby_silences,
+};
+
+pub const RUBY_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["call"],
+};
 
 /// Determines whether a path is conventionally a Ruby test file.
 pub fn is_ruby_test_path(path: &str) -> bool {
@@ -67,6 +179,8 @@ pub fn is_ruby_test_path(path: &str) -> bool {
 }
 
 struct RubyExtractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     vocab: &'a AssertVocabulary,
     is_test_path: bool,
@@ -142,6 +256,13 @@ impl<'a> RubyExtractor<'a> {
                         let mut helper_fn = TestFn::default();
                         let mut dummy_calls = Vec::new();
                         self.extract_assertions_in_body(body, &mut helper_fn, &mut dummy_calls);
+                        helper_fn.total_asserts += super::count_failure_exits(
+                            body,
+                            self.src,
+                            &["call", "identifier"],
+                            &["raise ", "raise(", "fail "],
+                            &["block", "do_block", "lambda", "method", "singleton_method"],
+                        );
                         let facts = super::HelperFacts {
                             total_asserts: helper_fn.total_asserts,
                             strong_asserts: helper_fn.strong_asserts,
@@ -213,6 +334,7 @@ impl<'a> RubyExtractor<'a> {
         let mut direct_calls = Vec::new();
         if let Some(body) = node.child_by_field_name("body") {
             self.extract_assertions_in_body(body, &mut test_fn, &mut direct_calls);
+            super::dispatch_calls(body, self.src, &RUBY_DISPATCH, &mut direct_calls);
         }
 
         Some((test_fn, direct_calls))
@@ -284,8 +406,10 @@ impl<'a> RubyExtractor<'a> {
         if let Some(b) = block {
             if let Some(body) = b.child_by_field_name("body") {
                 self.extract_assertions_in_body(body, &mut test_fn, &mut direct_calls);
+                super::dispatch_calls(body, self.src, &RUBY_DISPATCH, &mut direct_calls);
             } else {
                 self.extract_assertions_in_body(b, &mut test_fn, &mut direct_calls);
+                super::dispatch_calls(b, self.src, &RUBY_DISPATCH, &mut direct_calls);
             }
         }
 
@@ -328,6 +452,9 @@ impl<'a> RubyExtractor<'a> {
         test_fn: &mut TestFn,
         direct_calls: &mut Vec<String>,
     ) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         let kind = node.kind();
         if kind == "identifier" {
             let name = self.text(node);
@@ -405,6 +532,9 @@ impl<'a> RubyExtractor<'a> {
                         test.strong_asserts += h.strong_asserts;
                         test.tautologies += h.tautologies;
                         test.fatal_asserts += h.fatal_asserts;
+                        if h.total_asserts > h.tautologies {
+                            test.helper_checks += 1;
+                        }
                     }
                 }
             }
@@ -526,6 +656,20 @@ impl<'a> RubyExtractor<'a> {
             .collect()
     }
 }
+
+pub const RUBY_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if"],
+    block_kinds: &["then", "body_statement", "block_body"],
+    ignored_kinds: &["comment"],
+    terminators: &["return", "raise", "next", "break"],
+};
+
+/// Functions a test body runs through a dispatch table (`super::dispatch_calls`).
+pub const RUBY_DISPATCH: super::DispatchSpec = super::DispatchSpec {
+    containers: &["symbol_array", "array"],
+    names: &["bare_symbol", "simple_symbol"],
+    references: &[],
+};
 
 #[cfg(test)]
 mod tests {
@@ -680,19 +824,19 @@ end
     }
 
     #[test]
-    fn test_expanse_ruby_test_fixture() {
+    fn test_example_ruby_test_fixture() {
         let src = r#"
 require "minitest/autorun"
-require_relative "../lib/expanse"
+require_relative "../lib/example"
 
-class TestExpanse < Minitest::Test
+class TestExample < Minitest::Test
   def test_version
-    refute_nil Expanse.version
-    assert_match(/\d+\.\d+\.\d+/, Expanse.version)
+    refute_nil Example.version
+    assert_match(/\d+\.\d+\.\d+/, Example.version)
   end
 
   def test_set
-    set = Expanse::Set.new
+    set = Example::Set.new
     assert_equal 0, set.size
     assert set.empty?
 
@@ -729,7 +873,7 @@ class TestExpanse < Minitest::Test
   end
 
   def test_map
-    map = Expanse::Map.new
+    map = Example::Map.new
     assert_equal 0, map.size
 
     map[10] = 100
@@ -758,7 +902,7 @@ class TestExpanse < Minitest::Test
   end
 
   def test_strmap
-    strmap = Expanse::StrMap.new
+    strmap = Example::StrMap.new
     assert_equal 0, strmap.size
 
     strmap["alpha"] = 1
@@ -779,7 +923,7 @@ class TestExpanse < Minitest::Test
   end
 
   def test_bytesmap
-    bytesmap = Expanse::BytesMap.new
+    bytesmap = Example::BytesMap.new
     assert_equal 0, bytesmap.size
 
     k1 = "\x00\x01\xFE\xFF".b
@@ -798,7 +942,7 @@ class TestExpanse < Minitest::Test
   end
 
   def test_blobmap
-    blobmap = Expanse::BlobMap.new
+    blobmap = Example::BlobMap.new
     assert_equal 0, blobmap.size
 
     blobmap.set(100, "hello world", hot_meta: 1234)
@@ -819,19 +963,19 @@ end
         let pack = RubyPack;
         let facts = pack
             .extract(
-                "bindings/ruby/test/test_expanse.rb",
+                "bindings/ruby/test/test_example.rb",
                 src,
                 &AssertVocabulary::default(),
             )
             .expect("extract succeeds");
 
         assert_eq!(facts.tests.len(), 6);
-        assert_eq!(facts.tests[0].name, "TestExpanse#test_version");
-        assert_eq!(facts.tests[1].name, "TestExpanse#test_set");
-        assert_eq!(facts.tests[2].name, "TestExpanse#test_map");
-        assert_eq!(facts.tests[3].name, "TestExpanse#test_strmap");
-        assert_eq!(facts.tests[4].name, "TestExpanse#test_bytesmap");
-        assert_eq!(facts.tests[5].name, "TestExpanse#test_blobmap");
+        assert_eq!(facts.tests[0].name, "TestExample#test_version");
+        assert_eq!(facts.tests[1].name, "TestExample#test_set");
+        assert_eq!(facts.tests[2].name, "TestExample#test_map");
+        assert_eq!(facts.tests[3].name, "TestExample#test_strmap");
+        assert_eq!(facts.tests[4].name, "TestExample#test_bytesmap");
+        assert_eq!(facts.tests[5].name, "TestExample#test_blobmap");
 
         // Verify none of the real tests are vacuous or ignored
         for t in &facts.tests {

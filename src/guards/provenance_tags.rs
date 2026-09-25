@@ -10,7 +10,7 @@
 //! - Paired figures (e.g. `11.9 ns vs 108.9 ns`, cross-metric statements)
 //!   require shared workload IDs (`(workload: id)`) or documented differentiation markers.
 
-use super::{exempt_filter, Context, GateOutcome, PathFilter};
+use super::{claim_registry, exempt_filter, Context, GateOutcome, PathFilter};
 use crate::config::GateSettings;
 use crate::tokens;
 use anyhow::Result;
@@ -170,6 +170,74 @@ fn split_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
+/// What one scan judges and what satisfies it.
+#[derive(Default, Clone)]
+pub struct ScanPolicy {
+    pub check_tables: bool,
+    pub check_mechanisms: bool,
+    pub check_intervals: bool,
+    pub check_paired_figures: bool,
+    /// Replaces the built-in interval-evidence pattern when set.
+    pub interval_evidence: Option<Regex>,
+    /// Added to the built-in deterministic-metric pattern when set.
+    pub deterministic: Option<Regex>,
+    /// Judge only paragraphs containing one of these lines.
+    pub added_lines: Option<std::collections::BTreeSet<usize>>,
+}
+
+/// Build the interval-evidence pattern from `ratio_satisfied_by` entries. `None` when the
+/// list is empty (the built-in pattern applies); an error names a bad entry.
+pub fn interval_evidence_regex(forms: &[String]) -> anyhow::Result<Option<Regex>> {
+    if forms.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    for f in forms {
+        let part = if f == "interval" {
+            r"\[\s*[-+]?\d+(?:\.\d+)?[%x×]?\s*,\s*[-+]?\d+(?:\.\d+)?[%x×]?\s*\]|\bBCa\b|confidence interval|\bCI\b|bca_bootstrap".to_string()
+        } else if let Some(w) = f.strip_prefix("marker:") {
+            format!(r"\b{}\b", regex::escape(w.trim()))
+        } else if let Some(g) = f.strip_prefix("artifact:") {
+            // A glob over a path reference: `*` matches within a segment, `**` across.
+            let mut re = String::new();
+            let mut chars = g.trim().chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '*' if chars.peek() == Some(&'*') => {
+                        chars.next();
+                        re.push_str(r"[^\s`)\]]*");
+                    }
+                    '*' => re.push_str(r"[^\s`)\]/]*"),
+                    '?' => re.push_str(r"[^\s`)\]/]"),
+                    other => re.push_str(&regex::escape(&other.to_string())),
+                }
+            }
+            re
+        } else if let Some(r) = f.strip_prefix("regex:") {
+            Regex::new(r).map_err(|e| anyhow::anyhow!("ratio_satisfied_by `{f}`: {e}"))?;
+            r.to_string()
+        } else {
+            anyhow::bail!(
+                "ratio_satisfied_by `{f}`: expected `interval`, `marker:<word>`, `artifact:<glob>` or `regex:<pattern>`"
+            );
+        };
+        parts.push(format!("(?:{part})"));
+    }
+    Ok(Some(Regex::new(&format!("(?i){}", parts.join("|")))?))
+}
+
+/// A figure carrying one of `units` is deterministic.
+pub fn deterministic_regex(units: &[String]) -> anyhow::Result<Option<Regex>> {
+    if units.is_empty() {
+        return Ok(None);
+    }
+    let alts: Vec<String> = units.iter().map(|u| regex::escape(u.trim())).collect();
+    Ok(Some(Regex::new(&format!(
+        r"(?i)\d[\d.,]*\s*(?:{})\b",
+        alts.join("|")
+    ))?))
+}
+
 pub fn scan_markdown_text(
     text: &str,
     path_label: &str,
@@ -178,6 +246,28 @@ pub fn scan_markdown_text(
     check_intervals: bool,
     check_paired_figures: bool,
 ) -> Vec<HygieneFinding> {
+    scan_markdown_text_with_policy(
+        text,
+        path_label,
+        &ScanPolicy {
+            check_tables,
+            check_mechanisms,
+            check_intervals,
+            check_paired_figures,
+            ..Default::default()
+        },
+    )
+}
+
+pub fn scan_markdown_text_with_policy(
+    text: &str,
+    path_label: &str,
+    policy: &ScanPolicy,
+) -> Vec<HygieneFinding> {
+    let check_tables = policy.check_tables;
+    let check_mechanisms = policy.check_mechanisms;
+    let check_intervals = policy.check_intervals;
+    let check_paired_figures = policy.check_paired_figures;
     if path_label.ends_with("AGENTS.md")
         || path_label.ends_with("CLAUDE.md")
         || path_label.ends_with("GEMINI.md")
@@ -238,6 +328,12 @@ pub fn scan_markdown_text(
     }
 
     for (para_idx, para) in paras.iter().enumerate() {
+        // `diff_only`: a paragraph the change did not touch is not judged.
+        if let Some(added) = &policy.added_lines {
+            if !para.iter().any(|(n, _)| added.contains(n)) {
+                continue;
+            }
+        }
         let para_text = para
             .iter()
             .map(|(_, t)| t.as_str())
@@ -290,12 +386,20 @@ pub fn scan_markdown_text(
 
         // 3. Wall-Clock Intervals
         if check_intervals {
-            let has_interval_evidence = INTERVAL_EVIDENCE.is_match(&window_text);
+            let has_interval_evidence = match &policy.interval_evidence {
+                Some(re) => re.is_match(&window_text),
+                None => INTERVAL_EVIDENCE.is_match(&window_text),
+            };
             if !has_interval_evidence {
                 for (line_num, text) in para {
+                    let deterministic = DETERMINISTIC_METRIC.is_match(text)
+                        || policy
+                            .deterministic
+                            .as_ref()
+                            .is_some_and(|re| re.is_match(text));
                     if WALLCLOCK_RATIO.is_match(text)
                         && WALLCLOCK_CONTEXT.is_match(text)
-                        && !DETERMINISTIC_METRIC.is_match(text)
+                        && !deterministic
                     {
                         findings.push(HygieneFinding {
                             line: *line_num,
@@ -398,14 +502,43 @@ pub fn evaluate_provenance_tags(ctx: &Context) -> Result<GateOutcome> {
     let exempt = exempt_filter(settings)?;
     let patterns = vec!["**/*.md".to_string(), "**/*.markdown".to_string()];
     let doc_filter = PathFilter::new(&patterns)?;
+    let json_filter = PathFilter::new(&settings.superseded_json_paths)?;
 
     // Collect candidate markdown files: changed files if diff-scoped, or tracked files
     let changed_files = ctx.git.changed_files()?;
+    let interval_evidence = interval_evidence_regex(&settings.ratio_satisfied_by)?;
+    let deterministic = deterministic_regex(&settings.deterministic_units)?;
     let candidate_paths: Vec<String> = changed_files
         .iter()
         .map(|f| f.path.clone())
         .filter(|p| doc_filter.matches(p) && !exempt.matches(p))
         .collect();
+
+    let registry = match &settings.superseded_registry {
+        Some(path) => {
+            let Some(text) = ctx.git.head_content(path)? else {
+                anyhow::bail!(
+                    "provenance-tags: superseded_registry `{path}` is not present at HEAD"
+                );
+            };
+            let head = claim_registry::load_registry(&text, path)?;
+            // The base registry still binds this change (a PR cannot delete the entry for
+            // the figure it republishes). A malformed base is ignored: the change may fix it.
+            let base = match ctx.git.base_content(path)? {
+                Some(b) => claim_registry::load_registry(&b, path).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            Some((path.clone(), claim_registry::merge_registries(base, head)))
+        }
+        None => None,
+    };
+    let check_pending = settings.check_pending_citations || settings.require_open_pending_issues;
+    let forge_api = crate::forge::HttpApi::from_env();
+    let mut issue_states = settings.require_open_pending_issues.then(|| {
+        claim_registry::IssueStates::new(&forge_api, crate::forge::detect_for(ctx.git))
+            .allow_repositories(&settings.pending_issue_repos)
+    });
+    let mut undecidable: Vec<String> = Vec::new();
 
     let mut scanned_count = 0;
 
@@ -416,21 +549,41 @@ pub fn evaluate_provenance_tags(ctx: &Context) -> Result<GateOutcome> {
         };
 
         scanned_count += 1;
-        let findings = scan_markdown_text(
+        let added_lines = if settings.diff_only {
+            changed_files
+                .iter()
+                .find(|f| &f.path == path)
+                .map(|f| f.added_lines.clone())
+        } else {
+            None
+        };
+        let mut findings = scan_markdown_text_with_policy(
             &content,
             path,
-            settings.check_tables,
-            settings.check_mechanisms,
-            settings.check_intervals,
-            settings.check_paired_figures,
+            &ScanPolicy {
+                check_tables: settings.check_tables,
+                check_mechanisms: settings.check_mechanisms,
+                check_intervals: settings.check_intervals,
+                check_paired_figures: settings.check_paired_figures,
+                interval_evidence: interval_evidence.clone(),
+                deterministic: deterministic.clone(),
+                added_lines,
+            },
         );
+        if check_pending && !is_agent_guide(path) {
+            let stripped = strip_fences(&content.lines().collect::<Vec<_>>());
+            let (problems, unknown) =
+                claim_registry::scan_pending(&stripped, issue_states.as_mut());
+            findings.extend(problems.into_iter().map(pending_finding));
+            undecidable.extend(
+                unknown
+                    .into_iter()
+                    .map(|u| format!("{path}:{}: {}", u.line, u.reasons.join("; "))),
+            );
+        }
 
         for f in findings {
-            let override_rec = ctx
-                .find_override(GATE, tokens::ALLOW_PROVENANCE, path)
-                .or_else(|| {
-                    ctx.find_gate_or_subject_override(GATE, tokens::ALLOW_PROVENANCE, path)
-                });
+            let override_rec = ctx.find_override(GATE, tokens::ALLOW_PROVENANCE, path);
 
             if let Some(ov) = override_rec {
                 out.overrides.push(ov);
@@ -455,7 +608,7 @@ pub fn evaluate_provenance_tags(ctx: &Context) -> Result<GateOutcome> {
     // Also scan PR body if provided
     if let Some(ref body) = ctx.pr_body {
         scanned_count += 1;
-        let findings = scan_markdown_text(
+        let mut findings = scan_markdown_text(
             body,
             "PR body",
             settings.check_tables,
@@ -463,6 +616,17 @@ pub fn evaluate_provenance_tags(ctx: &Context) -> Result<GateOutcome> {
             settings.check_intervals,
             settings.check_paired_figures,
         );
+        if check_pending {
+            let stripped = strip_fences(&body.lines().collect::<Vec<_>>());
+            let (problems, unknown) =
+                claim_registry::scan_pending(&stripped, issue_states.as_mut());
+            findings.extend(problems.into_iter().map(pending_finding));
+            undecidable.extend(
+                unknown
+                    .into_iter()
+                    .map(|u| format!("PR body:{}: {}", u.line, u.reasons.join("; "))),
+            );
+        }
 
         for f in findings {
             let severity = if f.is_warning {
@@ -481,13 +645,169 @@ pub fn evaluate_provenance_tags(ctx: &Context) -> Result<GateOutcome> {
         }
     }
 
+    if !undecidable.is_empty() {
+        anyhow::bail!(
+            "provenance-tags: could not decide the state of issues cited by pending statements \
+             (require_open_pending_issues reads the forge's API over HTTPS, with a token for private \
+             repositories; see docs/GATES.md#forge-access): {}",
+            undecidable.join(" | ")
+        );
+    }
+
+    if let Some((registry_path, figures)) = &registry {
+        // A changed registry can withdraw a figure that is already published, so the
+        // sweep widens to every tracked document; otherwise only changed files are read.
+        let registry_changed = changed_files.iter().any(|f| &f.path == registry_path);
+        let sweep: Vec<String> = if registry_changed {
+            ctx.git.tracked_files()?
+        } else {
+            changed_files.iter().map(|f| f.path.clone()).collect()
+        };
+        let mut swept = 0;
+        for path in &sweep {
+            if exempt.matches(path) || path == registry_path {
+                continue;
+            }
+            let is_doc = doc_filter.matches(path);
+            let is_json = json_filter.matches(path) && path.ends_with(".json");
+            if !is_doc && !is_json {
+                continue;
+            }
+            let Some(content) = ctx.git.head_content(path)? else {
+                continue;
+            };
+            swept += 1;
+            let hits: Vec<(Option<usize>, String)> = if is_doc {
+                let stripped = strip_fences(&content.lines().collect::<Vec<_>>());
+                claim_registry::scan_superseded(&stripped, figures)?
+                    .into_iter()
+                    .map(|h| {
+                        let replacement = if h.replacement.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; replacement: {}", h.replacement)
+                        };
+                        (
+                            Some(h.line),
+                            format!(
+                                "`{}` is superseded figure `{}`, published without a retraction marker{replacement}",
+                                h.matched, h.figure_id
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+                    anyhow::anyhow!("provenance-tags: `{path}` is not valid JSON: {e}")
+                })?;
+                claim_registry::scan_superseded_json(&value, figures)?
+                    .into_iter()
+                    .map(|(key, msg)| (None, format!("{key}: {msg}")))
+                    .collect()
+            };
+            for (line, message) in hits {
+                if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_PROVENANCE, path) {
+                    out.overrides.push(ov);
+                } else {
+                    out.push(
+                        settings.severity(),
+                        "Superseded Figure Republished",
+                        Some(path),
+                        line,
+                        message,
+                        "Replace the figure with its current value, or mark it retracted/superseded within three lines.",
+                    );
+                }
+            }
+        }
+        if let Some(ref body) = ctx.pr_body {
+            let stripped = strip_fences(&body.lines().collect::<Vec<_>>());
+            for h in claim_registry::scan_superseded(&stripped, figures)? {
+                out.push(
+                    settings.severity(),
+                    "Superseded Figure Republished",
+                    Some("PR body"),
+                    Some(h.line),
+                    format!(
+                        "`{}` is superseded figure `{}`, published without a retraction marker",
+                        h.matched, h.figure_id
+                    ),
+                    "Replace the figure with its current value, or mark it retracted/superseded.",
+                );
+            }
+        }
+        scanned_count += swept;
+        out.notes.push(format!(
+            "superseded registry `{registry_path}`: {} figure(s); {swept} file(s) swept{}",
+            figures.len(),
+            if registry_changed {
+                " (registry changed: every tracked document)"
+            } else {
+                ""
+            }
+        ));
+    }
+
     out.examined = scanned_count;
     Ok(out)
+}
+
+fn is_agent_guide(path: &str) -> bool {
+    path.ends_with("AGENTS.md") || path.ends_with("CLAUDE.md") || path.ends_with("GEMINI.md")
+}
+
+fn pending_finding((line, problem): (usize, claim_registry::PendingProblem)) -> HygieneFinding {
+    let message = match problem {
+        claim_registry::PendingProblem::NoCitation => {
+            "pending measurement statement cites no tracking issue".to_string()
+        }
+        claim_registry::PendingProblem::Closed(issues) => format!(
+            "pending measurement statement cites only closed issue(s): {}",
+            issues.join(", ")
+        ),
+        claim_registry::PendingProblem::OutsideRepository(issues) => format!(
+            "pending measurement statement cites only issues of other repositories ({}); \
+             list them in `pending_issue_repos` if they track this measurement",
+            issues.join(", ")
+        ),
+    };
+    HygieneFinding {
+        line,
+        title: "Pending Measurement Without Open Issue",
+        message,
+        remediation: "Cite an open tracking issue (#123) after the pending statement, or state the measured result.",
+        is_warning: false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ratio_satisfaction_forms_build_a_pattern_and_bad_entries_are_errors() {
+        let re = interval_evidence_regex(&[
+            "interval".into(),
+            "artifact:results/baseline_*".into(),
+            "marker:superseded".into(),
+            "regex:\\bpending\\b".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(re.is_match("see [1.2, 1.4]"));
+        assert!(re.is_match("from results/baseline_2026.json"));
+        assert!(!re.is_match("from results/other.json"));
+        assert!(re.is_match("figure superseded by"));
+        assert!(re.is_match("pending"));
+        assert!(!re.is_match("nothing here"));
+        assert!(interval_evidence_regex(&[]).unwrap().is_none());
+        assert!(interval_evidence_regex(&["bogus".into()]).is_err());
+        assert!(interval_evidence_regex(&["regex:(".into()]).is_err());
+        let det = deterministic_regex(&["instructions".into()])
+            .unwrap()
+            .unwrap();
+        assert!(det.is_match("1,200 instructions") && !det.is_match("12 ns"));
+    }
 
     #[test]
     fn test_table_provenance_check() {
@@ -551,11 +871,11 @@ mod tests {
         let findings = scan_markdown_text(retracted_exp, "t.md", false, false, false, true);
         assert!(findings.is_empty());
 
-        let cross_ascii = "libexpanse retires 0.55x the instructions of stock libjudy on random 1M lookup and is 1.11x slower in wall clock.\n";
+        let cross_ascii = "libexample retires 0.55x the instructions of stock libjudy on random 1M lookup and is 1.11x slower in wall clock.\n";
         let findings = scan_markdown_text(cross_ascii, "t.md", false, false, false, true);
         assert_eq!(findings.len(), 1);
 
-        let cross_unicode = "libexpanse retires 0.55× the instructions of stock libjudy on random 1M lookup and is 1.11× slower in wall clock.\n";
+        let cross_unicode = "libexample retires 0.55× the instructions of stock libjudy on random 1M lookup and is 1.11× slower in wall clock.\n";
         let findings = scan_markdown_text(cross_unicode, "t.md", false, false, false, true);
         assert_eq!(findings.len(), 1);
 

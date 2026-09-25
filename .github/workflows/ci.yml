@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `edited`: a changed PR description (a directive added or removed) re-runs the gates.
+    types: [opened, synchronize, reopened, edited]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
@@ -44,6 +46,16 @@ jobs:
         run: python3 tests/action/check_ecosystem_theme.py --local-only
       - name: Test release notes sanitiser
         run: python3 tests/action/sanitize-release-notes.py --test
+      - name: Release notes carry the compatibility ledger
+        run: |
+          python3 scripts/release_notes_upgrade.py --test
+          python3 scripts/generate_portfile.py --test
+          version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          # The version being prepared must have ledger rows or none at all; this
+          # renders them so a malformed table fails here, not during a release.
+          python3 scripts/release_notes_upgrade.py --version "${version}" > /dev/null
+      - name: Test major tag drift detector
+        run: tests/action/test-check-major-tag.sh
       - name: Lint PR title for unquoted mentions
         if: github.event_name == 'pull_request'
         shell: bash
@@ -237,6 +249,7 @@ jobs:
           base_ref: main
           pr_title: "test: fixture (#1)"
           pr_body: "Plan: ship in 3 weeks."
+          fail_on_warnings: true
       - name: PR body time estimate fails with time-estimates gate
         shell: bash
         env:
@@ -387,6 +400,8 @@ jobs:
           [ -z "${STATUS}" ] || { echo "::error::a verdict was produced by an unverified binary"; exit 1; }
       - name: "Standalone installer: install.sh positive and negative controls"
         run: tests/action/test-install-script.sh .ci-bin/discipline "${RUNNER_TEMP}"
+      - name: "Homebrew formula generator: positive and negative controls"
+        run: tests/action/test-update-homebrew-formula.sh
 
   # Gitea's act_runner is built on nektos/act: run the Gitea workflow under act
   # with Gitea's runner image. A live Gitea server is the stronger check and is
@@ -415,6 +430,16 @@ jobs:
           # act exits 0 when it matched no job; require proof the jobs ran.
           grep -q 'report matches expectation: pass' act.log
           grep -q 'report matches expectation: fail' act.log
+      # The job-container recipe documented in docs/CONFIGURATION.md, extracted
+      # verbatim and run under act against the image built from this binary:
+      # the job must schedule, land on the pull request head, pass a clean
+      # change and reject a bad one by name.
+      - name: Build the container image from this run's binary
+        run: |
+          mkdir -p bin-amd64 && cp .ci-bin/discipline bin-amd64/discipline
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 -t discipline:test .
+      - name: Run the documented container recipe under act
+        run: tests/action/test-container-recipe.sh discipline:test
 
   # The local pre-commit path, through the pre-commit framework.
   pre-commit:
@@ -452,6 +477,21 @@ jobs:
         id: discipline
         with:
           binary_path: .ci-bin/discipline
+          # A pull request is judged by main's discipline.toml, not by its own copy.
+          policy_from: base
+      # Checks that need no forge API: a discipline job that cannot fail, a trigger that
+      # misses description edits, a gate file CODEOWNERS does not cover. Warnings fail.
+      - name: discipline doctor (local checks)
+        run: .ci-bin/discipline doctor --local-only --strict
+      # Forge-side checks with the workflow's read token: the required check, up-to-date
+      # policy, force-push and deletion blocking, review rules, bypass actors, merge
+      # methods. Warnings are visible in the log; `--strict` is switched on once the
+      # branch rules block deletion and require pull requests (both are repository
+      # settings, tracked in docs/ROADMAP.md).
+      - name: discipline doctor (forge checks)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .ci-bin/discipline doctor
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -459,9 +499,72 @@ jobs:
           path: ${{ steps.discipline.outputs.report }}
           if-no-files-found: ignore
 
+  # Smoke test the built container image with non-root USER 10001 against a root-owned checkout (reproducing R1).
+  docker-smoke:
+    needs: build-static
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: bin-amd64
+      - run: chmod +x bin-amd64/discipline
+      - name: Build local container image
+        run: |
+          docker build -f Dockerfile.release --build-arg TARGETARCH=amd64 -t discipline:test .
+      - name: Create root-owned fixture repo (reproducing container UID mismatch)
+        run: |
+          tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-root" clean
+          sudo chown -R 0:0 "${RUNNER_TEMP}/fx-root"
+      - name: "Smoke test container against root-owned workspace (positive control)"
+        run: |
+          docker run --rm -v "${RUNNER_TEMP}/fx-root":/workspace discipline:test check --base main --format json > "${RUNNER_TEMP}/fx-root-clean.json"
+          tests/action/assert-report.sh "${RUNNER_TEMP}/fx-root-clean.json" pass
+      - name: "Negative control: bad fixture is detected and rejected with real gate verdicts"
+        run: |
+          tests/action/make-fixture.sh "${RUNNER_TEMP}/fx-root-bad" bad
+          sudo chown -R 0:0 "${RUNNER_TEMP}/fx-root-bad"
+          if docker run --rm -v "${RUNNER_TEMP}/fx-root-bad":/workspace discipline:test check --base main --format json > "${RUNNER_TEMP}/fx-root-bad.json"; then
+            echo "Expected bad fixture to fail check" >&2
+            exit 1
+          fi
+          tests/action/assert-report.sh "${RUNNER_TEMP}/fx-root-bad.json" fail assertion-reduction pii time-estimates unsafe-safety-comment vacuous-tests
+      - name: "Smoke test container in-container checkout (GitLab/Woodpecker pipeline reproduction)"
+        run: |
+          docker run --rm discipline:test sh -c '
+            set -euo pipefail
+            git init -b main
+            git config user.email "ci@example.invalid"
+            git config user.name "ci"
+            echo "# Agents Guide" > AGENTS.md
+            cat > tests.rs << "EOF"
+          #[test]
+          fn works() {
+              let x = 1;
+              assert_eq!(x + 1, 2);
+          }
+          EOF
+            git add -A
+            git commit -m "chore: base"
+            git checkout -b work
+            cat >> tests.rs << "EOF"
+
+          #[test]
+          fn extra() {
+              let x = 2;
+              assert_eq!(x + 2, 4);
+          }
+          EOF
+            git add -A
+            git commit -m "test: add extra test"
+            discipline check --base main
+          '
+
   ci-gate:
     if: always()
-    needs: [lint, test, msrv, supply-chain, build-static, action-github, action-gitea, pre-commit, dogfood]
+    needs: [lint, test, msrv, supply-chain, build-static, action-github, action-gitea, pre-commit, dogfood, docker-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -476,5 +579,41 @@ jobs:
           # `skipped`, `cancelled`, or a result string added later — fails.
           bad="$(echo "${NEEDS}" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
           count="$(echo "${NEEDS}" | jq 'length')"
-          [ "${count}" -eq 9 ] || { echo "::error::expected 9 needed jobs, saw ${count}"; exit 1; }
+          [ "${count}" -eq 10 ] || { echo "::error::expected 10 needed jobs, saw ${count}"; exit 1; }
           [ -z "${bad}" ] || { echo "::error::not successful: ${bad}"; exit 1; }
+      # Dogfood ci-skip-set on this rollup's own runtime context. Every job
+      # above is unconditional, so each must have run; the inverted canary
+      # proves the gate evaluated the context rather than noting it absent.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: discipline-x86_64-unknown-linux-musl
+          path: .ci-bin
+      - name: Skip set matches each job's if (ci-skip-set)
+        shell: bash
+        env:
+          DISCIPLINE_CI_CONTEXT: ${{ toJson(needs) }}
+        run: |
+          set -euo pipefail
+          chmod +x .ci-bin/discipline
+          report="${RUNNER_TEMP}/skip-set.json"
+          .ci-bin/discipline check --suite integrity --base HEAD --format github-summary --json-out "${report}"
+          count="$(echo "${DISCIPLINE_CI_CONTEXT}" | jq 'length')"
+          jq -e --argjson n "${count}" '.outcomes[] | select(.gate == "ci-skip-set") | .examined == $n and (.violations | length) == 0' "${report}" \
+            || { echo "::error::ci-skip-set did not evaluate all ${count} rollup dependencies"; exit 1; }
+      - name: "Inverted canary: a skipped unconditional job is reported by ci-skip-set"
+        shell: bash
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          set -euo pipefail
+          first="$(echo "${NEEDS}" | jq -r 'keys[0]')"
+          DISCIPLINE_CI_CONTEXT="$(echo "${NEEDS}" | jq -c --arg j "${first}" '.[$j].result = "skipped"')"
+          export DISCIPLINE_CI_CONTEXT
+          report="${RUNNER_TEMP}/skip-set-canary.json"
+          rc=0
+          .ci-bin/discipline check --suite integrity --base HEAD --format json --json-out "${report}" > /dev/null || rc=$?
+          [ "${rc}" -eq 1 ] || { echo "::error::expected exit 1 from the canary, got ${rc}"; exit 1; }
+          jq -e --arg t "\`${first}\` skipped although its \`if:\` is true" \
+            '[.outcomes[] | select(.gate == "ci-skip-set") | .violations[].title] | any(. == $t)' "${report}" \
+            || { echo "::error::canary did not carry the ci-skip-set diagnostic"; jq '.outcomes[] | select(.gate == "ci-skip-set")' "${report}"; exit 1; }

@@ -1,3 +1,4 @@
+mod common;
 use discipline::config::{split_list, DisciplineConfig, Overrides, Severity, GATES};
 use std::path::Path;
 
@@ -7,6 +8,18 @@ fn dogfood_config_loads_with_every_available_gate_on() {
         .expect("discipline.toml must load under the strict schema");
     assert_eq!(config.meta.name, "discipline");
     for gate in GATES.iter().filter(|g| g.available) {
+        if gate.id == "archive-contents"
+            || gate.id == "manifest-sync"
+            || gate.id == "version-lockstep"
+            || gate.id == "scope-confinement"
+            || gate.id == "pr-checklist"
+            || gate.id == "unsafe-budget"
+            || gate.id == "msrv"
+            || gate.id == "miri"
+            || gate.id == "sanitizers"
+        {
+            continue;
+        }
         let s = config
             .gates
             .settings(gate.id)
@@ -43,9 +56,9 @@ fn schema_is_strict() {
     for bad in [
         "[gates.pii]\nlan_ipz = false\n",
         "[gates.no-such-gate]\nenabled = true\n",
-        "[gates.miri]\nenabled = true\n",
+        "[gates.fuzz-ratchet]\nenabled = true\n",
         "[gates.reproducible-builds]\nenabled = true\n",
-        "[gates.sanitizers]\nenabled = true\n",
+        "[gates.formal-verification]\nenabled = true\n",
         "[nonsense]\na = 1\n",
         "[gates.pii]\nseverity = \"fatal\"\n",
         "[directives]\nunknown_key = true\n",
@@ -62,7 +75,10 @@ fn schema_is_strict() {
 #[test]
 fn directives_config_defaults_and_overrides() {
     let base = DisciplineConfig::default_for_repo("t");
-    assert_eq!(base.directives.sources, vec!["pr-body", "commits"]);
+    assert_eq!(
+        base.directives.sources,
+        vec!["pr-body", "commits", "merged-pr-body"]
+    );
     assert!(!base.directives.allow_hidden);
     assert!(!base.directives.fail_on_overrides);
 
@@ -245,7 +261,7 @@ name = "my-test-proj"
 # description = "Brief description of the project"
 
 # [directives]
-# sources = ["pr-body", "commits"]
+# sources = ["pr-body", "commits", "merged-pr-body"]
 # allow_hidden = false
 # fail_on_overrides = false
 
@@ -266,7 +282,19 @@ name = "my-test-proj"
     assert_eq!(cfg.meta.name, "my-test-proj");
     assert_eq!(cfg.meta.version, 1);
     for g in GATES.iter().filter(|g| g.available) {
-        if g.id == "issue-link" || g.id == "provenance-tags" {
+        if g.id == "issue-link"
+            || g.id == "provenance-tags"
+            || g.id == "commit-provenance"
+            || g.id == "archive-contents"
+            || g.id == "manifest-sync"
+            || g.id == "version-lockstep"
+            || g.id == "scope-confinement"
+            || g.id == "pr-checklist"
+            || g.id == "unsafe-budget"
+            || g.id == "msrv"
+            || g.id == "miri"
+            || g.id == "sanitizers"
+        {
             assert!(
                 !cfg.gates.settings(g.id).unwrap().enabled(),
                 "{} should be opt-in (disabled by default)",
@@ -351,5 +379,228 @@ fn schema_json_file_in_sync_with_code() {
     assert_eq!(
         committed, generated,
         "discipline.schema.json is out of sync with Rust Serde models; run `cargo run -- docs --write` to update"
+    );
+}
+
+#[test]
+fn test_all_directives_documented_in_configuration_md() {
+    let doc =
+        std::fs::read_to_string("docs/CONFIGURATION.md").expect("docs/CONFIGURATION.md must exist");
+
+    let mut table_directives = std::collections::BTreeSet::new();
+    let mut in_table = false;
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("| Directive | Lifts | Subject |") {
+            in_table = true;
+            continue;
+        }
+        if in_table {
+            if !trimmed.starts_with('|') || trimmed.is_empty() {
+                break;
+            }
+            if trimmed.starts_with("|---|") {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.split('|').collect();
+            if parts.len() >= 2 {
+                let cell = parts[1].trim();
+                for entry in cell.split('/') {
+                    let cleaned = entry.trim().trim_matches('`').trim_end_matches(':').trim();
+                    if !cleaned.is_empty() {
+                        table_directives.insert(cleaned.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let code_directives: std::collections::BTreeSet<String> =
+        discipline::tokens::ALL_DIRECTIVE_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+    // 1. Every code directive must be in the documentation table
+    for dir in &code_directives {
+        assert!(
+            table_directives.contains(dir),
+            "Directive '{dir}' known to src/tokens.rs is missing from the directive table in docs/CONFIGURATION.md"
+        );
+    }
+
+    // 2. Every documented table directive must be known to src/tokens.rs
+    for dir in &table_directives {
+        assert!(
+            code_directives.contains(dir),
+            "Directive '{dir}' documented in docs/CONFIGURATION.md table is unknown to src/tokens.rs"
+        );
+    }
+
+    // 3. Exact set equality
+    assert_eq!(
+        table_directives, code_directives,
+        "Mismatch between documented directive table and src/tokens.rs::ALL_DIRECTIVE_NAMES"
+    );
+}
+
+#[test]
+fn config_meta_mode_round_trips_and_defaults_to_enforcing() {
+    let default_cfg = DisciplineConfig::default_for_repo("test-repo");
+    assert_eq!(
+        default_cfg.meta.mode,
+        discipline::config::RunMode::Enforcing
+    );
+
+    let toml_advisory = r#"
+[meta]
+version = 1
+name = "test-repo"
+mode = "advisory"
+"#;
+    let cfg = DisciplineConfig::from_toml_str(toml_advisory).expect("advisory mode must parse");
+    assert_eq!(cfg.meta.mode, discipline::config::RunMode::Advisory);
+
+    let serialized = toml::to_string_pretty(&cfg).unwrap();
+    let back = DisciplineConfig::from_toml_str(&serialized).unwrap();
+    assert_eq!(back.meta.mode, discipline::config::RunMode::Advisory);
+}
+
+/// Compatibility contract (docs/ARCHITECTURE.md §3.1): the built-in default
+/// enablement and severity of every gate. Changing a default fails this test
+/// until the snapshot is updated deliberately, so the change is visible in
+/// review. Within a major version a default may only become STRICTER without a
+/// release-note entry in docs/ROADMAP.md ("Default Changes").
+const DEFAULTS_SNAPSHOT: &[(&str, bool, Severity)] = &[
+    ("agents-md", true, Severity::Warning),
+    ("assertion-reduction", true, Severity::Error),
+    ("vacuous-tests", true, Severity::Error),
+    ("ignored-tests", true, Severity::Error),
+    ("unsafe-safety-comment", true, Severity::Error),
+    ("deletion-rationale", true, Severity::Error),
+    ("scope-confinement", false, Severity::Error),
+    ("suppression-delta", true, Severity::Warning),
+    ("time-estimates", true, Severity::Warning),
+    ("pii", true, Severity::Error),
+    ("agent-scratch", true, Severity::Error),
+    ("shell-secrets", true, Severity::Error),
+    ("issue-link", false, Severity::Error),
+    ("commit-provenance", false, Severity::Error),
+    ("provenance-tags", false, Severity::Error),
+    ("pr-checklist", false, Severity::Error),
+    ("config-integrity", true, Severity::Error),
+    ("toolchain-config", true, Severity::Error),
+    ("stub-bodies", true, Severity::Error),
+    ("error-swallowing", true, Severity::Error),
+    ("instruction-smuggling", true, Severity::Error),
+    ("build-hooks", true, Severity::Error),
+    ("golden-output", true, Severity::Error),
+    ("dependency-delta", true, Severity::Error),
+    ("test-budget", true, Severity::Error),
+    ("ci-integrity", true, Severity::Error),
+    ("ci-skip-set", true, Severity::Error),
+    ("test-floor", true, Severity::Error),
+    ("archive-contents", false, Severity::Error),
+    ("manifest-sync", false, Severity::Error),
+    ("version-lockstep", false, Severity::Error),
+    ("command", true, Severity::Error),
+    ("sanitizers", false, Severity::Error),
+    ("miri", false, Severity::Error),
+    ("unsafe-budget", false, Severity::Error),
+    ("msrv", false, Severity::Error),
+    ("bench-regression", true, Severity::Warning),
+];
+
+#[test]
+fn default_enablement_and_severity_match_snapshot() {
+    let defaults = DisciplineConfig::default_for_repo("t");
+    let available: Vec<&str> = GATES.iter().filter(|g| g.available).map(|g| g.id).collect();
+    for id in &available {
+        assert!(
+            DEFAULTS_SNAPSHOT.iter().any(|(s, _, _)| s == id),
+            "{id} has no entry in DEFAULTS_SNAPSHOT; add it deliberately"
+        );
+    }
+    let mut drift = Vec::new();
+    for (id, enabled, severity) in DEFAULTS_SNAPSHOT {
+        assert!(
+            available.contains(id),
+            "{id} is in DEFAULTS_SNAPSHOT but is not an available gate"
+        );
+        let s = defaults.gates.settings(id).expect("available gate");
+        if s.enabled() != *enabled || s.severity() != *severity {
+            drift.push(format!(
+                "{id}: snapshot ({enabled}, {severity}) != compiled ({}, {})",
+                s.enabled(),
+                s.severity()
+            ));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "default enablement/severity changed; update DEFAULTS_SNAPSHOT and record the change \
+         in docs/ROADMAP.md \"Default Changes\": {drift:#?}"
+    );
+}
+
+#[test]
+fn schema_severity_enum_matches_accepted_severities() {
+    let schema = discipline::schema::generate_schema();
+    let values: Vec<String> = schema["$defs"]["Severity"]["enum"]
+        .as_array()
+        .expect("Severity enum")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for v in &values {
+        let body = format!("[meta]\nversion = 1\nname = \"t\"\n[gates.pii]\nseverity = \"{v}\"\n");
+        let parsed = DisciplineConfig::from_toml_str(&body);
+        assert!(
+            parsed.is_ok(),
+            "schema advertises severity {v:?} but the config parser rejects it: {:?}",
+            parsed.err()
+        );
+    }
+    for sev in [Severity::Error, Severity::Warning, Severity::Note] {
+        assert!(
+            values.contains(&sev.to_string()),
+            "config accepts severity {sev} but the schema does not list it: {values:?}"
+        );
+    }
+}
+
+/// Every environment variable the binary reads must be isolated by the test harness, or a
+/// developer's shell (or a CI runner's own variables) could decide a test's verdict.
+#[test]
+fn test_harness_isolates_every_environment_variable_the_binary_reads() {
+    let family = regex::Regex::new(
+        r#""((?:DISCIPLINE|GITHUB|GITEA|FORGEJO|GITLAB|CI|PR|GH|DOCS)_[A-Z0-9_]+)""#,
+    )
+    .unwrap();
+    // Set explicitly by the harness rather than removed.
+    let set_by_harness = ["DISCIPLINE_NO_NETWORK"];
+    let mut missing = std::collections::BTreeSet::new();
+    let mut stack = vec![std::path::PathBuf::from("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for c in family.captures_iter(&text) {
+                    let name = c[1].to_string();
+                    if !common::ISOLATED_ENV_VARS.contains(&name.as_str())
+                        && !set_by_harness.contains(&name.as_str())
+                    {
+                        missing.insert(format!("{name} ({})", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "add to tests/common/mod.rs ISOLATED_ENV_VARS: {missing:?}"
     );
 }

@@ -1,10 +1,65 @@
 {
   "$defs": {
+    "ArchiveContentsGate": {
+      "additionalProperties": false,
+      "properties": {
+        "archive_path": {
+          "description": "Glob pattern matching the built archive file",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "forbidden_patterns": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Regex patterns forbidden inside the archive"
+        },
+        "max_entry_bytes": {
+          "description": "Entries larger than this many bytes are not scanned and are named in a note (default 16 MiB)",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "preset": {
+          "description": "Named forbidden_patterns list merged with forbidden_patterns; no-source also turns scan_contents on",
+          "enum": [
+            "no-source",
+            "no-source-npm",
+            "no-source-python",
+            "no-source-jvm",
+            "no-source-dotnet",
+            "no-source-rust",
+            "no-source-go"
+          ],
+          "type": "string"
+        },
+        "required_paths": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Files required to exist inside the archive"
+        },
+        "scan_contents": {
+          "description": "Read each entry and report source maps whose sourcesContent embeds the original source, as .map entries or inline base64 sourceMappingURL comments",
+          "type": "boolean"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "strip_components": {
+          "description": "Leading directory components to strip from archive paths",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "AssertionGate": {
       "additionalProperties": false,
       "properties": {
         "assert_helper_fns": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Additional function names treated as assertions"
         },
         "enabled": {
           "description": "Whether this gate is active",
@@ -14,11 +69,20 @@
           "$ref": "#/$defs/StringListOrReset"
         },
         "extra_assert_macros": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Additional macro names treated as assertions"
         },
         "min_assertions_per_test": {
           "description": "Minimum assertions required per test method",
           "type": "integer"
+        },
+        "mock_assert_fns": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Callee fragments that assert on a test double's interactions, beyond the built-in vocabulary"
+        },
+        "mock_setup_fns": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Callee fragments that construct or program a test double, beyond the built-in vocabulary"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -57,13 +121,24 @@
           "description": "In-job base benchmark result file path for dual-file regression checks",
           "type": "string"
         },
+        "citation_measurement_jobs": {
+          "description": "CI jobs that produce gated numbers, each with the step that gates them. A cited run that concluded `failure` is admitted only when every listed job it started reached its guard step with every earlier step green. Empty: a cited `failure` run cannot be told from a crashed benchmark and leaves the gate armed.",
+          "items": {
+            "$ref": "#/$defs/MeasurementJob"
+          },
+          "type": "array"
+        },
+        "citation_source_paths": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Repo-relative files or directories whose changes can move a gated number. A cited data artifact last committed before the branch's newest change under these paths is stale. Empty: artifact citations cannot be dated and leave the gate armed."
+        },
         "enabled": {
           "description": "Whether this gate is active",
           "type": "boolean"
         },
         "exempt_arms": {
           "$ref": "#/$defs/StringListOrReset",
-          "description": "Declared exempt benchmark arms"
+          "description": "Benchmark arms exempted from regression checks: exact name, the name as the benchmark prints it (`map_get random` matches `map_get/random`), a glob (`*.heap.*`), a trailing-`*` prefix, or a `::`/`/` path suffix. An entry matching no arm in the run is an error."
         },
         "exempt_paths": {
           "$ref": "#/$defs/StringListOrReset"
@@ -76,6 +151,14 @@
           "description": "Maximum acceptable coefficient of variation (std_dev / mean)",
           "type": "number"
         },
+        "mode": {
+          "description": "Evaluation mode: `version-vs-version` compares base and head artifacts of the same arms (preferred when the old version can be built in the same run); `paired-ratio` compares a ratio of two arms measured in the same interleaved rounds against a committed ratio baseline (when building the old version is impractical). The two are not interchangeable.",
+          "enum": [
+            "version-vs-version",
+            "paired-ratio"
+          ],
+          "type": "string"
+        },
         "noise_floor_pct": {
           "description": "Noise floor percentage (default: 0.5%)",
           "type": "number"
@@ -85,14 +168,23 @@
           "type": "number"
         },
         "paths": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Benchmark artifact globs tracked across revisions"
         },
         "provenance": {
           "description": "Expected host/runner provenance tag for benchmark artifacts",
           "type": "string"
         },
+        "ratio_baseline": {
+          "description": "Committed paired-ratio baseline (`discipline-bench-ratio-baseline/v1`), produced by `discipline bench derive`. Read from the base ref, never from head; loosening it needs a scoped `allow-regression: <path>` directive.",
+          "type": "string"
+        },
+        "ratio_tolerance_pct": {
+          "description": "Optional minimum paired-ratio threshold in percent. It only widens a derived floor; configured for an axis with no derived floor, it is a configuration error.",
+          "type": "number"
+        },
         "require_sourced_override": {
-          "description": "Require allow-regression reasons to cite a CI run URL or artifact path and name the arms",
+          "description": "Require allow-regression reasons to cite a CI run URL or artifact path and name the arms. Every citation is also checked for freshness: a cited run must have completed, reached its regression guard, and measured a commit reachable from the head; a cited data artifact must post-date the branch's newest change under `citation_source_paths`. A citation that cannot be checked (no `gh`, unauthenticated, rate limited) is reported by name and leaves the gate armed.",
           "type": "boolean"
         },
         "severity": {
@@ -157,6 +249,34 @@
         "workflows": {
           "$ref": "#/$defs/StringListOrReset",
           "description": "Workflow file patterns to inspect"
+        }
+      },
+      "type": "object"
+    },
+    "CiSkipSetGate": {
+      "additionalProperties": false,
+      "properties": {
+        "change_job": {
+          "description": "Change-detection job whose outputs gate the conditional jobs; it must have succeeded. Empty string = no such job",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "unconditional_jobs": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Jobs that must never be skipped, whatever their dependencies did"
+        },
+        "workflow": {
+          "description": "Repo-relative path of the workflow whose rollup job supplies the runtime needs context (DISCIPLINE_CI_CONTEXT). Left at the default, the running workflow (GITHUB_WORKFLOW_REF) or the first ci.yml under .github/, .gitea/ or .forgejo/workflows/ is used",
+          "type": "string"
         }
       },
       "type": "object"
@@ -277,6 +397,34 @@
       },
       "type": "object"
     },
+    "CommitProvenanceGate": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_markers": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Substrings of a trailer line, author name or author email that identify an agent-produced commit"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "required_trailers": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Trailer keys every commit in the change must carry"
+        },
+        "review_trailer": {
+          "description": "Trailer an agent-produced commit must carry, naming someone other than its author; empty switches the rule off (default: Reviewed-by)",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
+    },
     "DeletionGate": {
       "additionalProperties": false,
       "properties": {
@@ -295,7 +443,8 @@
           "$ref": "#/$defs/StringListOrReset"
         },
         "paths": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Path globs where file deletions require a rationale"
         },
         "require_scope": {
           "description": "When true, directive must name the deleted file or test",
@@ -350,10 +499,6 @@
     "GoldenGate": {
       "additionalProperties": false,
       "properties": {
-        "allow_updates": {
-          "description": "Permit snapshot updates without error",
-          "type": "boolean"
-        },
         "enabled": {
           "description": "Whether this gate is active",
           "type": "boolean"
@@ -362,7 +507,8 @@
           "$ref": "#/$defs/StringListOrReset"
         },
         "paths": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Committed golden/snapshot globs whose edits require a directive"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -383,6 +529,26 @@
         },
         "exempt_paths": {
           "$ref": "#/$defs/StringListOrReset"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
+    },
+    "InstructionSmugglingGate": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "instruction_files": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Globs of the repository's own agent-instruction files (a prompt an MCP server loads, a runtime context file), reported like AGENTS.md (default: [])"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -414,6 +580,125 @@
       },
       "type": "object"
     },
+    "ManifestSyncGate": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "rules": {
+          "description": "Rules reconciling packaging manifests against git-tracked files",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "exclude_paths": {
+                "$ref": "#/$defs/StringListOrReset",
+                "description": "Globs excluded from manifest registration requirement"
+              },
+              "extract_regex": {
+                "description": "Regex to extract relative file paths from manifest",
+                "type": "string"
+              },
+              "manifest": {
+                "description": "Path to packaging manifest (e.g. package.xml)",
+                "type": "string"
+              },
+              "watched_paths": {
+                "$ref": "#/$defs/StringListOrReset",
+                "description": "Git file globs that must be registered in the manifest"
+              }
+            },
+            "required": [
+              "manifest",
+              "extract_regex",
+              "watched_paths"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
+    },
+    "MeasurementJob": {
+      "additionalProperties": false,
+      "properties": {
+        "guard": {
+          "description": "Name of the step in that job that reads the numbers and enforces the regression guard",
+          "type": "string"
+        },
+        "job": {
+          "description": "Job display name as the CI API lists it",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job",
+        "guard"
+      ],
+      "type": "object"
+    },
+    "MiriGate": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Additional CLI arguments passed to cargo miri test"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "timeout_seconds": {
+          "description": "Maximum execution time in seconds before failing closed (default: 600)",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "MsrvGate": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "Command to run to verify MSRV compatibility",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "pinned_version": {
+          "description": "Explicit MSRV version string (e.g. \"1.90.0\")",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
+    },
     "PiiGate": {
       "additionalProperties": false,
       "properties": {
@@ -422,10 +707,12 @@
           "type": "boolean"
         },
         "allow_patterns": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Regex patterns exempted from rejection"
         },
         "allowed_users": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Username tokens permitted inside home-directory paths"
         },
         "diff_only": {
           "description": "When true, scans only modified lines in the git diff rather than all tracked files",
@@ -439,17 +726,23 @@
           "$ref": "#/$defs/StringListOrReset"
         },
         "extra_patterns": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Additional regex patterns to reject"
         },
         "home_paths": {
           "description": "Check for leaked home directory paths",
           "type": "boolean"
         },
         "hostname_denylist": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Whole-token, case-insensitive hostnames that must not appear"
         },
         "lan_ips": {
           "description": "Check for leaked private LAN IPs",
+          "type": "boolean"
+        },
+        "redact_lan_ips": {
+          "description": "Mask a matched LAN IP in the report instead of echoing it (default: false)",
           "type": "boolean"
         },
         "scan_pr_body": {
@@ -459,6 +752,22 @@
         "secrets": {
           "description": "Check for leaked private keys and high-entropy API tokens",
           "type": "boolean"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
+    },
+    "PrChecklistGate": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -481,8 +790,20 @@
           "description": "Check paired figures for shared workload IDs or differentiation tags",
           "type": "boolean"
         },
+        "check_pending_citations": {
+          "description": "A pending-measurement statement must cite a tracking issue",
+          "type": "boolean"
+        },
         "check_tables": {
           "description": "Check markdown tables for unit-bearing numbers without table or caption provenance tags",
+          "type": "boolean"
+        },
+        "deterministic_units": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Units whose figures are deterministic and exempt from the interval requirement, added to the built-in list"
+        },
+        "diff_only": {
+          "description": "Judge only paragraphs that contain an added line (default: false, the whole changed file)",
           "type": "boolean"
         },
         "enabled": {
@@ -491,6 +812,78 @@
         },
         "exempt_paths": {
           "$ref": "#/$defs/StringListOrReset"
+        },
+        "pending_issue_repos": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Other repositories (owner/name) whose issues a pending statement may cite; by default only this repository's issues count"
+        },
+        "ratio_satisfied_by": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "What satisfies a published wall-clock ratio, replacing the built-in list when set: interval, marker:<word>, artifact:<glob>, regex:<pattern> (paragraph-scoped)"
+        },
+        "require_open_pending_issues": {
+          "description": "A pending-measurement statement must cite at least one open issue, read from the forge (gh on GitHub, curl on GitLab, Gitea and Forgejo); implies check_pending_citations",
+          "type": "boolean"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "superseded_json_paths": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Globs of tracked JSON datasets swept for registered figures"
+        },
+        "superseded_registry": {
+          "description": "Path (read at HEAD) of a JSON registry of withdrawn figures; a registered figure may be republished only next to a retraction marker",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "SanitizersGate": {
+      "additionalProperties": false,
+      "properties": {
+        "canary": {
+          "description": "Whether to verify a negative-control race canary before main tests",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "sanitizer": {
+          "description": "Sanitizer name to activate (e.g. \"address\", \"thread\")",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        },
+        "timeout_seconds": {
+          "description": "Maximum execution time in seconds (default: 300)",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ScopeConfinementGate": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_paths": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Glob patterns of paths agents are authorized to modify"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "forbidden_paths": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Glob patterns of paths agents are strictly forbidden to touch"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -509,7 +902,8 @@
           "$ref": "#/$defs/StringListOrReset"
         },
         "paths": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Directory and file globs that must never be tracked"
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -518,11 +912,11 @@
       "type": "object"
     },
     "Severity": {
-      "description": "Violation severity: error (blocking, exit 1), warning (non-blocking), or info.",
+      "description": "Violation severity: error (blocking, exit 1), warning (non-blocking), or note (informational).",
       "enum": [
         "error",
         "warning",
-        "info"
+        "note"
       ],
       "type": "string"
     },
@@ -582,6 +976,30 @@
           "type": "object"
         }
       ]
+    },
+    "SuppressionDeltaGate": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_suppressions": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Specific suppression patterns explicitly permitted by policy"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "max_increase": {
+          "description": "Maximum net increase in suppression annotations permitted (default: 0)",
+          "type": "integer"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
     },
     "TestBudgetGate": {
       "additionalProperties": false,
@@ -659,7 +1077,8 @@
       "additionalProperties": false,
       "properties": {
         "allow_patterns": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Regex patterns permitted as operational exceptions; matched per line and across soft-wrapped lines of a paragraph, exempting only the matched text"
         },
         "diff_only": {
           "description": "When true, scans only modified lines in the git diff rather than all tracked files",
@@ -673,14 +1092,43 @@
           "$ref": "#/$defs/StringListOrReset"
         },
         "extra_patterns": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Additional banned regex patterns"
         },
         "include": {
-          "$ref": "#/$defs/StringListOrReset"
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "File globs swept for duration estimates"
         },
         "scan_pr_body": {
           "description": "Whether to scan PR description text",
           "type": "boolean"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
+    },
+    "UnsafeBudgetGate": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_increase": {
+          "description": "Whether total unsafe count may increase over base ref without override",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "max_unsafe": {
+          "description": "Maximum total number of unsafe sites allowed in head ref",
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "severity": {
           "$ref": "#/$defs/Severity"
@@ -707,6 +1155,62 @@
         }
       },
       "type": "object"
+    },
+    "VersionLockstepGate": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Whether this gate is active",
+          "type": "boolean"
+        },
+        "exempt_paths": {
+          "$ref": "#/$defs/StringListOrReset"
+        },
+        "groups": {
+          "description": "Groups of sources that must declare identical version strings",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "description": "Name of the version lockstep group",
+                "type": "string"
+              },
+              "sources": {
+                "description": "Files and capture regexes whose versions must match",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "description": "Source file path",
+                      "type": "string"
+                    },
+                    "regex": {
+                      "description": "Regex pattern capturing the version string in group 1",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "regex"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "name",
+              "sources"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -721,20 +1225,37 @@
           "description": "Allow directives hidden inside HTML comments <!-- --> (default: false)",
           "type": "boolean"
         },
+        "allowed_override_actors": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Actors authorized to apply overrides even when fail_on_overrides is true, and the reviewers whose approval require_approval accepts (default: [])"
+        },
+        "degrade_offline": {
+          "description": "On a push event, continue with a named note when the merged-pr-body lookup fails, the finding it might have lifted standing, instead of stopping with exit 2 (default: true; set false to make the review record a hard requirement)",
+          "type": "boolean"
+        },
         "fail_on_overrides": {
           "description": "Treat applied overrides as failures requiring human sign-off (default: false)",
           "type": "boolean"
         },
+        "max_overrides": {
+          "description": "Most PR-body / commit-body overrides one change may apply; inline markers are not counted (default: unset, no cap)",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_approval": {
+          "description": "PR-body / commit-body overrides fail the run until the forge shows an approving review of the head commit by an allowed_override_actors member other than the author (default: false)",
+          "type": "boolean"
+        },
         "sources": {
           "$ref": "#/$defs/StringListOrReset",
-          "description": "Allowed directive sources: pr-body, commits (default: [\"pr-body\", \"commits\"])"
+          "description": "Allowed directive sources: pr-body, commits, merged-pr-body (default: [\"pr-body\", \"commits\", \"merged-pr-body\"]). merged-pr-body reads, on a push event, the body of the merged pull request each pushed commit arrived through"
         }
       },
       "type": "object"
     },
     "gates": {
       "additionalProperties": false,
-      "description": "Per-gate settings. By default, every available gate is enabled at severity \"error\".",
+      "description": "Per-gate settings. Each gate has a built-in default enablement and severity; see docs/GATES.md \"Default Severity by Gate\".",
       "properties": {
         "agent-scratch": {
           "allOf": [
@@ -752,6 +1273,14 @@
           ],
           "description": "AGENTS.md exists; CLAUDE.md / GEMINI.md do not fork it"
         },
+        "archive-contents": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ArchiveContentsGate"
+            }
+          ],
+          "description": "distribution archive must contain required paths and zero forbidden developer artifacts"
+        },
         "assertion-reduction": {
           "allOf": [
             {
@@ -768,6 +1297,14 @@
           ],
           "description": "benchmark drift via harness adapters (deterministic counts or BCa intervals)"
         },
+        "build-hooks": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/BasicGate"
+            }
+          ],
+          "description": "install and build hooks that gain network or shell access, and package-manager configuration edits, need a token"
+        },
         "ci-integrity": {
           "allOf": [
             {
@@ -776,6 +1313,14 @@
           ],
           "description": "workflow weakening: continue-on-error, || true, unpinned actions"
         },
+        "ci-skip-set": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CiSkipSetGate"
+            }
+          ],
+          "description": "rollup skip set matches each job's `if:` under the observed filter outputs"
+        },
         "command": {
           "allOf": [
             {
@@ -783,6 +1328,14 @@
             }
           ],
           "description": "fail-closed wrapper for any tool: zero-tests guard, canary, count ratchet"
+        },
+        "commit-provenance": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/CommitProvenanceGate"
+            }
+          ],
+          "description": "commits carry the required trailers; an agent-produced commit carries a review by someone else"
         },
         "config-integrity": {
           "allOf": [
@@ -808,6 +1361,14 @@
           ],
           "description": "manifest diff inspection: zero wildcards, source/license allowlists, and deny.toml verification"
         },
+        "error-swallowing": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/BasicGate"
+            }
+          ],
+          "description": "no new empty error handler or discarded Result outside tests"
+        },
         "golden-output": {
           "allOf": [
             {
@@ -824,6 +1385,14 @@
           ],
           "description": "tests must not be newly #[ignore]d or skipped without directive"
         },
+        "instruction-smuggling": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/InstructionSmugglingGate"
+            }
+          ],
+          "description": "no invisible Unicode, unreviewed agent-instruction edits, or instruction-like text in comments and prose"
+        },
         "issue-link": {
           "allOf": [
             {
@@ -831,6 +1400,30 @@
             }
           ],
           "description": "PR title or description links a tracking issue (#123, Fixes #123)"
+        },
+        "manifest-sync": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ManifestSyncGate"
+            }
+          ],
+          "description": "reconcile git-tracked files against packaging manifest declarations"
+        },
+        "miri": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/MiriGate"
+            }
+          ],
+          "description": "Miri tiers with zero-tests guard"
+        },
+        "msrv": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/MsrvGate"
+            }
+          ],
+          "description": "cargo check under the pinned MSRV"
         },
         "pii": {
           "allOf": [
@@ -840,6 +1433,14 @@
           ],
           "description": "no home paths, LAN IPs, or denylisted hostnames in tracked text"
         },
+        "pr-checklist": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/PrChecklistGate"
+            }
+          ],
+          "description": "ticked PR checkboxes are reconciled against the diff"
+        },
         "provenance-tags": {
           "allOf": [
             {
@@ -848,6 +1449,22 @@
           ],
           "description": "published numerics carry (measured|target|projected)"
         },
+        "sanitizers": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/SanitizersGate"
+            }
+          ],
+          "description": "ASan / TSan preset with audited suppressions and a race canary"
+        },
+        "scope-confinement": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/ScopeConfinementGate"
+            }
+          ],
+          "description": "changes stay inside authorized paths"
+        },
         "shell-secrets": {
           "allOf": [
             {
@@ -855,6 +1472,22 @@
             }
           ],
           "description": "no command-line secrets or unverified piped scripts in shell, docker, or CI"
+        },
+        "stub-bodies": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/BasicGate"
+            }
+          ],
+          "description": "added functions are not stubs; existing bodies are not replaced by todo!() / NotImplementedError / return null"
+        },
+        "suppression-delta": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/SuppressionDeltaGate"
+            }
+          ],
+          "description": "newly added linter / compiler suppression annotations"
         },
         "test-budget": {
           "allOf": [
@@ -880,6 +1513,22 @@
           ],
           "description": "no calendar / duration estimates in markdown or the PR body"
         },
+        "toolchain-config": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/BasicGate"
+            }
+          ],
+          "description": "compiler, linter, type-checker, test-runner and coverage configuration cannot be loosened without a token"
+        },
+        "unsafe-budget": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/UnsafeBudgetGate"
+            }
+          ],
+          "description": "unsafe count ratchet"
+        },
         "unsafe-safety-comment": {
           "allOf": [
             {
@@ -895,6 +1544,36 @@
             }
           ],
           "description": "new tests must carry a non-tautological assertion"
+        },
+        "version-lockstep": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/VersionLockstepGate"
+            }
+          ],
+          "description": "version declarations across headers, manifests, and files must remain in lockstep"
+        }
+      },
+      "type": "object"
+    },
+    "languages": {
+      "additionalProperties": false,
+      "description": "Per-language parsing settings, read by the language packs before any gate runs",
+      "properties": {
+        "c": {
+          "additionalProperties": false,
+          "description": "C and C++ macros rewritten before parsing, appended to the built-in Zend, CPython and Ruby C API lists; an entry ending in * is a prefix. Adding an entry is a config-integrity weakening",
+          "properties": {
+            "function_macros": {
+              "$ref": "#/$defs/StringListOrReset",
+              "description": "Macros that expand to a function head, e.g. MYEXT_METHOD(Class, name) { ... } (default: [])"
+            },
+            "macros": {
+              "$ref": "#/$defs/StringListOrReset",
+              "description": "Macros blanked with their arguments: statement or declaration macros written without a semicolon, list entries without a comma, attribute-like prefixes (default: [])"
+            }
+          },
+          "type": "object"
         }
       },
       "type": "object"
@@ -905,6 +1584,15 @@
       "properties": {
         "description": {
           "description": "Optional short description of the project",
+          "type": "string"
+        },
+        "mode": {
+          "default": "enforcing",
+          "description": "Operating mode: 'enforcing' exits non-zero on violations; 'advisory' runs all checks and emits reports but exits 0.",
+          "enum": [
+            "enforcing",
+            "advisory"
+          ],
           "type": "string"
         },
         "name": {
@@ -921,6 +1609,21 @@
         "version",
         "name"
       ],
+      "type": "object"
+    },
+    "tests": {
+      "additionalProperties": false,
+      "description": "What the repository counts as test code beyond each language's conventions; read by every gate that separates test code from production code",
+      "properties": {
+        "functions": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Function names (leaf) that are test entry points wherever they appear, e.g. a script's self_test (default: [])"
+        },
+        "paths": {
+          "$ref": "#/$defs/StringListOrReset",
+          "description": "Path globs whose every line is test scope (default: [])"
+        }
+      },
       "type": "object"
     }
   },

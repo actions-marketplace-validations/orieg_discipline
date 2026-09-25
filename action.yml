@@ -10,7 +10,7 @@ branding:
 # text and must not be parsed as shell.
 inputs:
   config:
-    description: 'Path to discipline.toml. When the file is absent, built-in defaults apply (every available gate on).'
+    description: 'Path to discipline.toml. When the file is absent, built-in defaults apply (each gate at its built-in default enablement and severity).'
     required: false
     default: 'discipline.toml'
   suite:
@@ -45,8 +45,28 @@ inputs:
     description: 'Treat applied overrides as failures (requires human sign-off).'
     required: false
     default: 'false'
+  advisory:
+    description: 'Advisory mode: run all checks and emit reports, but exit code 0 even if violations occur.'
+    required: false
+    default: 'false'
+  comment:
+    description: "Post the report as one pull-request comment, edited on every run. Needs `pull-requests: write` (GitHub) or a token that can comment; a fork's read-only token is reported, not failed."
+    required: false
+    default: 'false'
+  token:
+    description: 'Token used to post the comment. Passed to discipline only when `comment` is true.'
+    required: false
+    default: ${{ github.token }}
+  policy_from:
+    description: "Which side's discipline.toml judges the change: 'head' (the change's own copy) or 'base' (the base ref's, so a policy edit takes effect once merged; config-integrity still reports it)."
+    required: false
+    default: 'head'
+  actor:
+    description: 'Login judged against allowed_override_actors. Default: the pull request author (github.event.pull_request.user.login), which the server sets; otherwise github.actor or the forge equivalent. The triggering login is not used on a pull request, since whoever edits the description must not be able to authorize their own override.'
+    required: false
+    default: ${{ github.event.pull_request.user.login || github.actor }}
   directive_sources:
-    description: 'Comma-separated list of allowed directive sources (pr-body, commits).'
+    description: 'Comma-separated list of allowed directive sources (pr-body, commits, merged-pr-body). merged-pr-body reads, on a push event, the body of the merged pull request each pushed commit arrived through.'
     required: false
     default: ''
   pr_body:
@@ -73,6 +93,18 @@ inputs:
     description: 'Base URL of the release store, for mirrors.'
     required: false
     default: 'https://github.com/orieg/discipline/releases'
+  baseline_file:
+    description: 'Path to grandfathering baseline file (defaults to discipline-baseline.toml if present).'
+    required: false
+    default: ''
+  no_baseline:
+    description: 'Ignore grandfathering baseline even if present.'
+    required: false
+    default: 'false'
+  ci_context:
+    description: 'Rollup job only: `toJson(needs)` of the rollup job (inline JSON, or a path to a file holding it) for the ci-skip-set gate. Empty: the gate reports "not evaluated".'
+    required: false
+    default: ''
 
 outputs:
   status:
@@ -90,6 +122,9 @@ outputs:
   overrides:
     description: 'Number of applied override directives'
     value: ${{ steps.run.outputs.overrides }}
+  baselined:
+    description: 'Number of grandfathered findings matching baseline (not blocking)'
+    value: ${{ steps.run.outputs.baselined }}
   overridden_gates:
     description: 'Comma separated ids of the gates that had an override applied'
     value: ${{ steps.run.outputs.overridden_gates }}
@@ -105,6 +140,9 @@ outputs:
   install_error:
     description: 'Why installing the binary failed (empty on success)'
     value: ${{ steps.install.outputs.install_error }}
+  bin:
+    description: 'Path to the installed discipline executable'
+    value: ${{ steps.install.outputs.bin }}
 
 runs:
   using: 'composite'
@@ -142,8 +180,15 @@ runs:
           esac
 
           version="${INPUT_VERSION}"
-          if [ -z "${version}" ] && [[ "${ACTION_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          if [ -z "${version}" ] && [[ "${ACTION_REF}" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)* ]]; then
             version="${ACTION_REF}"
+          fi
+          # A major tag (`@v0`) runs the binary of the release it points at, read from
+          # the action's own Cargo.toml, never `latest`: `latest` can move before the
+          # major tag does, which would pair a new binary with an older action.
+          if [ -z "${version}" ] && [[ "${ACTION_REF}" =~ ^v[0-9]+$ ]] && [ -f "${GITHUB_ACTION_PATH:-}/Cargo.toml" ]; then
+            pinned="$(sed -n 's/^version = "\(.*\)"/\1/p' "${GITHUB_ACTION_PATH}/Cargo.toml" | head -n 1)"
+            [ -n "${pinned}" ] && version="v${pinned}"
           fi
           if [ -n "${version}" ]; then
             base="${INPUT_DOWNLOAD_URL}/download/${version}"
@@ -184,6 +229,7 @@ runs:
 
         "${bin}" --version
         echo "bin=${bin}" >> "${GITHUB_OUTPUT}"
+        dirname "${bin}" >> "${GITHUB_PATH}"
 
     - name: Resolve base ref
       id: base
@@ -192,13 +238,14 @@ runs:
       env:
         INPUT_BASE_REF: ${{ inputs.base_ref }}
         PR_BASE_REF: ${{ github.base_ref }}
+        MERGE_GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
         PUSH_BEFORE: ${{ github.event.before }}
         DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         FORGEJO_BASE_REF: ${{ env.FORGEJO_BASE_REF }}
         GITEA_BASE_REF: ${{ env.GITEA_BASE_REF }}
       run: |
         set -euo pipefail
-        base="${INPUT_BASE_REF:-${PR_BASE_REF:-${FORGEJO_BASE_REF:-${GITEA_BASE_REF}}}}"
+        base="${INPUT_BASE_REF:-${PR_BASE_REF:-${MERGE_GROUP_BASE_REF:-${FORGEJO_BASE_REF:-${GITEA_BASE_REF}}}}}"
         if [ -z "${base}" ] && [ -n "${PUSH_BEFORE}" ] && ! [[ "${PUSH_BEFORE}" =~ ^0+$ ]]; then
           base="${PUSH_BEFORE}"
         fi
@@ -235,7 +282,15 @@ runs:
         DISCIPLINE_HOSTNAME_DENYLIST: ${{ inputs.hostname_denylist }}
         DISCIPLINE_FAIL_ON_WARNINGS: ${{ inputs.fail_on_warnings == 'true' && 'true' || 'false' }}
         DISCIPLINE_FAIL_ON_OVERRIDES: ${{ inputs.fail_on_overrides == 'true' && 'true' || 'false' }}
+        DISCIPLINE_ADVISORY: ${{ inputs.advisory == 'true' && 'true' || 'false' }}
+        DISCIPLINE_COMMENT: ${{ inputs.comment == 'true' && 'true' || 'false' }}
+        DISCIPLINE_FORGE_TOKEN: ${{ inputs.comment == 'true' && inputs.token || '' }}
+        DISCIPLINE_POLICY_FROM: ${{ inputs.policy_from || 'head' }}
+        DISCIPLINE_ACTOR: ${{ inputs.actor || github.event.pull_request.user.login || github.actor }}
         DISCIPLINE_DIRECTIVE_SOURCES: ${{ inputs.directive_sources }}
+        DISCIPLINE_BASELINE: ${{ inputs.baseline_file }}
+        DISCIPLINE_NO_BASELINE: ${{ inputs.no_baseline == 'true' && 'true' || 'false' }}
+        DISCIPLINE_CI_CONTEXT: ${{ inputs.ci_context }}
         INPUT_SUITE: ${{ inputs.suite }}
         PR_BODY: ${{ inputs.pr_body }}
         PR_TITLE: ${{ inputs.pr_title }}

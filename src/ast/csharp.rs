@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use super::{AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts, TestFn};
+use super::functions::{self, FunctionSpec};
+use super::{AssertVocabulary, EscapeHatchSite, Fact, LanguagePack, ParsedFileFacts, TestFn};
 
 /// C# language pack implementing [`LanguagePack`].
 pub struct CSharpPack;
@@ -11,6 +12,13 @@ pub struct CSharpPack;
 impl LanguagePack for CSharpPack {
     fn id(&self) -> &'static str {
         "csharp"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -33,6 +41,7 @@ impl LanguagePack for CSharpPack {
 
         let (has_errors, first_line, error_count) = super::collect_error_nodes_info(root);
         let mut extractor = CSharpExtractor {
+            dead: super::reach::dead_ranges(root, src, &CS_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_csharp_test_path(path),
@@ -49,6 +58,62 @@ impl LanguagePack for CSharpPack {
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
         extractor.resolve_same_file_helpers();
+        extractor.facts.functions = functions::extract(root, src, path, &CSHARP_FUNCTIONS);
+        super::mocks::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &CSHARP_MOCKS,
+            &vocab.mock_setup_fns,
+            &vocab.mock_assert_fns,
+        );
+        {
+            let tests = &extractor.facts.tests;
+            let spans: Vec<(usize, usize)> = tests
+                .iter()
+                .map(|t| (t.line, t.end_line.max(t.line)))
+                .collect();
+            // A file in a test directory, or one the repository declares as test scope, is
+            // test code line for line.
+            let whole_file = super::functions::test_path(path)
+                || super::functions::declared_test_path(path, &vocab.test_paths);
+            let is_test_line =
+                |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+            extractor.facts.swallowed =
+                super::handlers::extract(root, src, &CSHARP_HANDLERS, &is_test_line);
+        }
+        super::retries::mark(root, src, &mut extractor.facts.tests, &CSHARP_RETRIES);
+        if super::functions::declared_test_path(path, &vocab.test_paths) {
+            for f in &mut extractor.facts.functions {
+                f.is_test = true;
+            }
+        }
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &CSHARP_MOCKS,
+            super::calls::SLEEP_VOCAB,
+            super::calls::sleeps,
+        );
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &CSHARP_MOCKS,
+            super::calls::TRIVIAL_ASSERT_VOCAB,
+            super::calls::trivial_asserts,
+        );
+        extractor.facts.prose = super::prose::extract(
+            root,
+            src,
+            &[
+                "comment",
+                "string_literal",
+                "verbatim_string_literal",
+                "raw_string_literal",
+            ],
+        );
         Ok(extractor.facts)
     }
 }
@@ -70,6 +135,8 @@ pub fn is_csharp_test_path(path: &str) -> bool {
 }
 
 struct CSharpExtractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     vocab: &'a AssertVocabulary,
     is_test_path: bool,
@@ -190,6 +257,13 @@ impl<'a> CSharpExtractor<'a> {
                             }
                         }
                     }
+                    helper_fn.total_asserts += super::count_failure_exits(
+                        child,
+                        self.src,
+                        &["throw_statement", "throw_expression"],
+                        &[],
+                        &["lambda_expression", "local_function_statement"],
+                    );
                     let facts = super::HelperFacts {
                         total_asserts: helper_fn.total_asserts,
                         strong_asserts: helper_fn.strong_asserts,
@@ -247,19 +321,19 @@ impl<'a> CSharpExtractor<'a> {
                             .child_by_field_name("name")
                             .map(|n| self.text(n))
                             .unwrap_or("");
+                        // `[NUnit.Framework.Test]` names the same attribute as `[Test]`.
+                        let attr_name = attr_name.rsplit('.').next().unwrap_or(attr_name);
+                        let attr_name = attr_name.strip_suffix("Attribute").unwrap_or(attr_name);
 
                         if matches!(
                             attr_name,
                             "Fact"
-                                | "FactAttribute"
                                 | "Theory"
-                                | "TheoryAttribute"
                                 | "Test"
-                                | "TestAttribute"
                                 | "TestCase"
-                                | "TestCaseAttribute"
+                                | "TestCaseSource"
                                 | "TestMethod"
-                                | "TestMethodAttribute"
+                                | "DataTestMethod"
                         ) {
                             is_test = true;
                             // Check for xUnit Skip = "..." in attribute arguments
@@ -296,14 +370,8 @@ impl<'a> CSharpExtractor<'a> {
             }
         }
 
-        // Check naming convention in test files if no attributes present
-        if !is_test
-            && self.is_test_path
-            && (method_name.starts_with("Test") || method_name.starts_with("test_"))
-        {
-            is_test = true;
-        }
-
+        // xUnit, NUnit and MSTest discover tests by attribute only: a method
+        // named `TestConnection` without one is a helper, never run as a test.
         if !is_test {
             return None;
         }
@@ -325,12 +393,14 @@ impl<'a> CSharpExtractor<'a> {
         let mut direct_calls = Vec::new();
         if let Some(body) = node.child_by_field_name("body") {
             self.extract_assertions_in_body(body, &mut test_fn, &mut direct_calls);
+            super::dispatch_calls(body, self.src, &CS_DISPATCH, &mut direct_calls);
         } else {
             // Check for expression-bodied method (arrow_expression_clause)
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "arrow_expression_clause" {
                     self.extract_assertions_in_body(child, &mut test_fn, &mut direct_calls);
+                    super::dispatch_calls(child, self.src, &CS_DISPATCH, &mut direct_calls);
                 }
             }
         }
@@ -344,6 +414,9 @@ impl<'a> CSharpExtractor<'a> {
         test_fn: &mut TestFn,
         direct_calls: &mut Vec<String>,
     ) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         let kind = node.kind();
 
         if kind == "invocation_expression" {
@@ -401,6 +474,9 @@ impl<'a> CSharpExtractor<'a> {
                         test.strong_asserts += h.strong_asserts;
                         test.tautologies += h.tautologies;
                         test.fatal_asserts += h.fatal_asserts;
+                        if h.total_asserts > h.tautologies {
+                            test.helper_checks += 1;
+                        }
                     }
                 }
             }
@@ -557,6 +633,94 @@ impl<'a> CSharpExtractor<'a> {
     }
 }
 
+fn csharp_fn_skip(node: tree_sitter::Node, src: &str) -> bool {
+    let mut cursor = node.walk();
+    let is_abstract = node.children(&mut cursor).any(|c| {
+        c.kind() == "modifier"
+            && c.utf8_text(src.as_bytes())
+                .is_ok_and(|t| t == "abstract" || t == "extern" || t == "partial")
+    });
+    if is_abstract {
+        return true;
+    }
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "interface_declaration" {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+fn csharp_fn_is_test(node: tree_sitter::Node, src: &str, path: &str) -> bool {
+    if functions::test_path(path) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|c| {
+        c.kind() == "attribute_list"
+            && c.utf8_text(src.as_bytes()).is_ok_and(|t| {
+                t.contains("Fact")
+                    || t.contains("Theory")
+                    || t.contains("TestMethod")
+                    || t.contains("Test]")
+            })
+    });
+    found
+}
+
+pub const CSHARP_FUNCTIONS: FunctionSpec = FunctionSpec {
+    function_kinds: &[
+        "method_declaration",
+        "constructor_declaration",
+        "local_function_statement",
+    ],
+    name_fields: &["name"],
+    body_fields: &["body", "block", "arrow_expression_clause"],
+    ignored_kinds: &["comment"],
+    skip: csharp_fn_skip,
+    is_test: csharp_fn_is_test,
+    classify: functions::classify_jvm,
+};
+
+pub const CSHARP_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &["invocation_expression", "object_creation_expression"],
+    callee_fields: &["function"],
+};
+
+pub const CSHARP_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    handler_kinds: &["catch_clause"],
+    arm_of: &[],
+    body_fields: &["body", "block"],
+    ignored_kinds: &["comment"],
+    trivial: &["return", "return null", "return false", "continue"],
+    discard_kinds: &[],
+    discards: super::handlers::no_discard,
+    classify_discard: None,
+    call_value_kinds: &[],
+    silence_kinds: &[],
+    silences: super::handlers::no_discard,
+};
+
+pub const CSHARP_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["attribute_list"],
+};
+
+pub const CS_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if_statement"],
+    block_kinds: &["block"],
+    ignored_kinds: &["comment"],
+    terminators: &["return", "throw"],
+};
+
+/// Functions a test body runs through a dispatch table (`super::dispatch_calls`).
+pub const CS_DISPATCH: super::DispatchSpec = super::DispatchSpec {
+    containers: &["initializer_expression", "collection_expression"],
+    names: &["identifier"],
+    references: &[],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,7 +730,7 @@ mod tests {
         let pack = CSharpPack;
         assert_eq!(pack.id(), "csharp");
         assert_eq!(pack.name(), "C#");
-        assert!(pack.matches("ExpanseMapTests.cs"));
+        assert!(pack.matches("ExampleMapTests.cs"));
         assert!(pack.matches("tests/UnitTest.cs"));
         assert!(!pack.matches("test.cpp"));
         assert!(!pack.matches("test.java"));
@@ -627,21 +791,21 @@ public class CalcTests
     }
 
     #[test]
-    fn test_expanse_dotnet_map_tests_fixture() {
+    fn test_example_dotnet_map_tests_fixture() {
         let src = r#"
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using Xunit;
 
-namespace Expanse.Tests;
+namespace Example.Tests;
 
-public class ExpanseMapTests
+public class ExampleMapTests
 {
     [Fact]
     public void BasicCrudAndIndexer()
     {
-        using var map = new ExpanseMap();
+        using var map = new ExampleMap();
         Assert.Equal(0, map.Count);
         Assert.True(map.IsEmpty);
 
@@ -669,7 +833,7 @@ public class ExpanseMapTests
         let pack = CSharpPack;
         let facts = pack
             .extract(
-                "bindings/dotnet/tests/Expanse.NET.Tests/ExpanseMapTests.cs",
+                "bindings/dotnet/tests/Example.NET.Tests/ExampleMapTests.cs",
                 src,
                 &AssertVocabulary::default(),
             )
@@ -823,5 +987,51 @@ public class HelperTests
         assert_eq!(t.total_asserts, 1);
         assert_eq!(t.strong_asserts, 1);
         assert!(!t.is_vacuous());
+    }
+
+    #[test]
+    fn unattributed_test_named_method_is_not_collected() {
+        // xUnit, NUnit and MSTest discover by attribute only; a helper named
+        // `TestConnection` in a test project is never run as a test.
+        let src = r#"
+public class DbFixture
+{
+    public bool TestConnection()
+    {
+        return true;
+    }
+
+    public void test_seed_data()
+    {
+    }
+}
+
+public class DbTests
+{
+    [Fact]
+    public void Connects()
+    {
+        Assert.True(new DbFixture().TestConnection());
+    }
+
+    [NUnit.Framework.Test]
+    public void Seeds()
+    {
+        Assert.Equal(1, 1 + 0);
+    }
+
+    [DataTestMethod]
+    public void Rows()
+    {
+        Assert.AreEqual(2, 1 + 1);
+    }
+}
+"#;
+        let facts = CSharpPack
+            .extract("tests/DbTests.cs", src, &AssertVocabulary::default())
+            .expect("extract succeeds");
+        let mut names: Vec<&str> = facts.tests.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Connects", "Rows", "Seeds"]);
     }
 }

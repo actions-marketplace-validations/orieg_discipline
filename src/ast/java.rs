@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use super::{AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts, TestFn};
+use super::functions::{self, FunctionSpec};
+use super::{AssertVocabulary, EscapeHatchSite, Fact, LanguagePack, ParsedFileFacts, TestFn};
 
 /// Java language pack implementing [`LanguagePack`].
 pub struct JavaPack;
@@ -11,6 +12,13 @@ pub struct JavaPack;
 impl LanguagePack for JavaPack {
     fn id(&self) -> &'static str {
         "java"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -32,6 +40,7 @@ impl LanguagePack for JavaPack {
         let root = tree.root_node();
 
         let mut extractor = JavaExtractor {
+            dead: super::reach::dead_ranges(root, src, &JAVA_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_java_test_path(path),
@@ -46,6 +55,62 @@ impl LanguagePack for JavaPack {
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
         extractor.resolve_same_file_helpers();
+        extractor.facts.functions = functions::extract(root, src, path, &JAVA_FUNCTIONS);
+        super::mocks::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &JAVA_MOCKS,
+            &vocab.mock_setup_fns,
+            &vocab.mock_assert_fns,
+        );
+        {
+            let tests = &extractor.facts.tests;
+            let spans: Vec<(usize, usize)> = tests
+                .iter()
+                .map(|t| (t.line, t.end_line.max(t.line)))
+                .collect();
+            // A file in a test directory, or one the repository declares as test scope, is
+            // test code line for line.
+            let whole_file = super::functions::test_path(path)
+                || super::functions::declared_test_path(path, &vocab.test_paths);
+            let is_test_line =
+                |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+            extractor.facts.swallowed =
+                super::handlers::extract(root, src, &JAVA_HANDLERS, &is_test_line);
+        }
+        super::retries::mark(root, src, &mut extractor.facts.tests, &JAVA_RETRIES);
+        if super::functions::declared_test_path(path, &vocab.test_paths) {
+            for f in &mut extractor.facts.functions {
+                f.is_test = true;
+            }
+        }
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &JAVA_MOCKS,
+            super::calls::SLEEP_VOCAB,
+            super::calls::sleeps,
+        );
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &JAVA_MOCKS,
+            super::calls::TRIVIAL_ASSERT_VOCAB,
+            super::calls::trivial_asserts,
+        );
+        extractor.facts.prose = super::prose::extract(
+            root,
+            src,
+            &[
+                "line_comment",
+                "block_comment",
+                "string_literal",
+                "text_block",
+            ],
+        );
         Ok(extractor.facts)
     }
 }
@@ -70,6 +135,8 @@ pub fn is_java_test_path(path: &str) -> bool {
 }
 
 struct JavaExtractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     vocab: &'a AssertVocabulary,
     is_test_path: bool,
@@ -85,6 +152,32 @@ impl<'a> JavaExtractor<'a> {
 
     fn collect_comments_and_escape_hatches(&mut self, node: Node) {
         let kind = node.kind();
+        if kind == "annotation" || kind == "marker_annotation" {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| self.text(n))
+                .unwrap_or("");
+            if name == "SuppressWarnings" {
+                let rule = node
+                    .child_by_field_name("arguments")
+                    .map(|a| {
+                        self.text(a)
+                            .trim_matches(['(', ')'])
+                            .trim()
+                            .trim_matches('"')
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "all".to_string());
+                self.facts
+                    .escape_hatches
+                    .push(EscapeHatchSite::LinterDisable {
+                        line: node.start_position().row + 1,
+                        rule,
+                        snippet: self.text(node).to_string(),
+                    });
+            }
+            return;
+        }
         if kind == "line_comment" || kind == "block_comment" {
             let text = self.text(node);
             let line = node.start_position().row + 1;
@@ -270,6 +363,7 @@ impl<'a> JavaExtractor<'a> {
             let mut direct_calls = Vec::new();
             if let Some(body) = node.child_by_field_name("body") {
                 self.scan_method_body(body, &mut test_fn, &mut direct_calls);
+                super::dispatch_calls(body, self.src, &JAVA_DISPATCH, &mut direct_calls);
             }
 
             self.facts.tests.push(test_fn);
@@ -279,6 +373,13 @@ impl<'a> JavaExtractor<'a> {
                 let mut helper_fn = TestFn::default();
                 let mut dummy_calls = Vec::new();
                 self.scan_method_body(body, &mut helper_fn, &mut dummy_calls);
+                helper_fn.total_asserts += super::count_failure_exits(
+                    body,
+                    self.src,
+                    &["throw_statement"],
+                    &[],
+                    &["lambda_expression", "class_body"],
+                );
                 let facts = super::HelperFacts {
                     total_asserts: helper_fn.total_asserts,
                     strong_asserts: helper_fn.strong_asserts,
@@ -330,6 +431,9 @@ impl<'a> JavaExtractor<'a> {
         test_fn: &mut TestFn,
         direct_calls: &mut Vec<String>,
     ) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         match node.kind() {
             "assert_statement" => {
                 test_fn.total_asserts += 1;
@@ -505,6 +609,9 @@ impl<'a> JavaExtractor<'a> {
                         test.strong_asserts += h.strong_asserts;
                         test.tautologies += h.tautologies;
                         test.fatal_asserts += h.fatal_asserts;
+                        if h.total_asserts > h.tautologies {
+                            test.helper_checks += 1;
+                        }
                     }
                 }
             }
@@ -526,6 +633,68 @@ impl<'a> JavaExtractor<'a> {
     }
 }
 
+/// A method without a `body` field (abstract, interface) never reaches the classifier;
+/// a `default` interface method or a class method does.
+fn java_fn_is_test(node: tree_sitter::Node, src: &str, path: &str) -> bool {
+    if functions::test_path(path) || is_java_test_path(path) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).any(|c| {
+        c.kind() == "modifiers"
+            && c.utf8_text(src.as_bytes())
+                .is_ok_and(|t| t.contains("@Test") || t.contains("@ParameterizedTest"))
+    });
+    found
+}
+
+pub const JAVA_FUNCTIONS: FunctionSpec = FunctionSpec {
+    function_kinds: &["method_declaration", "constructor_declaration"],
+    name_fields: &["name"],
+    body_fields: &["body"],
+    ignored_kinds: &["line_comment", "block_comment"],
+    skip: functions::skip_none,
+    is_test: java_fn_is_test,
+    classify: functions::classify_jvm,
+};
+
+pub const JAVA_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &["method_invocation", "object_creation_expression"],
+    callee_fields: &["name"],
+};
+
+pub const JAVA_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    handler_kinds: &["catch_clause"],
+    arm_of: &[],
+    body_fields: &["body", "block"],
+    ignored_kinds: &["line_comment", "block_comment"],
+    trivial: &["return", "return null", "return false", "continue"],
+    discard_kinds: &[],
+    discards: super::handlers::no_discard,
+    classify_discard: None,
+    call_value_kinds: &[],
+    silence_kinds: &[],
+    silences: super::handlers::no_discard,
+};
+
+pub const JAVA_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["annotation", "marker_annotation"],
+};
+
+pub const JAVA_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if_statement"],
+    block_kinds: &["block"],
+    ignored_kinds: &["line_comment", "block_comment"],
+    terminators: &["return", "throw"],
+};
+
+/// Functions a test body runs through a dispatch table (`super::dispatch_calls`).
+pub const JAVA_DISPATCH: super::DispatchSpec = super::DispatchSpec {
+    containers: &[],
+    names: &[],
+    references: &["method_reference"],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,12 +702,12 @@ mod tests {
     #[test]
     fn test_junit5_test_extraction_and_assertion_counting() {
         let src = r#"
-package io.github.orieg.expanse;
+package io.github.example.project;
 
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
-class ExpanseMapTest {
+class ExampleMapTest {
     @Test
     void testSlotSegment() {
         assertEquals(99L, 99L + 0);
@@ -552,12 +721,12 @@ class ExpanseMapTest {
 "#;
         let pack = JavaPack;
         let facts = pack
-            .extract("ExpanseMapTest.java", src, &AssertVocabulary::default())
+            .extract("ExampleMapTest.java", src, &AssertVocabulary::default())
             .expect("extraction must succeed");
 
         assert_eq!(facts.tests.len(), 1);
         let t = &facts.tests[0];
-        assert_eq!(t.name, "ExpanseMapTest.testSlotSegment");
+        assert_eq!(t.name, "ExampleMapTest.testSlotSegment");
         assert_eq!(t.total_asserts, 4);
         assert_eq!(t.strong_asserts, 2); // assertEquals + assertThrows
         assert_eq!(t.tautologies, 2); // assertTrue(true) + assertFalse(false)

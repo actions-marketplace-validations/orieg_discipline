@@ -27,8 +27,7 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
 
     // Read base discipline.toml to get base configuration
     let base_cfg = ctx
-        .git
-        .base_content(ctx.config_path)
+        .base_config_text()
         .ok()
         .flatten()
         .and_then(|s| crate::config::DisciplineConfig::from_toml_str(&s).ok());
@@ -53,16 +52,7 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
                     base_floor_const = Some(val);
                 } else {
                     let subject = const_name.as_str();
-                    if let Some(ov) = ctx
-                        .find_gate_or_subject_override(GATE, tokens::ALLOW_TEST_SHRINK, subject)
-                        .or_else(|| {
-                            ctx.find_gate_or_subject_override(
-                                GATE,
-                                tokens::ALLOW_TEST_SHRINK,
-                                const_file,
-                            )
-                        })
-                    {
+                    if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, subject) {
                         out.overrides.push(ov);
                     } else {
                         out.violations.push(Violation {
@@ -84,9 +74,7 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
                 }
             }
             Ok(None) => {
-                if let Some(ov) =
-                    ctx.find_gate_or_subject_override(GATE, tokens::ALLOW_TEST_SHRINK, const_file)
-                {
+                if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, const_file) {
                     out.overrides.push(ov);
                 } else {
                     out.violations.push(Violation {
@@ -127,19 +115,8 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
                     if let Some(caps) = re.captures(&head_src) {
                         if let Ok(head_val) = caps[1].parse::<usize>() {
                             if head_val < base_floor {
-                                if let Some(ov) = ctx
-                                    .find_gate_or_subject_override(
-                                        GATE,
-                                        tokens::ALLOW_TEST_SHRINK,
-                                        const_name,
-                                    )
-                                    .or_else(|| {
-                                        ctx.find_gate_or_subject_override(
-                                            GATE,
-                                            tokens::ALLOW_TEST_SHRINK,
-                                            const_file,
-                                        )
-                                    })
+                                if let Some(ov) =
+                                    ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, const_name)
                                 {
                                     out.overrides.push(ov);
                                 } else {
@@ -200,16 +177,7 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
     for suite in &settings.required_suites {
         let full = Path::new(ctx.git.root()).join(suite);
         if !full.is_file() {
-            if let Some(ov) = ctx
-                .find_gate_or_subject_override(GATE, tokens::ALLOW_TEST_SHRINK, suite)
-                .or_else(|| {
-                    ctx.find_gate_or_subject_override(
-                        GATE,
-                        tokens::ALLOW_TEST_SHRINK,
-                        "required_suites",
-                    )
-                })
-            {
+            if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, suite) {
                 out.overrides.push(ov);
             } else {
                 out.violations.push(Violation {
@@ -228,18 +196,32 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
         }
     }
 
+    // Base ref discipline.toml takes precedence over HEAD discipline.toml to prevent self-lowering.
+    let explicit_floor = base_min_tests.or(head_min_tests).or(base_floor_const);
+
+    // The zero-config ratchet counts the base ref statically; it cannot build
+    // and run the base ref's tests. Comparing that against a runtime count
+    // mixes two counting bases (see docs/GATES.md, test-floor), so the result
+    // would be meaningless in either direction. Refuse before running anything.
+    if settings.test_command.is_some() && explicit_floor.is_none() {
+        bail!(
+            "test-floor: `test_command` supplies a runtime test count, but no floor is configured to \
+             compare it against; set `min_tests` (or `constant_file` + `constant_name`) to a count on \
+             the same basis, or remove `test_command` to use the static ratchet"
+        );
+    }
+
     // 5. Calculate measured test count.
     let measured_count = if let Some(cmd) = &settings.test_command {
         count_tests_via_command(cmd, Path::new(ctx.git.root()))?
     } else {
-        count_workspace_ast_tests(ctx, &filter)?
+        let head = count_workspace_ast_tests(ctx, &filter)?;
+        out.notes.extend(head.notes("head"));
+        head.running
     };
     out.examined = measured_count;
 
-    // 6. Determine effective floor and compare.
-    // Base ref discipline.toml takes precedence over HEAD discipline.toml to prevent self-lowering.
-    let explicit_floor = base_min_tests.or(head_min_tests).or(base_floor_const);
-
+    // 6. Compare against the effective floor.
     if let Some(floor) = explicit_floor {
         if measured_count + settings.tolerance < floor {
             if let Some(ov) = find_test_floor_override(ctx) {
@@ -263,7 +245,9 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
         }
     } else {
         // Zero-config ratchet: compare head AST test count against base ref AST test count.
-        let base_count = count_base_workspace_ast_tests(ctx, &filter)?;
+        let base = count_base_workspace_ast_tests(ctx, &filter)?;
+        out.notes.extend(base.notes("base"));
+        let base_count = base.running;
         if base_count > 0 && measured_count + settings.tolerance < base_count {
             if let Some(ov) = find_test_floor_override(ctx) {
                 out.overrides.push(ov);
@@ -295,80 +279,177 @@ pub fn evaluate_test_floor(ctx: &Context) -> Result<GateOutcome> {
 }
 
 fn find_test_floor_override(ctx: &Context) -> Option<crate::tokens::OverrideRecord> {
-    ctx.find_gate_or_subject_override(GATE, tokens::ALLOW_TEST_SHRINK, "test-floor")
-        .or_else(|| ctx.find_gate_or_subject_override(GATE, tokens::ALLOW_TEST_SHRINK, "tests"))
-        .or_else(|| ctx.find_gate_or_subject_override(GATE, tokens::ALLOW_TEST_SHRINK, "min_tests"))
-        .or_else(|| {
-            for d in &ctx.directives {
-                if d.directive.eq_ignore_ascii_case("allow-test-shrink")
-                    || d.directive.eq_ignore_ascii_case("allow-floor-drop")
-                    || d.directive
-                        .eq_ignore_ascii_case("discipline:allow(test-floor)")
-                    || d.directive.eq_ignore_ascii_case("allow(test-floor)")
-                {
-                    return Some(crate::tokens::OverrideRecord {
-                        gate: GATE.to_string(),
-                        subject: "test-floor".to_string(),
-                        directive: d.directive.clone(),
-                        reason: d.reason.clone(),
-                        source: d.source.clone(),
-                        hidden: d.hidden,
-                    });
+    if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_GATE_WEAKENING, GATE) {
+        return Some(ov);
+    }
+    if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, "min_tests") {
+        return Some(ov);
+    }
+    if let Ok(changed) = ctx.git.changed_files() {
+        let registry = crate::ast::default_registry();
+        let v = crate::guards::agent_diff::assert_vocabulary(ctx.config);
+
+        for cf in &changed {
+            if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, &cf.path) {
+                return Some(ov);
+            }
+            if cf.old_path != cf.path {
+                if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, &cf.old_path) {
+                    return Some(ov);
                 }
             }
-            None
-        })
+            if let Some(file_name) = cf.path.rsplit('/').next() {
+                if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, file_name) {
+                    return Some(ov);
+                }
+            }
+            if let Some(stem) = Path::new(&cf.path).file_stem().and_then(|s| s.to_str()) {
+                if let Some(ov) = ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, stem) {
+                    return Some(ov);
+                }
+            }
+
+            if let Ok(Some(base_src)) = ctx.git.base_content(&cf.old_path) {
+                if let Some(pack) = registry.find_pack(&cf.old_path) {
+                    if let Ok(base_facts) = pack.extract(&cf.old_path, &base_src, &v) {
+                        let head_names: std::collections::HashSet<String> = if cf.is_deleted() {
+                            std::collections::HashSet::new()
+                        } else if let Ok(Some(head_src)) = ctx.git.head_content(&cf.path) {
+                            pack.extract(&cf.path, &head_src, &v)
+                                .map(|f| f.tests.into_iter().map(|t| t.name).collect())
+                                .unwrap_or_default()
+                        } else {
+                            std::collections::HashSet::new()
+                        };
+
+                        for t in base_facts.tests {
+                            if !head_names.contains(&t.name) {
+                                if let Some(ov) =
+                                    ctx.find_override(GATE, tokens::ALLOW_TEST_SHRINK, &t.name)
+                                {
+                                    return Some(ov);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
-/// Counts test functions across all supported language packs in tracked repository files.
+/// A static test count over one side of the change.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AstTestCount {
+    /// Tests that run. An ignored or skipped test does not count toward a floor: it
+    /// verifies nothing until someone re-enables it.
+    pub running: usize,
+    pub ignored: usize,
+    /// Supported-language files that could not be read (contributed nothing) or that
+    /// parse with errors (tree-sitter recovers what it can; the count may be short).
+    pub unread: Vec<String>,
+}
+
+impl AstTestCount {
+    fn add(
+        &mut self,
+        path: &str,
+        content: Option<String>,
+        registry: &crate::ast::LanguageRegistry,
+        v: &crate::ast::AssertVocabulary,
+    ) {
+        let facts = content.and_then(|c| {
+            registry
+                .find_pack(path)
+                .and_then(|pack| pack.extract(path, &c, v).ok())
+        });
+        match facts {
+            Some(facts) => {
+                if facts.has_parse_errors {
+                    self.unread.push(path.to_string());
+                }
+                // A conditional skip (`skipif`, `cfg_attr(..., ignore)`) still runs somewhere.
+                let ignored = facts
+                    .tests
+                    .iter()
+                    .filter(|t| t.ignored && t.conditional_ignore.is_none())
+                    .count();
+                self.ignored += ignored;
+                self.running += facts.tests.len() - ignored;
+            }
+            None => self.unread.push(path.to_string()),
+        }
+    }
+
+    /// Notes for the report: what was left out of the count, and why.
+    fn notes(&self, side: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.ignored > 0 {
+            notes.push(format!(
+                "{side}: {} ignored / skipped test(s) are not counted toward the floor",
+                self.ignored
+            ));
+        }
+        if !self.unread.is_empty() {
+            let shown: Vec<&str> = self.unread.iter().take(5).map(String::as_str).collect();
+            notes.push(format!(
+                "{side}: {} file(s) could not be read, or parse with errors, so their tests may be uncounted: {}{}",
+                self.unread.len(),
+                shown.join(", "),
+                if self.unread.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                }
+            ));
+        }
+        notes
+    }
+}
+
+/// Counts running test functions across all supported language packs in the workspace.
 pub fn count_workspace_ast_tests(
     ctx: &Context,
     filter: &crate::guards::PathFilter,
-) -> Result<usize> {
-    let files = ctx.git.tracked_files()?;
+) -> Result<AstTestCount> {
     let registry = crate::ast::default_registry();
-    let v = crate::ast::AssertVocabulary::default();
-    let mut total = 0;
-
-    for path in files {
+    let v = crate::guards::agent_diff::assert_vocabulary(ctx.config);
+    let mut count = AstTestCount::default();
+    for path in ctx.git.tracked_files()? {
         if filter.matches(&path) || !registry.is_supported(&path) {
             continue;
         }
         let full = Path::new(ctx.git.root()).join(&path);
-        if let Ok(content) = std::fs::read_to_string(&full) {
-            if let Some(pack) = registry.find_pack(&path) {
-                if let Ok(facts) = pack.extract(&path, &content, &v) {
-                    total += facts.tests.len();
-                }
-            }
+        // A tracked file deleted from the working tree is gone, not unreadable.
+        if !full.exists() {
+            continue;
         }
+        count.add(&path, std::fs::read_to_string(&full).ok(), &registry, &v);
     }
-    Ok(total)
+    Ok(count)
 }
 
-/// Counts test functions across all supported language packs in base ref.
+/// Counts running test functions across all supported language packs in base ref.
 pub fn count_base_workspace_ast_tests(
     ctx: &Context,
     filter: &crate::guards::PathFilter,
-) -> Result<usize> {
-    let files = ctx.git.base_tracked_files()?;
+) -> Result<AstTestCount> {
     let registry = crate::ast::default_registry();
-    let v = crate::ast::AssertVocabulary::default();
-    let mut total = 0;
-
-    for path in files {
+    let v = crate::guards::agent_diff::assert_vocabulary(ctx.config);
+    let mut count = AstTestCount::default();
+    for path in ctx.git.base_tracked_files()? {
         if filter.matches(&path) || !registry.is_supported(&path) {
             continue;
         }
-        if let Ok(Some(content)) = ctx.git.base_content(&path) {
-            if let Some(pack) = registry.find_pack(&path) {
-                if let Ok(facts) = pack.extract(&path, &content, &v) {
-                    total += facts.tests.len();
-                }
-            }
-        }
+        count.add(
+            &path,
+            ctx.git.base_content(&path).ok().flatten(),
+            &registry,
+            &v,
+        );
     }
-    Ok(total)
+    Ok(count)
 }
 
 /// Executes an external test listing command and counts tests from output lines.

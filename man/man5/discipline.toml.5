@@ -1,0 +1,274 @@
+.TH DISCIPLINE.TOML 5 "September 2026" "Discipline v0.12.2" "File Formats Manual"
+.SH NAME
+discipline.toml \- configuration file for the Discipline CI gatekeeper and diff sentinel
+.SH SYNOPSIS
+.B discipline.toml
+.SH DESCRIPTION
+.B discipline.toml
+is a TOML-formatted configuration file that defines repository policy for
+.BR discipline (1).
+It controls which static analysis and diff-inspection gates are enabled, their
+enforcement severity, file path exemptions, override directive policies, and
+benchmark performance regression thresholds.
+
+Discipline uses a strict five-layer configuration hierarchy where every layer
+merges deterministically and unknown fields are rejected (fail-closed):
+.IP 1. 4
+.B Built-in defaults:
+Each gate's compiled default is listed under
+.BR GATES .
+Correctness and integrity gates default to
+.BR error ;
+heuristic and brownfield-sensitive gates default to
+.BR warning ;
+gates that need repository-specific setup (a toolchain, a tracker convention,
+a packaging manifest) default to off.
+.B discipline gates
+prints the effective state for the current repository.
+.IP 2. 4
+.B Repository configuration:
+The checked-in
+.B discipline.toml
+file.
+.IP 3. 4
+.B Inline TOML overrides:
+Supplied via
+.B \-\-config\-override
+or
+.BR DISCIPLINE_CONFIG_OVERRIDE .
+Tables merge, lists append, and scalar values replace.
+.IP 4. 4
+.B Gate switches:
+Supplied via
+.B \-\-enable
+and
+.BR \-\-disable .
+.IP 5. 4
+.B Secret denylists:
+Supplied via
+.B DISCIPLINE_HOSTNAME_DENYLIST
+(appended to the
+.B pii
+gate; never echoed in reports).
+
+.SH FILE FORMAT
+The file consists of TOML tables:
+.TP
+.B [meta]
+Top-level metadata and configuration schema version.
+.RS
+.TP
+.BI version " = 1"
+Required integer. Must match the schema version (currently 1).
+.TP
+.BI name " = \"project-name\""
+Required string. Name of the project or repository.
+.TP
+.BI description " = \"...\""
+Optional string. High-level description of the repository.
+.TP
+.BI mode " = \"enforcing\" | \"advisory\""
+Optional string. Default is \fB"enforcing"\fR. When set to \fB"advisory"\fR,
+all gates run and generate reports (terminal, SARIF, GitLab Code Quality, JUnit),
+but the process exits with code 0 even if violations occur.
+.RE
+
+.TP
+.B [directives]
+Policy for developer override directives (e.g. \fBallow-time-estimates:\fR).
+.RS
+.TP
+.BI sources " = [\"pr-body\", \"commits\"]"
+Allowed sources for directives. Valid values: \fB"pr-body"\fR, \fB"commits"\fR.
+.TP
+.BI allow_hidden " = false"
+Whether directives placed inside HTML comments (\fB<!-- -->\fR) are honored.
+Default is \fBfalse\fR to prevent stealth overrides.
+.TP
+.BI fail_on_overrides " = false"
+When \fBtrue\fR, any applied directive is treated as a build failure unless
+the executing actor is authorized.
+.TP
+.BI allowed_override_actors " = [\"username\"]"
+List of repository actors (GitHub/GitLab logins) authorized to supply overrides
+when \fBfail_on_overrides\fR is enabled.
+.RE
+
+.TP
+.B [gates.<gate-id>]
+Individual gate configuration. Every gate accepts these common fields:
+.RS
+.TP
+.BI enabled " = true | false"
+Enable or disable the gate.
+.TP
+.BI severity " = \"error\" | \"warning\" | \"note\""
+Severity of violations reported by this gate.
+.TP
+.BI exempt_paths " = [\"glob\", ...]"
+Glob patterns of files exempt from this gate.
+.RE
+
+.SH GATES
+Every table below also accepts the common fields above. The per-gate keys are
+listed in the configuration reference (see
+.BR "SEE ALSO" ).
+.\" generated:gates
+.TP
+.B [gates.agents-md]
+AGENTS.md exists; CLAUDE.md / GEMINI.md do not fork it (agent-guard; default: on, warning; languages: any)
+.TP
+.B [gates.assertion-reduction]
+assertion count / strength must not drop in an existing test (agent-guard; default: on, error; languages: Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective\-C)
+.TP
+.B [gates.vacuous-tests]
+new tests must carry a non\-tautological assertion (agent-guard; default: on, error; languages: Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective\-C)
+.TP
+.B [gates.ignored-tests]
+tests must not be newly #[ignore]d or skipped without directive (agent-guard; default: on, error; languages: Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective\-C)
+.TP
+.B [gates.unsafe-safety-comment]
+unsafe blocks / impls carry a // SAFETY: comment (agent-guard; default: on, error; languages: Rust)
+.TP
+.B [gates.deletion-rationale]
+deleted files and removed tests need a scoped removes: rationale (agent-guard; default: on, error; languages: any)
+.TP
+.B [gates.time-estimates]
+no calendar / duration estimates in markdown or the PR body (hygiene; default: on, warning; languages: any)
+.TP
+.B [gates.pii]
+no home paths, LAN IPs, or denylisted hostnames in tracked text (hygiene; default: on, error; languages: any)
+.TP
+.B [gates.agent-scratch]
+agent scratch state is never tracked (hygiene; default: on, error; languages: any)
+.TP
+.B [gates.shell-secrets]
+no command\-line secrets or unverified piped scripts in shell, docker, or CI (hygiene; default: on, error; languages: shell, docker, workflows)
+.TP
+.B [gates.issue-link]
+PR title or description links a tracking issue (#123, Fixes #123) (hygiene; default: off; languages: any)
+.TP
+.B [gates.commit-provenance]
+commits carry the required trailers; an agent\-produced commit carries a review by someone else (hygiene; default: off; languages: any)
+.TP
+.B [gates.config-integrity]
+a change cannot weaken its own discipline.toml without a token (integrity; default: on, error; languages: any)
+.TP
+.B [gates.stub-bodies]
+added functions are not stubs; existing bodies are not replaced by todo!() / NotImplementedError / return null (agent-guard; default: on, error; languages: Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective\-C)
+.TP
+.B [gates.error-swallowing]
+no new empty error handler or discarded Result outside tests (agent-guard; default: on, error; languages: Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective\-C)
+.TP
+.B [gates.instruction-smuggling]
+no invisible Unicode, unreviewed agent\-instruction edits, or instruction\-like text in comments and prose (agent-guard; default: on, error; languages: any (invisible characters, instruction files); Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective\-C and prose files (phrases))
+.TP
+.B [gates.build-hooks]
+install and build hooks that gain network or shell access, and package\-manager configuration edits, need a token (integrity; default: on, error; languages: package.json, build.rs, setup.py, .npmrc, .pypirc, pip.conf, .cargo/config.toml, .env*)
+.TP
+.B [gates.toolchain-config]
+compiler, linter, type\-checker, test\-runner and coverage configuration cannot be loosened without a token (integrity; default: on, error; languages: tsconfig, ruff, mypy, pytest, coverage, flake8, Cargo lints, rustflags, nextest, eslintrc, golangci, jest, codecov, phpstan, phpunit)
+.TP
+.B [gates.scope-confinement]
+changes stay inside authorized paths (agent-guard; default: off; languages: any)
+.TP
+.B [gates.suppression-delta]
+newly added linter / compiler suppression annotations (agent-guard; default: on, warning; languages: per pack)
+.TP
+.B [gates.provenance-tags]
+published numerics carry (measured|target|projected) (hygiene; default: off; languages: any)
+.TP
+.B [gates.ci-integrity]
+workflow weakening: continue\-on\-error, || true, unpinned actions (integrity; default: on, error; languages: any)
+.TP
+.B [gates.ci-skip-set]
+rollup skip set matches each job's `if:` under the observed filter outputs (integrity; default: on, error; languages: any)
+.TP
+.B [gates.test-floor]
+test\-count ratchet read from the base ref (integrity; default: on, error; languages: any)
+.TP
+.B [gates.golden-output]
+prevents stealth edits to committed golden/test output files without explicit override (integrity; default: on, error; languages: any)
+.TP
+.B [gates.dependency-delta]
+manifest diff inspection: zero wildcards, source/license allowlists, and deny.toml verification (integrity; default: on, error; languages: any)
+.TP
+.B [gates.test-budget]
+property\-test and fuzz effort ratchet (cases, shrink iters, fuzztime, seed corpus) (integrity; default: on, error; languages: Rust, Python, JS/TS, Go, any)
+.TP
+.B [gates.pr-checklist]
+ticked PR checkboxes are reconciled against the diff (hygiene; default: off; languages: any)
+.TP
+.B [gates.command]
+fail\-closed wrapper for any tool: zero\-tests guard, canary, count ratchet (verification; default: on, error; languages: any)
+.TP
+.B [gates.sanitizers]
+ASan / TSan preset with audited suppressions and a race canary (verification; default: off; languages: Rust, C/C++)
+.TP
+.B [gates.msrv]
+cargo check under the pinned MSRV (quality; default: off; languages: Rust)
+.TP
+.B [gates.miri]
+Miri tiers with zero\-tests guard (verification; default: off; languages: Rust)
+.TP
+.B [gates.unsafe-budget]
+unsafe count ratchet (verification; default: off; languages: Rust)
+.TP
+.B [gates.bench-regression]
+benchmark drift via harness adapters (deterministic counts or BCa intervals) (bench; default: on, warning; languages: Rust, Go, Python, C/C++)
+.TP
+.B [gates.archive-contents]
+distribution archive must contain required paths and zero forbidden developer artifacts (integrity; default: off; languages: any)
+.TP
+.B [gates.manifest-sync]
+reconcile git\-tracked files against packaging manifest declarations (integrity; default: off; languages: any)
+.TP
+.B [gates.version-lockstep]
+version declarations across headers, manifests, and files must remain in lockstep (integrity; default: off; languages: any)
+.\" /generated
+
+.SH OVERRIDE DIRECTIVES
+When an invariant must be legitimately relaxed, an override directive is
+declared on its own line in an allowed source (see
+.BR sources ):
+.PP
+.RS
+.B <directive>: <subject> <reason>
+.RE
+.PP
+Each gate names its own directive, for example
+.BR allow-assertion-drop: ,
+.BR allow-ci-weakening: ,
+.BR allow-gate-weakening: ,
+.BR allow-dependency: ,
+and
+.BR removes: .
+A directive whose subject or reason is a placeholder is rejected, and every
+applied override is listed in the report. The full list is in the gate
+reference.
+.PP
+Example:
+.RS
+.B removes: tests/legacy_parser.rs parser replaced by the tree\-sitter pack
+.RE
+
+.SH EXIT STATUS
+.TP
+.B 0
+All gates passed, or violations occurred while in advisory mode.
+.TP
+.B 1
+One or more gates reported blocking violations.
+.TP
+.B 2
+Could not check: a gate could not run, a required tool or input was missing,
+the configuration was invalid, or the base ref could not be resolved. Never a pass.
+
+.SH SEE ALSO
+.BR discipline (1),
+.BR git (1)
+.PP
+Configuration reference (every key, type and default):
+https://github.com/orieg/discipline/blob/main/docs/CONFIGURATION.md
+.PP
+Documentation and guides: https://orieg.github.io/discipline/

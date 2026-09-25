@@ -65,21 +65,21 @@ pub const GATES: &[GateInfo] = &[
         id: "assertion-reduction",
         suite: Suite::AgentGuard,
         summary: "assertion count / strength must not drop in an existing test",
-        languages: "Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby",
+        languages: "Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C",
         available: true,
     },
     GateInfo {
         id: "vacuous-tests",
         suite: Suite::AgentGuard,
         summary: "new tests must carry a non-tautological assertion",
-        languages: "Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby",
+        languages: "Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C",
         available: true,
     },
     GateInfo {
         id: "ignored-tests",
         suite: Suite::AgentGuard,
         summary: "tests must not be newly #[ignore]d or skipped without directive",
-        languages: "Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby",
+        languages: "Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C",
         available: true,
     },
     GateInfo {
@@ -132,6 +132,13 @@ pub const GATES: &[GateInfo] = &[
         available: true,
     },
     GateInfo {
+        id: "commit-provenance",
+        suite: Suite::Hygiene,
+        summary: "commits carry the required trailers; an agent-produced commit carries a review by someone else",
+        languages: "any",
+        available: true,
+    },
+    GateInfo {
         id: "config-integrity",
         suite: Suite::Integrity,
         summary: "a change cannot weaken its own discipline.toml without a token",
@@ -139,18 +146,53 @@ pub const GATES: &[GateInfo] = &[
         available: true,
     },
     GateInfo {
+        id: "stub-bodies",
+        suite: Suite::AgentGuard,
+        summary: "added functions are not stubs; existing bodies are not replaced by todo!() / NotImplementedError / return null",
+        languages: "Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective-C",
+        available: true,
+    },
+    GateInfo {
+        id: "error-swallowing",
+        suite: Suite::AgentGuard,
+        summary: "no new empty error handler or discarded Result outside tests",
+        languages: "Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective-C",
+        available: true,
+    },
+    GateInfo {
+        id: "instruction-smuggling",
+        suite: Suite::AgentGuard,
+        summary: "no invisible Unicode, unreviewed agent-instruction edits, or instruction-like text in comments and prose",
+        languages: "any (invisible characters, instruction files); Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective-C and prose files (phrases)",
+        available: true,
+    },
+    GateInfo {
+        id: "build-hooks",
+        suite: Suite::Integrity,
+        summary: "install and build hooks that gain network or shell access, and package-manager configuration edits, need a token",
+        languages: "package.json, build.rs, setup.py, .npmrc, .pypirc, pip.conf, .cargo/config.toml, .env*",
+        available: true,
+    },
+    GateInfo {
+        id: "toolchain-config",
+        suite: Suite::Integrity,
+        summary: "compiler, linter, type-checker, test-runner and coverage configuration cannot be loosened without a token",
+        languages: "tsconfig, ruff, mypy, pytest, coverage, flake8, Cargo lints, rustflags, nextest, eslintrc, golangci, jest, codecov, phpstan, phpunit",
+        available: true,
+    },
+    GateInfo {
         id: "scope-confinement",
         suite: Suite::AgentGuard,
         summary: "changes stay inside authorized paths",
         languages: "any",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "suppression-delta",
         suite: Suite::AgentGuard,
-        summary: "new #[allow], commented-out tests, cfg-gated tests",
+        summary: "newly added linter / compiler suppression annotations",
         languages: "per pack",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "provenance-tags",
@@ -163,6 +205,13 @@ pub const GATES: &[GateInfo] = &[
         id: "ci-integrity",
         suite: Suite::Integrity,
         summary: "workflow weakening: continue-on-error, || true, unpinned actions",
+        languages: "any",
+        available: true,
+    },
+    GateInfo {
+        id: "ci-skip-set",
+        suite: Suite::Integrity,
+        summary: "rollup skip set matches each job's `if:` under the observed filter outputs",
         languages: "any",
         available: true,
     },
@@ -200,7 +249,7 @@ pub const GATES: &[GateInfo] = &[
         suite: Suite::Hygiene,
         summary: "ticked PR checkboxes are reconciled against the diff",
         languages: "any",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "command",
@@ -214,34 +263,55 @@ pub const GATES: &[GateInfo] = &[
         suite: Suite::Verification,
         summary: "ASan / TSan preset with audited suppressions and a race canary",
         languages: "Rust, C/C++",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "msrv",
         suite: Suite::Quality,
         summary: "cargo check under the pinned MSRV",
         languages: "Rust",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "miri",
         suite: Suite::Verification,
         summary: "Miri tiers with zero-tests guard",
         languages: "Rust",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "unsafe-budget",
         suite: Suite::Verification,
         summary: "unsafe count ratchet",
         languages: "Rust",
-        available: false,
+        available: true,
     },
     GateInfo {
         id: "bench-regression",
         suite: Suite::Bench,
         summary: "benchmark drift via harness adapters (deterministic counts or BCa intervals)",
         languages: "Rust, Go, Python, C/C++",
+        available: true,
+    },
+    GateInfo {
+        id: "archive-contents",
+        suite: Suite::Integrity,
+        summary: "distribution archive must contain required paths and zero forbidden developer artifacts",
+        languages: "any",
+        available: true,
+    },
+    GateInfo {
+        id: "manifest-sync",
+        suite: Suite::Integrity,
+        summary: "reconcile git-tracked files against packaging manifest declarations",
+        languages: "any",
+        available: true,
+    },
+    GateInfo {
+        id: "version-lockstep",
+        suite: Suite::Integrity,
+        summary: "version declarations across headers, manifests, and files must remain in lockstep",
+        languages: "any",
         available: true,
     },
 ];
@@ -255,6 +325,17 @@ pub fn gate_info(id: &str) -> Option<&'static GateInfo> {
 pub enum Severity {
     Error,
     Warning,
+    Note,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Severity::Error => write!(f, "error"),
+            Severity::Warning => write!(f, "warning"),
+            Severity::Note => write!(f, "note"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,14 +344,37 @@ pub struct DirectivesConfig {
     pub sources: Vec<String>,
     pub allow_hidden: bool,
     pub fail_on_overrides: bool,
+    pub allowed_override_actors: Vec<String>,
+    /// Most directive overrides (PR body and commit bodies; inline markers are not
+    /// counted) one change may apply. Unset = no cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_overrides: Option<usize>,
+    /// Directive overrides fail the run until the forge shows an approving review of the
+    /// head commit by an `allowed_override_actors` member who is not the author.
+    pub require_approval: bool,
+    /// On a push event, when the `merged-pr-body` source cannot be read (forge
+    /// unreachable, token without permission), continue with a named note (the finding
+    /// the body might have lifted stands) instead of stopping with exit 2. Default true:
+    /// a least-privilege token cannot always read pull requests. `false` makes the
+    /// review record a hard requirement of the push run.
+    #[serde(default = "default_true")]
+    pub degrade_offline: bool,
 }
 
 impl Default for DirectivesConfig {
     fn default() -> Self {
         Self {
-            sources: vec!["pr-body".to_string(), "commits".to_string()],
+            sources: vec![
+                "pr-body".to_string(),
+                "commits".to_string(),
+                "merged-pr-body".to_string(),
+            ],
             allow_hidden: false,
             fail_on_overrides: false,
+            allowed_override_actors: Vec::new(),
+            max_overrides: None,
+            require_approval: false,
+            degrade_offline: true,
         }
     }
 }
@@ -278,26 +382,83 @@ impl Default for DirectivesConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisciplineConfig {
+    #[serde(default)]
     pub meta: MetaConfig,
     #[serde(default)]
     pub directives: DirectivesConfig,
     #[serde(default)]
+    pub tests: TestsConfig,
+    #[serde(default)]
+    pub languages: LanguagesConfig,
+    #[serde(default)]
     pub gates: Gates,
 }
 
+/// Per-language parsing settings, read by the language packs before any gate runs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LanguagesConfig {
+    pub c: CLanguageConfig,
+}
+
+/// Macros the C and C++ packs rewrite before parsing (`src/ast/c_macros.rs`), appended to
+/// the built-in Zend, CPython and Ruby C API lists. An entry ending in `*` is a prefix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CLanguageConfig {
+    /// Blanked with their arguments: statement or declaration macros written without a
+    /// semicolon, list entries written without a comma, attribute-like prefixes.
+    pub macros: Vec<String>,
+    /// Expand to a function head (`MYEXT_METHOD(Class, name) { ... }`).
+    pub function_macros: Vec<String>,
+}
+
+/// What the repository counts as test code beyond what each language's conventions say.
+/// Read by every gate that separates test code from production code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestsConfig {
+    /// Function names (leaf) that are test entry points wherever they appear, e.g. a
+    /// script's `self_test`.
+    pub functions: Vec<String>,
+    /// Path globs whose every line is test scope.
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunMode {
+    #[default]
+    Enforcing,
+    Advisory,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct MetaConfig {
     pub version: u32,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub mode: RunMode,
+}
+
+impl Default for MetaConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            name: "discipline-project".to_string(),
+            description: None,
+            mode: RunMode::Enforcing,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Gates {
-    pub agents_md: BasicGate,
+    pub agents_md: AgentsMdGate,
     pub assertion_reduction: AssertionGate,
     pub vacuous_tests: AssertionGate,
     pub ignored_tests: IgnoredTestsGate,
@@ -307,6 +468,11 @@ pub struct Gates {
     pub pii: PiiGate,
     pub agent_scratch: ScratchGate,
     pub config_integrity: BasicGate,
+    pub toolchain_config: BasicGate,
+    pub stub_bodies: BasicGate,
+    pub error_swallowing: BasicGate,
+    pub instruction_smuggling: InstructionSmugglingGate,
+    pub build_hooks: BasicGate,
     pub golden_output: GoldenGate,
     pub bench_regression: BenchRegressionGate,
     pub command: CommandGate,
@@ -314,9 +480,45 @@ pub struct Gates {
     pub test_budget: TestBudgetGate,
     pub test_floor: TestFloorGate,
     pub ci_integrity: CiIntegrityGate,
+    pub ci_skip_set: CiSkipSetGate,
     pub shell_secrets: ShellSecretsGate,
     pub issue_link: IssueLinkGate,
+    pub commit_provenance: CommitProvenanceGate,
     pub provenance_tags: ProvenanceTagsGate,
+    pub archive_contents: ArchiveContentsGate,
+    pub manifest_sync: ManifestSyncGate,
+    pub version_lockstep: VersionLockstepGate,
+    pub scope_confinement: ScopeConfinementGate,
+    pub suppression_delta: SuppressionDeltaGate,
+    pub pr_checklist: PrChecklistGate,
+    pub unsafe_budget: UnsafeBudgetGate,
+    pub msrv: MsrvGate,
+    pub miri: MiriGate,
+    pub sanitizers: SanitizersGate,
+}
+
+/// `instruction-smuggling`: the shared keys plus the repository's own agent-instruction
+/// files, beyond the built-in list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstructionSmugglingGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    /// Globs of files that instruct agents in this repository (a prompt an MCP server
+    /// loads, a runtime context file), reported like `AGENTS.md`.
+    pub instruction_files: Vec<String>,
+}
+
+impl Default for InstructionSmugglingGate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            instruction_files: Vec::new(),
+        }
+    }
 }
 
 /// Settings every gate shares.
@@ -337,6 +539,8 @@ macro_rules! impl_gate_settings {
 }
 impl_gate_settings!(
     BasicGate,
+    InstructionSmugglingGate,
+    AgentsMdGate,
     IgnoredTestsGate,
     UnsafeSafetyCommentGate,
     AssertionGate,
@@ -351,10 +555,40 @@ impl_gate_settings!(
     TestBudgetGate,
     TestFloorGate,
     CiIntegrityGate,
+    CiSkipSetGate,
     ShellSecretsGate,
     IssueLinkGate,
-    ProvenanceTagsGate
+    CommitProvenanceGate,
+    ProvenanceTagsGate,
+    ArchiveContentsGate,
+    ManifestSyncGate,
+    VersionLockstepGate,
+    ScopeConfinementGate,
+    SuppressionDeltaGate,
+    PrChecklistGate,
+    UnsafeBudgetGate,
+    MsrvGate,
+    MiriGate,
+    SanitizersGate
 );
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentsMdGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+}
+
+impl Default for AgentsMdGate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            severity: Severity::Warning,
+            exempt_paths: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -436,6 +670,12 @@ pub struct AssertionGate {
     pub assert_helper_fns: Vec<String>,
     /// Minimum assertions required per test method (default: None).
     pub min_assertions_per_test: Option<usize>,
+    /// Callee fragments that construct or program a test double, beyond the built-in
+    /// vocabulary (`Mock(`, `jest.fn`, `when(`, `.Setup(`, ...).
+    pub mock_setup_fns: Vec<String>,
+    /// Callee fragments that assert on a double's interactions, beyond the built-in
+    /// vocabulary (`assert_called_with`, `toHaveBeenCalled`, `verify(`, ...).
+    pub mock_assert_fns: Vec<String>,
 }
 
 impl Default for AssertionGate {
@@ -447,6 +687,8 @@ impl Default for AssertionGate {
             extra_assert_macros: Vec::new(),
             assert_helper_fns: Vec::new(),
             min_assertions_per_test: None,
+            mock_setup_fns: Vec::new(),
+            mock_assert_fns: Vec::new(),
         }
     }
 }
@@ -495,7 +737,9 @@ pub struct TimeEstimateGate {
     pub include: Vec<String>,
     /// Additional banned regexes.
     pub extra_patterns: Vec<String>,
-    /// A line matching any of these is not a violation.
+    /// Text matched by any of these is not a violation. Patterns match per
+    /// line and across soft-wrapped lines of a paragraph; the exemption covers
+    /// only the matched text.
     pub allow_patterns: Vec<String>,
     pub scan_pr_body: bool,
     /// When true, scans only modified lines in the git diff rather than all tracked files.
@@ -506,7 +750,7 @@ impl Default for TimeEstimateGate {
     fn default() -> Self {
         Self {
             enabled: true,
-            severity: Severity::Error,
+            severity: Severity::Warning,
             exempt_paths: Vec::new(),
             include: vec!["**/*.md".to_string()],
             extra_patterns: Vec::new(),
@@ -525,6 +769,8 @@ pub struct PiiGate {
     pub exempt_paths: Vec<String>,
     pub home_paths: bool,
     pub lan_ips: bool,
+    /// When true, redacts private RFC 1918 LAN IP addresses in findings instead of echoing them for triage.
+    pub redact_lan_ips: bool,
     pub secrets: bool,
     /// Home-directory user names that are not a leak (CI users, placeholders).
     pub allowed_users: Vec<String>,
@@ -551,6 +797,7 @@ impl Default for PiiGate {
             exempt_paths: Vec::new(),
             home_paths: true,
             lan_ips: true,
+            redact_lan_ips: false,
             secrets: true,
             allowed_users: [
                 "runner", "user", "username", "you", "me", "name", "example", "shared",
@@ -583,7 +830,19 @@ impl Default for ScratchGate {
         Self {
             enabled: true,
             severity: Severity::Error,
-            exempt_paths: Vec::new(),
+            // The shared hook configuration `discipline hook install` writes, and Cursor's
+            // project MCP server list, are project configuration, not scratch state. A
+            // change to them is still an agent-control change `instruction-smuggling`
+            // reports.
+            exempt_paths: [
+                ".claude/settings.json",
+                ".cursor/hooks.json",
+                ".cursor/mcp.json",
+                ".aider.conf.yml",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             paths: [
                 ".claude/**",
                 ".gemini/**",
@@ -619,7 +878,11 @@ impl Default for GoldenGate {
             paths: [
                 "**/golden/**",
                 "**/snapshots/**",
+                "**/__snapshots__/**",
                 "**/*.snap",
+                "**/*.ambr",
+                "**/*.golden",
+                "**/*.approved.*",
                 "tests/fixtures/**/output*",
             ]
             .iter()
@@ -651,17 +914,64 @@ pub struct BenchRegressionGate {
     pub noise_floor_pct: Option<f64>,
     /// Advisory review percentage (default: 0.1%). Regressions above this render review notices in notes.
     pub advisory_pct: Option<f64>,
-    /// Declared exempt arms (e.g. random arms of map_get, set_contains).
+    /// Benchmark arms exempted from regression checks. Matches the exact name, the name
+    /// as the benchmark prints it (`map_get random` matches `map_get/random`), a glob
+    /// (`*.heap.*`, `*::random_*`), a trailing-`*` prefix, or a `::`/`/` path suffix.
+    /// An entry that matches no arm in the run is an error, so a stale exemption cannot
+    /// silently stop covering something.
     pub exempt_arms: Vec<String>,
     /// Require allow-regression directive reasons to carry a verifiable citation and arm names.
+    /// Every citation the reason carries is also checked for freshness: a cited CI run must
+    /// have completed, reached its regression guard, and measured a commit reachable from the
+    /// head; a cited data artifact must post-date the branch's newest change under
+    /// `citation_source_paths`. A citation that cannot be decided leaves the gate armed.
     pub require_sourced_override: bool,
+    /// Paths (repo-relative files or directories) whose changes can move a gated number.
+    /// A cited data artifact last committed before the branch's newest change under these
+    /// paths describes the code the change replaced.
+    pub citation_source_paths: Vec<String>,
+    /// CI jobs that produce gated numbers, each with the one step that gates them. A cited run
+    /// that concluded `failure` is admitted only when every one of these jobs that started
+    /// reached its guard step with every earlier step green.
+    pub citation_measurement_jobs: Vec<MeasurementJob>,
+    /// Evaluation mode: `version-vs-version` (base and head artifacts, the default) or
+    /// `paired-ratio` (a ratio of two arms measured in the same interleaved rounds, compared
+    /// against a committed ratio baseline).
+    pub mode: BenchMode,
+    /// Committed paired-ratio baseline (the threshold file). Read from the base ref, never
+    /// from head.
+    pub ratio_baseline: Option<String>,
+    /// Optional minimum paired-ratio threshold in percent. It only ever widens a derived
+    /// floor; configured for an axis the baseline has no derived floor for, it is an error.
+    pub ratio_tolerance_pct: Option<f64>,
+}
+
+/// Evaluation mode of the `bench-regression` gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchMode {
+    /// Base and head benchmark artifacts of the same arms (the preferred model).
+    #[default]
+    VersionVsVersion,
+    /// A paired within-run ratio against a committed ratio baseline.
+    PairedRatio,
+}
+
+/// A CI job that produces gated numbers and the step in it that gates them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementJob {
+    /// Job display name as the CI API lists it.
+    pub job: String,
+    /// Name of the step in that job that reads the numbers and enforces the guard.
+    pub guard: String,
 }
 
 impl Default for BenchRegressionGate {
     fn default() -> Self {
         Self {
             enabled: true,
-            severity: Severity::Error,
+            severity: Severity::Warning,
             exempt_paths: [
                 ".github/**",
                 ".gitea/**",
@@ -695,6 +1005,11 @@ impl Default for BenchRegressionGate {
             advisory_pct: Some(0.1),
             exempt_arms: Vec::new(),
             require_sourced_override: false,
+            citation_source_paths: Vec::new(),
+            citation_measurement_jobs: Vec::new(),
+            mode: BenchMode::VersionVsVersion,
+            ratio_baseline: None,
+            ratio_tolerance_pct: None,
         }
     }
 }
@@ -713,6 +1028,28 @@ pub struct ProvenanceTagsGate {
     pub check_intervals: bool,
     /// Check paired figures (e.g. 11.9 ns vs 108.9 ns) for shared workload IDs or differentiation tags.
     pub check_paired_figures: bool,
+    /// Repository path (read at HEAD) of a JSON registry of withdrawn figures. A registered
+    /// figure may be republished only next to a retraction marker.
+    pub superseded_registry: Option<String>,
+    /// Globs of tracked JSON datasets swept for registered figures.
+    pub superseded_json_paths: Vec<String>,
+    /// A pending-measurement statement must cite a tracking issue.
+    pub check_pending_citations: bool,
+    /// A pending-measurement statement must cite at least one open issue, read from the forge.
+    /// Implies `check_pending_citations`.
+    pub require_open_pending_issues: bool,
+    /// Other repositories (`owner/name`) whose issues a pending statement may cite. By
+    /// default only this repository's issues count.
+    pub pending_issue_repos: Vec<String>,
+    /// What satisfies a published wall-clock ratio, replacing the built-in list when set:
+    /// `interval` (a `[lo, hi]` / BCa / CI mention), `marker:<word>`, `artifact:<glob>`
+    /// (a path reference matching the glob), `regex:<pattern>`. Paragraph-scoped.
+    pub ratio_satisfied_by: Vec<String>,
+    /// Units whose figures are deterministic and exempt from the interval requirement,
+    /// added to the built-in list (instructions, cycles, bytes, allocations).
+    pub deterministic_units: Vec<String>,
+    /// Judge only paragraphs that contain an added line (default: whole changed file).
+    pub diff_only: bool,
 }
 
 impl Default for ProvenanceTagsGate {
@@ -725,6 +1062,14 @@ impl Default for ProvenanceTagsGate {
             check_mechanisms: true,
             check_intervals: true,
             check_paired_figures: true,
+            superseded_registry: None,
+            superseded_json_paths: Vec::new(),
+            check_pending_citations: false,
+            require_open_pending_issues: false,
+            pending_issue_repos: Vec::new(),
+            ratio_satisfied_by: Vec::new(),
+            deterministic_units: Vec::new(),
+            diff_only: false,
         }
     }
 }
@@ -917,6 +1262,51 @@ pub struct IssueLinkGate {
     pub require_in_commit_if_no_pr: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommitProvenanceGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    /// Trailer keys every commit in the change must carry (`Signed-off-by`, `Agent-Tool`).
+    pub required_trailers: Vec<String>,
+    /// Substrings (case-insensitive) of a trailer line, the author name or the author
+    /// email that identify an agent-produced commit.
+    pub agent_markers: Vec<String>,
+    /// Trailer an agent-produced commit must carry, naming someone other than its
+    /// author. Empty switches the agent rule off.
+    pub review_trailer: String,
+}
+
+impl Default for CommitProvenanceGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            required_trailers: Vec::new(),
+            agent_markers: [
+                "Agent-Tool:",
+                "Agent:",
+                "Generated-by:",
+                "Co-authored-by: Claude",
+                "Co-authored-by: Copilot",
+                "Co-authored-by: Gemini",
+                "Co-authored-by: Codex",
+                "Co-authored-by: Cursor",
+                "Co-authored-by: aider",
+                "[bot]",
+                "noreply@anthropic.com",
+                "noreply@openai.com",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            review_trailer: "Reviewed-by".to_string(),
+        }
+    }
+}
+
 impl Default for IssueLinkGate {
     fn default() -> Self {
         Self {
@@ -984,10 +1374,16 @@ impl Default for CiIntegrityGate {
             enabled: true,
             severity: Severity::Error,
             exempt_paths: Vec::new(),
-            workflows: vec![
-                ".github/workflows/*.yml".to_string(),
-                ".github/workflows/*.yaml".to_string(),
-            ],
+            // Every Actions-shaped workflow directory `doctor::WORKFLOW_DIRS` knows.
+            workflows: crate::doctor::WORKFLOW_DIRS
+                .iter()
+                .flat_map(|dir| [format!("{dir}/*.yml"), format!("{dir}/*.yaml")])
+                .chain(
+                    [".gitlab-ci.yml", ".gitlab/ci/*.yml", ".gitlab/ci/*.yaml"]
+                        .iter()
+                        .map(|s| s.to_string()),
+                )
+                .collect(),
             rollup_job: Some("ci-gate".to_string()),
             excluded_jobs: vec!["detect-changes".to_string()],
             pin_actions: true,
@@ -997,6 +1393,293 @@ impl Default for CiIntegrityGate {
             documented_job_count_path: None,
             documented_job_count_pattern: None,
             first_party_action_prefixes: vec!["actions/".to_string(), "github/".to_string()],
+        }
+    }
+}
+
+/// `ci-skip-set`: runtime check of a rollup job's skip set. It reads the
+/// rollup's `needs` context from `DISCIPLINE_CI_CONTEXT`; with no context it
+/// reports a named "not evaluated" note and never passes or fails silently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CiSkipSetGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    /// Repo-relative path of the workflow whose rollup supplies the context.
+    pub workflow: String,
+    /// Change-detection job whose outputs gate the conditional jobs. It must
+    /// have succeeded. Empty string = the workflow has no such job.
+    pub change_job: String,
+    /// Jobs that must never be `skipped`, whatever their dependencies did.
+    pub unconditional_jobs: Vec<String>,
+}
+
+impl Default for CiSkipSetGate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            workflow: ".github/workflows/ci.yml".to_string(),
+            change_job: "detect-changes".to_string(),
+            unconditional_jobs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArchiveContentsGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub archive_path: Option<String>,
+    pub required_paths: Vec<String>,
+    pub forbidden_patterns: Vec<String>,
+    pub strip_components: usize,
+    /// Read each entry's bytes and report source maps that embed the original
+    /// source (`sourcesContent`), inline or as `.map` entries.
+    pub scan_contents: bool,
+    /// Entries larger than this are not scanned; they are named in a note.
+    pub max_entry_bytes: u64,
+    /// A named `forbidden_patterns` list (`no-source`, `no-source-npm`, ...)
+    /// merged with the configured patterns.
+    pub preset: Option<String>,
+}
+
+/// Default `max_entry_bytes`: 16 MiB.
+pub const ARCHIVE_MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+
+impl Default for ArchiveContentsGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            archive_path: None,
+            required_paths: Vec::new(),
+            forbidden_patterns: Vec::new(),
+            strip_components: 0,
+            scan_contents: false,
+            max_entry_bytes: ARCHIVE_MAX_ENTRY_BYTES,
+            preset: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManifestSyncGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub rules: Vec<ManifestSyncRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestSyncRule {
+    pub manifest: String,
+    pub extract_regex: String,
+    pub watched_paths: Vec<String>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+}
+
+impl Default for ManifestSyncGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VersionLockstepGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub groups: Vec<VersionGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionGroup {
+    pub name: String,
+    pub sources: Vec<VersionSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionSource {
+    pub path: String,
+    pub regex: String,
+}
+
+impl Default for VersionLockstepGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScopeConfinementGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub allowed_paths: Vec<String>,
+    pub forbidden_paths: Vec<String>,
+}
+
+impl Default for ScopeConfinementGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            allowed_paths: Vec::new(),
+            forbidden_paths: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SuppressionDeltaGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub max_increase: usize,
+    pub allowed_suppressions: Vec<String>,
+}
+
+impl Default for SuppressionDeltaGate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            severity: Severity::Warning,
+            exempt_paths: Vec::new(),
+            max_increase: 0,
+            allowed_suppressions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrChecklistGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+}
+
+impl Default for PrChecklistGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UnsafeBudgetGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub max_unsafe: Option<usize>,
+    pub allow_increase: bool,
+}
+
+impl Default for UnsafeBudgetGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            max_unsafe: None,
+            allow_increase: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MsrvGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub pinned_version: Option<String>,
+    pub command: Option<String>,
+}
+
+impl Default for MsrvGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            pinned_version: None,
+            command: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MiriGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub args: Vec<String>,
+    pub timeout_seconds: u64,
+}
+
+impl Default for MiriGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            args: Vec::new(),
+            timeout_seconds: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SanitizersGate {
+    pub enabled: bool,
+    pub severity: Severity,
+    pub exempt_paths: Vec<String>,
+    pub sanitizer: String,
+    pub canary: bool,
+    pub timeout_seconds: u64,
+}
+
+impl Default for SanitizersGate {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            severity: Severity::Error,
+            exempt_paths: Vec::new(),
+            sanitizer: "address".to_string(),
+            canary: false,
+            timeout_seconds: 300,
         }
     }
 }
@@ -1015,7 +1698,13 @@ impl Gates {
             "agent-scratch" => &self.agent_scratch,
             "shell-secrets" => &self.shell_secrets,
             "issue-link" => &self.issue_link,
+            "commit-provenance" => &self.commit_provenance,
             "config-integrity" => &self.config_integrity,
+            "toolchain-config" => &self.toolchain_config,
+            "stub-bodies" => &self.stub_bodies,
+            "error-swallowing" => &self.error_swallowing,
+            "instruction-smuggling" => &self.instruction_smuggling,
+            "build-hooks" => &self.build_hooks,
             "golden-output" => &self.golden_output,
             "bench-regression" => &self.bench_regression,
             "command" => &self.command,
@@ -1023,7 +1712,18 @@ impl Gates {
             "test-budget" => &self.test_budget,
             "test-floor" => &self.test_floor,
             "ci-integrity" => &self.ci_integrity,
+            "ci-skip-set" => &self.ci_skip_set,
             "provenance-tags" => &self.provenance_tags,
+            "archive-contents" => &self.archive_contents,
+            "manifest-sync" => &self.manifest_sync,
+            "version-lockstep" => &self.version_lockstep,
+            "scope-confinement" => &self.scope_confinement,
+            "suppression-delta" => &self.suppression_delta,
+            "pr-checklist" => &self.pr_checklist,
+            "unsafe-budget" => &self.unsafe_budget,
+            "msrv" => &self.msrv,
+            "miri" => &self.miri,
+            "sanitizers" => &self.sanitizers,
             _ => return None,
         })
     }
@@ -1058,8 +1758,11 @@ impl DisciplineConfig {
                 version: SCHEMA_VERSION,
                 name: name.to_string(),
                 description: None,
+                mode: RunMode::Enforcing,
             },
             directives: DirectivesConfig::default(),
+            tests: TestsConfig::default(),
+            languages: LanguagesConfig::default(),
             gates: Gates::default(),
         }
     }
@@ -1101,12 +1804,24 @@ impl DisciplineConfig {
 
     /// Resolve the effective configuration. `path = None` starts from defaults.
     pub fn resolve(path: Option<&Path>, overrides: &Overrides) -> Result<Self> {
-        let mut source_info: Option<(std::path::PathBuf, String)> = None;
-        let mut value = match path {
-            Some(p) => {
-                let content = std::fs::read_to_string(p).with_context(|| {
+        let source = match path {
+            Some(p) => Some((
+                p,
+                std::fs::read_to_string(p).with_context(|| {
                     format!("failed to read configuration file {}", p.display())
-                })?;
+                })?,
+            )),
+            None => None,
+        };
+        Self::resolve_source(source, overrides)
+    }
+
+    /// [`Self::resolve`] over content already in hand (a blob read from the base ref).
+    /// The path only labels diagnostics.
+    pub fn resolve_source(source: Option<(&Path, String)>, overrides: &Overrides) -> Result<Self> {
+        let mut source_info: Option<(std::path::PathBuf, String)> = None;
+        let mut value = match source {
+            Some((p, content)) => {
                 let val = match toml::from_str::<Value>(&content) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1130,6 +1845,13 @@ impl DisciplineConfig {
             if let Some(table) = value.as_table_mut() {
                 if let Ok(def_dir) = Value::try_from(DirectivesConfig::default()) {
                     table.insert("directives".to_string(), def_dir);
+                }
+            }
+        }
+        if value.get("tests").is_none() {
+            if let Some(table) = value.as_table_mut() {
+                if let Ok(def) = Value::try_from(TestsConfig::default()) {
+                    table.insert("tests".to_string(), def);
                 }
             }
         }
@@ -1300,6 +2022,7 @@ pub const SHORTER_IS_STRICTER: &[&str] = &[
 
 pub const LONGER_IS_STRICTER: &[&str] = &[
     "hostname_denylist",
+    "citation_source_paths",
     "extra_patterns",
     "paths",
     "include",

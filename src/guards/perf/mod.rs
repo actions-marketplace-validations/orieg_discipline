@@ -21,6 +21,8 @@
 //!    conservative interval clearing derived from interval arithmetic; overlapping CIs do not fail.
 
 pub mod bounds;
+pub mod citation;
+pub mod paired_ratio;
 
 use self::bounds::{
     evaluate_continuous_regression, ConfidenceInterval, ContinuousEstimate, DiscreteMetric,
@@ -50,6 +52,9 @@ pub struct BenchmarkMetric {
 
 pub fn bench_regression(ctx: &Context) -> Result<GateOutcome> {
     let settings = &ctx.config.gates.bench_regression;
+    if settings.mode == crate::config::BenchMode::PairedRatio {
+        return paired_ratio::bench_paired_ratio(ctx);
+    }
 
     let env_head = std::env::var("DISCIPLINE_BENCH_HEAD_FILE")
         .ok()
@@ -256,7 +261,46 @@ pub fn bench_regression(ctx: &Context) -> Result<GateOutcome> {
         )?;
     }
 
+    // Stale exemptions are judged against every arm in the tracked benchmark artifacts at
+    // head, not only the changed ones: an entry covering an unchanged artifact is live.
+    if !settings.exempt_arms.is_empty() {
+        if let Some(arms) = head_arm_names(ctx, &watched, &exempt, &mut out)? {
+            report_stale_exempt_arms(&settings.exempt_arms, &arms, None, &mut out)?;
+        }
+    }
+
     Ok(out)
+}
+
+/// Arm names across every tracked, watched, non-exempt benchmark artifact at head.
+/// `None` (with a named note) when an artifact cannot be read or parsed, so staleness
+/// cannot be determined.
+fn head_arm_names(
+    ctx: &Context,
+    watched: &PathFilter,
+    exempt: &PathFilter,
+    out: &mut GateOutcome,
+) -> Result<Option<Vec<String>>> {
+    let mut arms = Vec::new();
+    for path in ctx.git.tracked_files()? {
+        if !watched.matches(&path) || exempt.matches(&path) {
+            continue;
+        }
+        let parsed = ctx
+            .git
+            .head_bytes(&path)?
+            .map(|raw| parse_metrics(&path, &String::from_utf8_lossy(&raw)));
+        match parsed {
+            Some(Ok(metrics)) => arms.extend(metrics.into_iter().map(|m| m.name)),
+            _ => {
+                out.notes.push(format!(
+                    "stale `exempt_arms` check skipped: benchmark artifact `{path}` could not be read or parsed at head"
+                ));
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(arms))
 }
 
 fn run_dual_file_bench_regression(
@@ -403,6 +447,11 @@ fn run_dual_file_bench_regression(
         &mut out,
     )?;
 
+    if !settings.exempt_arms.is_empty() {
+        let arms: Vec<String> = head_metrics.iter().map(|m| m.name.clone()).collect();
+        report_stale_exempt_arms(&settings.exempt_arms, &arms, Some(h_path), &mut out)?;
+    }
+
     Ok(out)
 }
 
@@ -415,18 +464,19 @@ pub fn evaluate_metrics_regression(
     head_path: &str,
     out: &mut GateOutcome,
 ) -> Result<()> {
-    evaluate_metrics_regression_with_directives(
+    evaluate_metrics_regression_with_instruments(
         &ctx.directives,
         settings,
-        base_metrics,
-        head_metrics,
-        base_path,
-        head_path,
+        (base_metrics, head_metrics),
+        (base_path, head_path),
         ctx.overridable(settings.severity),
+        &citation::LiveInstruments::new(ctx.git),
         out,
     )
 }
 
+/// `evaluate_metrics_regression_with_instruments` with no instruments: every citation an
+/// override rests on is undecidable, so a sourced override never admits a regression here.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_metrics_regression_with_directives(
     directives: &[crate::tokens::ParsedDirective],
@@ -438,6 +488,91 @@ pub fn evaluate_metrics_regression_with_directives(
     severity: crate::config::Severity,
     out: &mut GateOutcome,
 ) -> Result<()> {
+    evaluate_metrics_regression_with_instruments(
+        directives,
+        settings,
+        (base_metrics, head_metrics),
+        (base_path, head_path),
+        severity,
+        &citation::Unavailable,
+        out,
+    )
+}
+
+/// Reports an override whose citations are stale or undecidable, with every regression it
+/// would have approved. Returns true when the override must not be admitted.
+fn report_unfresh_override(
+    report: &citation::FreshnessReport,
+    directive: &crate::tokens::ParsedDirective,
+    regressions: &[(String, f64, u64, u64, String)],
+    head_path: &str,
+    severity: crate::config::Severity,
+    out: &mut GateOutcome,
+) -> bool {
+    if report.is_fresh() {
+        return false;
+    }
+    if !report.problems.is_empty() {
+        out.push(
+            severity,
+            "Regression Override Is Void — Citation Does Not Measure This Code",
+            Some(head_path),
+            None,
+            format!(
+                "regression override `{}` is void: its citation does not resolve to a measurement of the head being gated: {}",
+                directive.reason,
+                report.problems.join("; ")
+            ),
+            "cite a completed run at a commit reachable from this head, or regenerate the cited artifact after the change",
+        );
+    } else {
+        for item in &report.undecidable {
+            out.notes.push(format!(
+                "allow-regression citation not verified — {item}; the gate stays armed"
+            ));
+        }
+        out.push(
+            severity,
+            "Regression Override Not Verified — Citation Undecidable",
+            Some(head_path),
+            None,
+            format!(
+                "regression override `{}` is not admitted: its citations could not be checked for freshness: {}",
+                directive.reason,
+                report.undecidable.join("; ")
+            ),
+            "give the job network access and a GitHub token (`GH_TOKEN` or `GITHUB_TOKEN`) (or configure `citation_measurement_jobs` / `citation_source_paths`), or cite a committed artifact",
+        );
+    }
+    for (arm, delta, base_c, head_c, unit) in regressions {
+        out.push(
+            severity,
+            "Instruction Count Regressed",
+            Some(head_path),
+            None,
+            format!(
+                "deterministic counter `{arm}` in `{head_path}` regressed by +{delta:.2}% ({base_c} -> {head_c} {unit}), and the override for it rests on a citation that is not verified fresh"
+            ),
+            &format!("optimize `{arm}` or cite a fresh measurement"),
+        );
+    }
+    true
+}
+
+/// Evaluates base and head metrics; a sourced override is admitted only when every
+/// citation it rests on is verified fresh with `instruments`. `metrics` and `paths` are
+/// `(base, head)`.
+pub fn evaluate_metrics_regression_with_instruments(
+    directives: &[crate::tokens::ParsedDirective],
+    settings: &crate::config::BenchRegressionGate,
+    metrics: (&[BenchmarkMetric], &[BenchmarkMetric]),
+    paths: (&str, &str),
+    severity: crate::config::Severity,
+    instruments: &dyn citation::CitationInstruments,
+    out: &mut GateOutcome,
+) -> Result<()> {
+    let (base_metrics, head_metrics) = metrics;
+    let (base_path, head_path) = paths;
     // 1. Check for removed benchmarks within surviving artifact
     for b in base_metrics {
         if !head_metrics.iter().any(|h| h.name == b.name) {
@@ -471,25 +606,11 @@ pub fn evaluate_metrics_regression_with_directives(
     let advisory_threshold = settings.advisory_pct.unwrap_or(0.1);
     let effective_tolerance = settings.tolerance_pct + settings.noise_margin_pct.unwrap_or(0.0);
 
+    let exemptions = ArmExemptions::new(&settings.exempt_arms)?;
     let mut discrete_regressions: Vec<(String, f64, u64, u64, String)> = Vec::new();
 
     for h in head_metrics {
-        let is_exempt = settings.exempt_arms.iter().any(|ex| {
-            if ex == &h.name {
-                return true;
-            }
-            if let Some(prefix) = ex.strip_suffix('*') {
-                if h.name.starts_with(prefix) {
-                    return true;
-                }
-            }
-            if let Some(tail) = h.name.rsplit("::").next() {
-                if tail == ex || tail.split('/').next() == Some(ex) {
-                    return true;
-                }
-            }
-            false
-        });
+        let is_exempt = exemptions.matches(&h.name);
 
         if is_exempt {
             out.notes.push(format!(
@@ -594,7 +715,7 @@ pub fn evaluate_metrics_regression_with_directives(
                             ),
                         );
                     }
-                } else if decision.method == "not_comparable_no_ci"
+                } else if decision.method.starts_with("not_comparable")
                     || decision.point_delta_pct > effective_tolerance
                 {
                     out.notes
@@ -688,6 +809,22 @@ pub fn evaluate_metrics_regression_with_directives(
                                         &format!("name `{}` in the override reason", arm),
                                     );
                                 }
+                            } else if report_unfresh_override(
+                                &citation::check_citation_freshness(
+                                    &d.reason,
+                                    &citation::FreshnessPolicy {
+                                        measurement_jobs: &settings.citation_measurement_jobs,
+                                        source_paths: &settings.citation_source_paths,
+                                    },
+                                    instruments,
+                                ),
+                                d,
+                                &discrete_regressions,
+                                head_path,
+                                severity,
+                                out,
+                            ) {
+                                // Stale or undecidable: the gate stays armed.
                             } else {
                                 for (arm, delta, base_c, head_c, unit) in &discrete_regressions {
                                     if unapproved.contains(&arm.as_str()) {
@@ -768,6 +905,132 @@ pub fn evaluate_metrics_regression_with_directives(
         }
     }
 
+    Ok(())
+}
+
+/// Printed arm form (`map_get random`, or the full iai header
+/// `instructions::cost::map_get random:"random"`) mapped to the reported name `map_get/random`.
+static PRINTED_ARM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^(?:[\w:]+::)?(\w+)\s+([^:\s"\(]+):?.*$"#).unwrap());
+
+/// One `exempt_arms` entry, in every form it may match under.
+struct ArmExemption {
+    raw: String,
+    /// The entry as written, plus the reported name when the entry is in printed form.
+    forms: Vec<String>,
+    /// Compiled glob for each form that carries glob metacharacters.
+    globs: Vec<globset::GlobMatcher>,
+}
+
+impl ArmExemption {
+    fn new(raw: &str) -> Result<Self> {
+        let mut forms = vec![raw.to_string()];
+        if raw.contains(char::is_whitespace) {
+            if let Some(cap) = PRINTED_ARM.captures(raw.trim()) {
+                let reported = format!("{}/{}", &cap[1], &cap[2]);
+                if !forms.contains(&reported) {
+                    forms.push(reported);
+                }
+            }
+        }
+        let mut globs = Vec::new();
+        for form in &forms {
+            if form.contains(['*', '?', '[', '{']) {
+                let glob = globset::Glob::new(form).with_context(|| {
+                    format!("invalid glob `{form}` in `gates.bench-regression.exempt_arms`")
+                })?;
+                globs.push(glob.compile_matcher());
+            }
+        }
+        Ok(Self {
+            raw: raw.to_string(),
+            forms,
+            globs,
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        // `::` path suffix (`tests/perf.py::test_x` -> `test_x`).
+        let tail = name.rsplit("::").next().unwrap_or(name);
+        let literal = self.forms.iter().any(|ex| {
+            // exact
+            ex == name
+                // trailing-wildcard literal prefix
+                || ex.strip_suffix('*').is_some_and(|p| name.starts_with(p))
+                // path suffix, or its `/` parameter head (`map_get/random` -> `map_get`)
+                || tail == ex
+                || tail.split('/').next() == Some(ex.as_str())
+        });
+        literal || self.globs.iter().any(|g| g.is_match(name))
+    }
+}
+
+/// Compiled `gates.bench-regression.exempt_arms` entries.
+///
+/// An entry exempts an arm when it is the arm name exactly, a trailing-`*` literal prefix of it,
+/// its `::` path suffix or that suffix's `/` parameter head, a glob matching it (`*.heap.*`),
+/// or the printed form a benchmark harness shows for it (`map_get random` for `map_get/random`).
+pub struct ArmExemptions {
+    entries: Vec<ArmExemption>,
+}
+
+impl ArmExemptions {
+    /// Fails on an entry that is a malformed glob (F6: strict configuration).
+    pub fn new(entries: &[String]) -> Result<Self> {
+        Ok(Self {
+            entries: entries
+                .iter()
+                .map(|e| ArmExemption::new(e))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    /// Whether any entry exempts the arm `name`.
+    pub fn matches(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.matches(name))
+    }
+
+    /// Entries, as written, that exempt none of `arms`.
+    pub fn unmatched<'a, I>(&self, arms: I) -> Vec<&str>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let arms: Vec<&str> = arms.into_iter().collect();
+        self.entries
+            .iter()
+            .filter(|e| !arms.iter().any(|a| e.matches(a)))
+            .map(|e| e.raw.as_str())
+            .collect()
+    }
+}
+
+/// Reports every `exempt_arms` entry that matches no arm in `arms` as a violation.
+///
+/// A stale exemption is how a gate quietly stops covering something, so it is an error
+/// regardless of the gate's configured severity: it is a deterministic configuration
+/// defect, not measurement noise. No directive lifts it; the fix is to edit the entry.
+pub fn report_stale_exempt_arms(
+    exempt_arms: &[String],
+    arms: &[String],
+    location: Option<&str>,
+    out: &mut GateOutcome,
+) -> Result<()> {
+    let exemptions = ArmExemptions::new(exempt_arms)?;
+    for entry in exemptions.unmatched(arms.iter().map(String::as_str)) {
+        out.push(
+            crate::config::Severity::Error,
+            "Stale Benchmark Arm Exemption",
+            location,
+            None,
+            format!(
+                "`gates.bench-regression.exempt_arms` entry `{entry}` matches no benchmark arm in this run ({} arm(s) examined); a stale exemption silently stops covering whatever it was written for",
+                arms.len()
+            ),
+            &format!(
+                "remove `{entry}` from `exempt_arms`, or correct it to the arm name as reported or printed by the benchmark"
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -1167,9 +1430,143 @@ fn parse_json_metrics(val: &serde_json::Value) -> Result<Vec<BenchmarkMetric>> {
                 });
             }
         }
+        if !metrics.is_empty() {
+            return Ok(metrics);
+        }
+    }
+
+    // 4. Object/map of benchmarks (e.g. a custom JSON harness: {"benchmarks": { "<name>": { "runs_ms": [...], "median_ms": ... } }})
+    if let Some(benchmarks_map) = val.get("benchmarks").and_then(|b| b.as_object()) {
+        for (name, b) in benchmarks_map {
+            let mut unit = "ms".to_string();
+            let runs_arr = b
+                .get("runs_ms")
+                .or_else(|| {
+                    if let Some(arr) = b.get("runs_ns") {
+                        unit = "ns".to_string();
+                        Some(arr)
+                    } else if let Some(arr) = b.get("runs_us") {
+                        unit = "us".to_string();
+                        Some(arr)
+                    } else if let Some(arr) = b.get("runs_s") {
+                        unit = "s".to_string();
+                        Some(arr)
+                    } else if let Some(arr) = b.get("runs") {
+                        Some(arr)
+                    } else {
+                        b.get("samples")
+                    }
+                })
+                .and_then(|r| r.as_array());
+
+            let median_val = b
+                .get("median_ms")
+                .or_else(|| {
+                    if let Some(m) = b.get("median_ns") {
+                        unit = "ns".to_string();
+                        Some(m)
+                    } else if let Some(m) = b.get("median_us") {
+                        unit = "us".to_string();
+                        Some(m)
+                    } else if let Some(m) = b.get("median_s") {
+                        unit = "s".to_string();
+                        Some(m)
+                    } else if let Some(m) = b.get("median") {
+                        Some(m)
+                    } else {
+                        b.get("mean")
+                    }
+                })
+                .and_then(|v| v.as_f64());
+
+            // Memory rows (`{"median_ms": 0, "heap_bytes": 160, "rss_bytes": 20480}`) carry a
+            // placeholder zero timing. With no usable timing signal they are parsed as a
+            // deterministic byte counter so they gate like instruction counts, not as a
+            // 0.0 wall-clock estimate that admits no relative delta.
+            let timing_usable = median_val.is_some_and(|m| m > 0.0)
+                || runs_arr.is_some_and(|r| r.iter().filter_map(|v| v.as_f64()).any(|v| v > 0.0));
+            if !timing_usable {
+                if let Some(bytes) = memory_bytes(b)? {
+                    metrics.push(BenchmarkMetric {
+                        name: name.clone(),
+                        count: bytes as f64,
+                        value: MetricValue::Discrete(DiscreteMetric::new(bytes)),
+                        unit: "bytes".to_string(),
+                    });
+                    continue;
+                }
+            }
+
+            if let Some(runs) = runs_arr {
+                let sample_vec: Vec<f64> = runs.iter().filter_map(|v| v.as_f64()).collect();
+                if !sample_vec.is_empty() {
+                    let est = ContinuousEstimate::from_samples(&sample_vec, median_val, &unit)?;
+                    metrics.push(BenchmarkMetric {
+                        name: name.clone(),
+                        count: est.point_estimate,
+                        value: MetricValue::Continuous(est),
+                        unit,
+                    });
+                    continue;
+                }
+            }
+
+            if let Some(median) = median_val {
+                let est = ContinuousEstimate::point_only(median, &unit)?;
+                metrics.push(BenchmarkMetric {
+                    name: name.clone(),
+                    count: median,
+                    value: MetricValue::Continuous(est),
+                    unit,
+                });
+                continue;
+            }
+
+            if let Some(count) = b
+                .get("instructions")
+                .or_else(|| b.get("ir"))
+                .or_else(|| b.get("fuel"))
+                .and_then(|v| v.as_f64())
+            {
+                let unit = if b.get("fuel").is_some() {
+                    "fuel"
+                } else {
+                    "Ir"
+                };
+                metrics.push(BenchmarkMetric {
+                    name: name.clone(),
+                    count,
+                    value: MetricValue::Discrete(DiscreteMetric::new(count as u64)),
+                    unit: unit.to_string(),
+                });
+            }
+        }
+        if !metrics.is_empty() {
+            return Ok(metrics);
+        }
     }
 
     Ok(metrics)
+}
+
+/// Memory footprint of a benchmark row, preferring `heap_bytes` (allocator-counted, deterministic)
+/// over a generic `bytes` field and `rss_bytes` (resident set size, page-granular).
+/// A present field that is not a non-negative integer is malformed.
+fn memory_bytes(row: &serde_json::Value) -> Result<Option<u64>> {
+    for key in ["heap_bytes", "bytes", "rss_bytes"] {
+        if let Some(v) = row.get(key) {
+            let Some(n) = v
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
+            else {
+                bail!(
+                    "malformed memory benchmark row: `{key}` is not a non-negative integer ({v})"
+                );
+            };
+            return Ok(Some(n as u64));
+        }
+    }
+    Ok(None)
 }
 
 fn parse_text_metrics(content: &str) -> Vec<BenchmarkMetric> {
@@ -1435,6 +1832,199 @@ smoke_cost::set_contains
         assert_eq!(base[0].count, 1000.0);
     }
 
+    fn exempt(entries: &[&str]) -> ArmExemptions {
+        let owned: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+        ArmExemptions::new(&owned).unwrap()
+    }
+
+    const MIXED_TIMING_AND_MEMORY: &str = r#"{
+        "benchmarks": {
+            "core.bitset.write.judy": {
+                "median_ms": 14.5314,
+                "runs_ms": [14.3895, 14.476, 14.5057, 14.5314, 14.5369, 14.538, 14.5991]
+            },
+            "core.bitset.read.judy": { "median_ms": 5.12 },
+            "core.bitset.heap.judy": { "median_ms": 0, "heap_bytes": 160, "rss_bytes": 20480 },
+            "core.int_to_int.heap.php": { "median_ms": 0, "rss_bytes": 40960 }
+        }
+    }"#;
+
+    #[test]
+    fn memory_rows_parse_as_discrete_bytes_alongside_timing_rows() {
+        let metrics = parse_metrics("baselines/latest.json", MIXED_TIMING_AND_MEMORY).unwrap();
+        assert_eq!(metrics.len(), 4);
+
+        let write = metrics
+            .iter()
+            .find(|m| m.name == "core.bitset.write.judy")
+            .unwrap();
+        assert!(matches!(write.value, MetricValue::Continuous(_)));
+        assert_eq!(write.unit, "ms");
+
+        // heap_bytes is preferred over rss_bytes: allocator counts are deterministic,
+        // resident set size carries page granularity.
+        let heap = metrics
+            .iter()
+            .find(|m| m.name == "core.bitset.heap.judy")
+            .unwrap();
+        assert_eq!(heap.value, MetricValue::Discrete(DiscreteMetric::new(160)));
+        assert_eq!(heap.unit, "bytes");
+
+        let rss = metrics
+            .iter()
+            .find(|m| m.name == "core.int_to_int.heap.php")
+            .unwrap();
+        assert_eq!(rss.value, MetricValue::Discrete(DiscreteMetric::new(40960)));
+        assert_eq!(rss.unit, "bytes");
+    }
+
+    #[test]
+    fn memory_rows_gate_as_deterministic_counters() {
+        use crate::config::{BenchRegressionGate, Severity};
+        let settings = BenchRegressionGate {
+            tolerance_pct: 5.0,
+            ..Default::default()
+        };
+        let base = parse_metrics("b.json", MIXED_TIMING_AND_MEMORY).unwrap();
+        let grown = MIXED_TIMING_AND_MEMORY.replace("\"heap_bytes\": 160", "\"heap_bytes\": 320");
+        let head = parse_metrics("h.json", &grown).unwrap();
+        let mut out = GateOutcome::new(GATE);
+        evaluate_metrics_regression_with_directives(
+            &[],
+            &settings,
+            &base,
+            &head,
+            "b.json",
+            "h.json",
+            Severity::Error,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.violations.len(), 1, "{:?}", out.violations);
+        assert!(out.violations[0].message.contains("core.bitset.heap.judy"));
+        assert!(out.violations[0].message.contains("160 -> 320 bytes"));
+
+        // Unchanged memory rows evaluate cleanly: no bail on the zero timing field.
+        let mut clean = GateOutcome::new(GATE);
+        evaluate_metrics_regression_with_directives(
+            &[],
+            &settings,
+            &base,
+            &base,
+            "b.json",
+            "h.json",
+            Severity::Error,
+            &mut clean,
+        )
+        .unwrap();
+        assert!(clean.violations.is_empty(), "{:?}", clean.violations);
+    }
+
+    #[test]
+    fn zero_point_estimate_is_not_comparable_rather_than_a_bail() {
+        use crate::config::{BenchRegressionGate, Severity};
+        let json = r#"{"benchmarks": {"core.noop.judy": {"median_ms": 0}}}"#;
+        let metrics = parse_metrics("b.json", json).unwrap();
+        assert!(matches!(metrics[0].value, MetricValue::Continuous(_)));
+        let mut out = GateOutcome::new(GATE);
+        evaluate_metrics_regression_with_directives(
+            &[],
+            &BenchRegressionGate::default(),
+            &metrics,
+            &metrics,
+            "b.json",
+            "h.json",
+            Severity::Error,
+            &mut out,
+        )
+        .expect("a zero point estimate must not abort the gate");
+        assert!(out.violations.is_empty());
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("core.noop.judy") && n.contains("not comparable")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn exempt_arms_accepts_globs() {
+        let ex = exempt(&["*.heap.*"]);
+        assert!(ex.matches("core.bitset.heap.judy"));
+        assert!(ex.matches("core.int_to_int.heap.php"));
+        assert!(!ex.matches("core.bitset.write.judy"));
+
+        let suffix = exempt(&["*.heap"]);
+        assert!(suffix.matches("core.bitset.heap"));
+        assert!(!suffix.matches("core.bitset.heap.judy"));
+
+        let path = exempt(&["*::random_*"]);
+        assert!(path.matches("tests/test_perf.py::random_lookup"));
+        assert!(!path.matches("tests/test_perf.py::sequential_lookup"));
+    }
+
+    #[test]
+    fn exempt_arms_preserves_existing_forms() {
+        // exact
+        assert!(exempt(&["map_get/random"]).matches("map_get/random"));
+        // trailing-wildcard literal prefix, including glob metacharacters in the prefix
+        assert!(exempt(&["map_get*"]).matches("map_get/random"));
+        assert!(exempt(&["bm[1]*"]).matches("bm[1]/large"));
+        // `::` path suffix and `/` parameter head
+        assert!(exempt(&["test_serialize"]).matches("tests/test_perf.py::test_serialize"));
+        assert!(exempt(&["map_get"]).matches("map_get/random"));
+        // negative controls
+        assert!(!exempt(&["map_get"]).matches("map_insert/random"));
+        assert!(!exempt(&["map"]).matches("map_get/random"));
+    }
+
+    #[test]
+    fn exempt_arms_accepts_the_printed_arm_form() {
+        let sample = "instructions::cost::map_get random:\"random\"\n  Instructions:               1,050|1,000 (+5.0000%)\n";
+        let (head, _) = parse_iai_callgrind_console_both(sample);
+        assert_eq!(head[0].name, "map_get/random");
+
+        assert!(exempt(&["map_get random"]).matches(&head[0].name));
+        assert!(exempt(&["instructions::cost::map_get random:\"random\""]).matches(&head[0].name));
+        assert!(!exempt(&["map_get sequential"]).matches(&head[0].name));
+        assert!(!exempt(&["map_insert random"]).matches(&head[0].name));
+    }
+
+    #[test]
+    fn exempt_arms_rejects_a_malformed_glob() {
+        assert!(ArmExemptions::new(&["core.[heap".to_string()]).is_err());
+    }
+
+    #[test]
+    fn stale_exempt_arm_is_an_error() {
+        let arms = vec![
+            "map_get/random".to_string(),
+            "core.bitset.heap.judy".to_string(),
+        ];
+        let entries = vec![
+            "map_get random".to_string(),
+            "*.heap.*".to_string(),
+            "set_contains".to_string(),
+        ];
+        let ex = ArmExemptions::new(&entries).unwrap();
+        assert_eq!(
+            ex.unmatched(arms.iter().map(String::as_str)),
+            vec!["set_contains"]
+        );
+
+        let mut out = GateOutcome::new(GATE);
+        report_stale_exempt_arms(&entries, &arms, Some("h.json"), &mut out).unwrap();
+        assert_eq!(out.violations.len(), 1, "{:?}", out.violations);
+        assert_eq!(out.violations[0].title, "Stale Benchmark Arm Exemption");
+        assert_eq!(out.violations[0].severity, crate::config::Severity::Error);
+        assert!(out.violations[0].message.contains("set_contains"));
+
+        let mut live = GateOutcome::new(GATE);
+        report_stale_exempt_arms(&entries[..2], &arms, Some("h.json"), &mut live).unwrap();
+        assert!(live.violations.is_empty());
+    }
+
     #[test]
     fn test_evaluate_metrics_regression_two_tier_and_sourced_override() {
         use crate::config::{BenchRegressionGate, Severity};
@@ -1587,7 +2177,7 @@ smoke_cost::set_contains
         let dir_unnamed = vec![ParsedDirective {
             directive: "allow-regression".to_string(),
             reason:
-                "coordination trade refs https://github.com/orieg/expanse/actions/runs/34490311084"
+                "coordination trade refs https://github.com/example-org/example-project/actions/runs/34490311084"
                     .to_string(),
             source: OverrideSource::PrBody,
             hidden: false,
@@ -1612,27 +2202,78 @@ smoke_cost::set_contains
         );
 
         // Case 6: Sourced override naming only subset of regressed arms -> named approved, unnamed fails
+        // (the cited run is verified fresh: completed at the head under review)
         let dir_subset = vec![ParsedDirective {
             directive: "allow-regression".to_string(),
-            reason: "sync_map_insert pays the bracket refs https://github.com/orieg/expanse/actions/runs/34490311084".to_string(),
+            reason: "sync_map_insert pays the bracket refs https://github.com/acme/widgets/actions/runs/4401".to_string(),
             source: OverrideSource::PrBody,
             hidden: false,
         }];
-        let mut out6 = GateOutcome::new(GATE);
-        evaluate_metrics_regression_with_directives(
-            &dir_subset,
-            &settings,
-            &base,
-            &head_two_2pct,
-            "base.txt",
-            "head.txt",
-            Severity::Error,
-            &mut out6,
-        )
-        .unwrap();
+        let canned = |conclusion: &str| citation::CannedInstruments {
+            responses: std::collections::BTreeMap::from([
+                (
+                    "repos/acme/widgets/actions/runs/4401".to_string(),
+                    serde_json::json!({"conclusion": conclusion, "head_sha": "abc123"}),
+                ),
+                (
+                    "repos/acme/widgets/compare/abc123...abc123".to_string(),
+                    serde_json::json!({"status": "identical"}),
+                ),
+            ]),
+            head: Some("abc123".to_string()),
+            ..Default::default()
+        };
+        let run6 = |instruments: &dyn citation::CitationInstruments| {
+            let mut out = GateOutcome::new(GATE);
+            evaluate_metrics_regression_with_instruments(
+                &dir_subset,
+                &settings,
+                (&base, &head_two_2pct),
+                ("base.txt", "head.txt"),
+                Severity::Error,
+                instruments,
+                &mut out,
+            )
+            .unwrap();
+            out
+        };
+        let out6 = run6(&canned("success"));
         assert_eq!(out6.overrides.len(), 1, "named arm must be approved");
         assert_eq!(out6.violations.len(), 1, "unnamed arm must fail");
         assert!(out6.violations[0].title.contains("Unapproved Arm"));
+
+        // Case 6b: the same override citing a cancelled run is void, and says which run.
+        let stale = run6(&canned("cancelled"));
+        assert!(
+            stale.overrides.is_empty(),
+            "a stale citation admits nothing"
+        );
+        assert!(stale
+            .violations
+            .iter()
+            .any(|v| v.title.contains("Citation Does Not Measure This Code")
+                && v.message.contains("run 4401 concluded `cancelled`")));
+        assert_eq!(
+            stale
+                .violations
+                .iter()
+                .filter(|v| v.title == "Instruction Count Regressed")
+                .count(),
+            2,
+            "every regression stays armed"
+        );
+
+        // Case 6c: no instruments -> undecidable -> named notice, gate stays armed.
+        let undecided = run6(&citation::Unavailable);
+        assert!(undecided.overrides.is_empty(), "undecidable admits nothing");
+        assert!(undecided
+            .violations
+            .iter()
+            .any(|v| v.title.contains("Citation Undecidable")));
+        assert!(undecided
+            .notes
+            .iter()
+            .any(|n| n.contains("citation not verified") && n.contains("run 4401")));
 
         // Case 7: Exempt arm
         let mut settings_exempt = settings.clone();
@@ -1653,5 +2294,52 @@ smoke_cost::set_contains
             out7.violations.is_empty(),
             "after exempting one arm, only 1 arm remains > noise floor, passing the gate"
         );
+    }
+
+    #[test]
+    fn test_parse_metrics_custom_json_sample_array() {
+        let json_content = r#"{
+            "benchmarks": {
+                "core.bitset.write.judy": {
+                    "median_ms": 14.5314,
+                    "runs_ms": [14.3895, 14.476, 14.5057, 14.5314, 14.5369, 14.538, 14.5991]
+                },
+                "core.bitset.read.judy": {
+                    "median_ms": 5.12
+                }
+            }
+        }"#;
+        let metrics = parse_metrics("baselines/latest.json", json_content).unwrap();
+        assert_eq!(metrics.len(), 2);
+
+        let write_metric = metrics
+            .iter()
+            .find(|m| m.name == "core.bitset.write.judy")
+            .unwrap();
+        assert_eq!(write_metric.unit, "ms");
+        assert_eq!(write_metric.count, 14.5314);
+        match &write_metric.value {
+            MetricValue::Continuous(est) => {
+                assert_eq!(est.point_estimate, 14.5314);
+                let ci = est.ci.expect("bootstrap CI must be present");
+                assert!(ci.lower <= 14.5314);
+                assert!(ci.upper >= 14.5314);
+            }
+            _ => panic!("expected continuous metric"),
+        }
+
+        let read_metric = metrics
+            .iter()
+            .find(|m| m.name == "core.bitset.read.judy")
+            .unwrap();
+        assert_eq!(read_metric.unit, "ms");
+        assert_eq!(read_metric.count, 5.12);
+        match &read_metric.value {
+            MetricValue::Continuous(est) => {
+                assert_eq!(est.point_estimate, 5.12);
+                assert!(est.ci.is_none());
+            }
+            _ => panic!("expected continuous metric"),
+        }
     }
 }

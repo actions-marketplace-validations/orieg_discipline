@@ -124,6 +124,8 @@ fn render_terminal_to_writer<W: Write>(
                     crate::tokens::OverrideSource::Commit(oid) => format!("commit {oid}"),
                     crate::tokens::OverrideSource::Inline { file, line } =>
                         format!("{file}:{line}"),
+                    crate::tokens::OverrideSource::MergedPrBody(n) =>
+                        format!("merged pull request #{n} body"),
                 }
             )?;
         }
@@ -144,6 +146,7 @@ fn render_terminal_to_writer<W: Write>(
         let icon = match v.severity {
             Severity::Error => style::red("error"),
             Severity::Warning => style::yellow("warning"),
+            Severity::Note => style::cyan("note"),
         };
         let loc = location(v).map(|l| format!(" [{l}]")).unwrap_or_default();
         writeln!(
@@ -157,25 +160,40 @@ fn render_terminal_to_writer<W: Write>(
         if let Some(rem) = &v.remediation {
             writeln!(w, "   {} {rem}", style::bold("Remediation:"))?;
         }
+        writeln!(
+            w,
+            "   {} https://orieg.github.io/discipline/gates/#{}",
+            style::bold("Doc:"),
+            v.gate
+        )?;
     }
 
     let total_ov = summary.total_overrides();
     let (passed, failed, disabled, examined) =
         summary.gate_counts(fail_on_warnings, fail_on_overrides);
-    let disabled_suffix = if disabled > 0 {
+    let mut disabled_suffix = if disabled > 0 {
         format!(", {disabled} disabled")
     } else {
         String::new()
     };
+    let not_evaluated = summary.not_evaluated_count();
+    if not_evaluated > 0 {
+        disabled_suffix.push_str(&format!(", {not_evaluated} not evaluated"));
+    }
     let items_label = if examined == 1 { "item" } else { "items" };
     writeln!(
         w,
         "\ngates:  {} passed, {} failed{} ({} {} examined)",
         passed, failed, disabled_suffix, examined, items_label
     )?;
+    let baselined_suffix = if summary.baselined > 0 {
+        format!("  baselined: {}", summary.baselined)
+    } else {
+        String::new()
+    };
     writeln!(
         w,
-        "errors: {}  warnings: {}  overrides: {}",
+        "errors: {}  warnings: {}  overrides: {}{baselined_suffix}",
         summary.errors, summary.warnings, total_ov
     )?;
     if fail_on_overrides && total_ov > 0 {
@@ -185,10 +203,20 @@ fn render_terminal_to_writer<W: Write>(
             style::red("failure: applied overrides require human sign-off (directives.fail_on_overrides / --fail-on-overrides)")
         )?;
     }
+    for failure in &summary.policy_failures {
+        writeln!(w, "{}", style::red(&format!("failure: {failure}")))?;
+    }
     if summary.is_success(fail_on_warnings, fail_on_overrides) {
         writeln!(w, "{}", style::green("Status: PASS"))?;
     } else {
         writeln!(w, "{}", style::red("Status: FAILED"))?;
+        if summary.baselined == 0 && summary.errors > 0 {
+            writeln!(
+                w,
+                "\n{}",
+                style::cyan("Tip: fix what this change introduced. Findings in code it did not touch (existing debt when adopting Discipline) can be recorded with 'discipline baseline --write'.")
+            )?;
+        }
     }
     Ok(())
 }
@@ -205,6 +233,7 @@ fn render_annotations(summary: &CheckSummary) {
         let level = match v.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
+            Severity::Note => "notice",
         };
         let mut props = format!(
             "title={}",
@@ -233,7 +262,23 @@ fn render_step_summary(
         .append(true)
         .open(&path)
         .with_context(|| format!("failed to open job summary {path}"))?;
-    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    render_step_summary_to_writer(&mut file, summary, fail_on_warnings, fail_on_overrides)
+}
+
+pub fn render_step_summary_to_writer(
+    mut file: impl std::io::Write,
+    summary: &CheckSummary,
+    fail_on_warnings: bool,
+    fail_on_overrides: bool,
+) -> Result<()> {
+    let cell_code = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    let cell = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('|', "\\|")
+            .replace('\n', " ")
+    };
 
     let heading = if summary.is_success(fail_on_warnings, fail_on_overrides) {
         "### Discipline gate: passed"
@@ -241,20 +286,32 @@ fn render_step_summary(
         "### Discipline gate: FAILED"
     };
     writeln!(file, "{heading}\n\nBase: `{}`\n", summary.base)?;
+    for failure in &summary.policy_failures {
+        writeln!(file, "**Refused:** {failure}\n")?;
+    }
 
     let (passed, failed, disabled, examined) =
         summary.gate_counts(fail_on_warnings, fail_on_overrides);
-    let disabled_suffix = if disabled > 0 {
+    let mut disabled_suffix = if disabled > 0 {
         format!(", {disabled} disabled")
     } else {
         String::new()
     };
+    let not_evaluated = summary.not_evaluated_count();
+    if not_evaluated > 0 {
+        disabled_suffix.push_str(&format!(", {not_evaluated} not evaluated"));
+    }
     let items_label = if examined == 1 { "item" } else { "items" };
     let total_ov = summary.total_overrides();
+    let baselined_part = if summary.baselined > 0 {
+        format!(" · {} baselined", summary.baselined)
+    } else {
+        String::new()
+    };
     writeln!(
         file,
-        "**Summary:** {} passed, {} failed{} ({} {} examined) · {} errors · {} warnings · {} overrides\n",
-        passed, failed, disabled_suffix, examined, items_label, summary.errors, summary.warnings, total_ov
+        "**Summary:** {} passed, {} failed{} ({} {} examined) · {} errors · {} warnings · {} overrides{}\n",
+        passed, failed, disabled_suffix, examined, items_label, summary.errors, summary.warnings, total_ov, baselined_part
     )?;
 
     writeln!(
@@ -291,13 +348,16 @@ fn render_step_summary(
                 crate::tokens::OverrideSource::Inline { file, line } => {
                     format!("`{file}:{line}`")
                 }
+                crate::tokens::OverrideSource::MergedPrBody(n) => {
+                    format!("merged pull request #{n} body")
+                }
             };
             writeln!(
                 file,
                 "| `{}` | `{}` | `{}` | {} | {} |",
                 ov.gate,
-                cell(&ov.directive),
-                cell(&ov.subject),
+                cell_code(&ov.directive),
+                cell_code(&ov.subject),
                 cell(&ov.reason),
                 src
             )?;
@@ -311,12 +371,13 @@ fn render_step_summary(
         for v in summary.violations() {
             writeln!(
                 file,
-                "| {:?} | `{}` | **{}** | {} | {}<br>_{}_ |",
+                "| {:?} | [`{}`](https://orieg.github.io/discipline/gates/#{}) | **{}** | {} | {}<br>_{}_ |",
                 v.severity,
+                v.gate,
                 v.gate,
                 cell(&v.title),
                 location(v)
-                    .map(|l| format!("`{}`", cell(&l)))
+                    .map(|l| format!("`{}`", cell_code(&l)))
                     .unwrap_or_else(|| "—".into()),
                 cell(&v.message),
                 cell(v.remediation.as_deref().unwrap_or("—"))
@@ -347,14 +408,17 @@ fn render_step_outputs(
         "fail"
     };
     let mut fired: Vec<&str> = summary.violations().map(|v| v.gate).collect();
+    fired.sort_unstable();
     fired.dedup();
     let mut overridden: Vec<&str> = summary.overrides().map(|o| o.gate.as_str()).collect();
+    overridden.sort_unstable();
     overridden.dedup();
     let (passed, _failed, _disabled, examined) =
         summary.gate_counts(fail_on_warnings, fail_on_overrides);
     writeln!(file, "errors={}", summary.errors)?;
     writeln!(file, "warnings={}", summary.warnings)?;
     writeln!(file, "overrides={}", summary.total_overrides())?;
+    writeln!(file, "baselined={}", summary.baselined)?;
     writeln!(file, "status={status}")?;
     writeln!(file, "failed_gates={}", fired.join(","))?;
     writeln!(file, "overridden_gates={}", overridden.join(","))?;
@@ -371,8 +435,13 @@ pub fn format_agent_prompt(summary: &CheckSummary) -> String {
     if violations.is_empty() {
         let (passed, _, _, examined) = summary.gate_counts(false, false);
         let items_label = if examined == 1 { "item" } else { "items" };
+        let baselined_part = if summary.baselined > 0 {
+            format!(" · {} baselined findings not blocking", summary.baselined)
+        } else {
+            String::new()
+        };
         return format!(
-            "No discipline violations found ({passed} gates passed, {examined} {items_label} examined).\n"
+            "No discipline violations found ({passed} gates passed, {examined} {items_label} examined{baselined_part}).\n"
         );
     }
 
@@ -422,7 +491,7 @@ pub fn repair_action_for_violation(v: &Violation) -> String {
         "forbidden-words" => {
             "Remove the forbidden term and replace it with precise architectural or technical layer terminology (e.g. engine, runtime, AST parser, memory hierarchy).".to_string()
         }
-        "host-leaks" => {
+        "pii" | "host-leaks" => {
             "Remove local absolute paths, usernames, LAN IPs, or private hostnames from the file.".to_string()
         }
         "command" => {
@@ -437,7 +506,7 @@ pub fn repair_action_for_violation(v: &Violation) -> String {
         "bench-regression" => {
             "Optimize the code to eliminate the performance or cycle count regression.".to_string()
         }
-        "golden-tests" => {
+        "golden-output" | "golden-tests" => {
             "Restore or regenerate the golden test output to match expected behavior.".to_string()
         }
         "nul-bytes" => {
@@ -465,32 +534,19 @@ pub fn repair_action_for_violation(v: &Violation) -> String {
 
 /// Strictly scrubs any override directive syntax, ensuring AI coding agents cannot learn bypass tokens.
 pub fn scrub_override_directives(input: &str) -> String {
-    let directive_patterns = [
-        "allow-assertion-drop",
-        "allow-command",
-        "allow-dependency",
-        "allow-test-shrink",
-        "allow-test-budget",
-        "allow-gate-weakening",
-        "allow-golden-update",
-        "allow-nul-byte",
-        "allow-nul",
-        "allow-corrupt",
-        "allow-regression",
-        "allow-bench-regression",
-        "allow-ignored-test",
-        "allow-ignore",
-        "allow-vacuous-test",
-        "allow-unsafe",
+    let mut result = input.to_string();
+    for pat in crate::tokens::ALL_DIRECTIVE_NAMES {
+        result = result.replace(pat, "[redacted-directive]");
+    }
+    for extra in &[
         "discipline:allow",
         "allow(",
+        "docs-lint: allow",
+        "docs-lint:allow",
         "removes:",
         "deletes:",
-    ];
-
-    let mut result = input.to_string();
-    for pat in &directive_patterns {
-        result = result.replace(pat, "[redacted-directive]");
+    ] {
+        result = result.replace(extra, "[redacted-directive]");
     }
     result
 }
@@ -566,9 +622,12 @@ mod tests {
             base: "main".to_string(),
             errors: 5,
             warnings: 0,
+            notes: 0,
             overrides: 0,
+            baselined: 0,
             outcomes: vec![o1, o2, o3, o4, o5],
             planned_gates: vec![],
+            policy_failures: Vec::new(),
         };
 
         let prompt = format_agent_prompt(&summary);
@@ -624,9 +683,12 @@ mod tests {
             base: "main".to_string(),
             errors: 0,
             warnings: 0,
+            notes: 0,
             overrides: 0,
+            baselined: 0,
             outcomes: vec![o1, o2, o3],
             planned_gates: vec![],
+            policy_failures: Vec::new(),
         };
 
         let mut buf = Vec::new();
@@ -659,9 +721,12 @@ mod tests {
             base: "main".to_string(),
             errors: 1,
             warnings: 0,
+            notes: 0,
             overrides: 0,
+            baselined: 0,
             outcomes: vec![o1],
             planned_gates: vec![],
+            policy_failures: Vec::new(),
         };
 
         let mut buf = Vec::new();
@@ -687,15 +752,64 @@ mod tests {
             base: "main".to_string(),
             errors: 0,
             warnings: 0,
+            notes: 0,
             overrides: 0,
+            baselined: 0,
             outcomes: vec![o1, o2],
             planned_gates: vec![],
+            policy_failures: Vec::new(),
         };
 
         let prompt = format_agent_prompt(&summary);
         assert_eq!(
             prompt,
             "No discipline violations found (2 gates passed, 51 items examined).\n"
+        );
+    }
+
+    #[test]
+    fn test_render_step_summary_escapes_html_in_table_cells() {
+        let mut o1 = GateOutcome::new("shell-secrets");
+        o1.examined = 1;
+        o1.violations.push(Violation {
+            gate: "shell-secrets",
+            severity: Severity::Error,
+            title: "Secret <Key> Detected".into(),
+            file: Some("<pr-body>".into()),
+            line: Some(42),
+            message: "Contains <token> & raw `value`".into(),
+            remediation: Some("Replace <token> with env var".into()),
+        });
+
+        let summary = CheckSummary {
+            base: "main".to_string(),
+            errors: 1,
+            warnings: 0,
+            notes: 0,
+            overrides: 0,
+            baselined: 0,
+            outcomes: vec![o1],
+            planned_gates: vec![],
+            policy_failures: Vec::new(),
+        };
+
+        let mut buf = Vec::new();
+        render_step_summary_to_writer(&mut buf, &summary, false, false).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(
+            out.contains("**Secret &lt;Key&gt; Detected**"),
+            "expected escaped title in: {out}"
+        );
+        assert!(
+            out.contains(
+                "Contains &lt;token&gt; &amp; raw `value`<br>_Replace &lt;token&gt; with env var_"
+            ),
+            "expected escaped message and remediation in: {out}"
+        );
+        assert!(
+            out.contains("`<pr-body>:42`"),
+            "expected code span for location to retain raw backtick content in: {out}"
         );
     }
 }

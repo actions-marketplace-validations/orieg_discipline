@@ -54,6 +54,11 @@ impl Run {
             .collect()
     }
 
+    /// Violations a gate reported as JSON Values.
+    pub fn violations(&self, gate: &str) -> Vec<Value> {
+        self.outcome(gate)["violations"].as_array().unwrap().clone()
+    }
+
     pub fn outcome(&self, gate: &str) -> Value {
         self.json()["outcomes"]
             .as_array()
@@ -65,7 +70,7 @@ impl Run {
     }
 }
 
-const ISOLATED_ENV_VARS: &[&str] = &[
+pub const ISOLATED_ENV_VARS: &[&str] = &[
     "PR_BODY",
     "PR_TITLE",
     "GITHUB_STEP_SUMMARY",
@@ -78,20 +83,94 @@ const ISOLATED_ENV_VARS: &[&str] = &[
     "FORGEJO_ACTIONS",
     "DISCIPLINE_CONFIG",
     "DISCIPLINE_CONFIG_OVERRIDE",
+    "DISCIPLINE_REPLAY_CASE",
     "DISCIPLINE_ENABLE",
     "DISCIPLINE_DISABLE",
     "DISCIPLINE_BASE_REF",
     "DISCIPLINE_FAIL_ON_WARNINGS",
     "DISCIPLINE_FAIL_ON_OVERRIDES",
+    "DISCIPLINE_ADVISORY",
+    "DISCIPLINE_COMMENT",
+    "DISCIPLINE_POLICY_FROM",
     "DISCIPLINE_DIRECTIVE_SOURCES",
     "DISCIPLINE_HOSTNAME_DENYLIST",
     "DISCIPLINE_REPORT_GITLAB",
     "DISCIPLINE_REPORT_JUNIT",
     "DISCIPLINE_REPORT_SARIF",
+    "DISCIPLINE_BASELINE",
+    "DISCIPLINE_NO_BASELINE",
+    "DISCIPLINE_CI_CONTEXT",
+    "GITHUB_REPOSITORY",
+    "GITHUB_ACTIONS",
+    "GITHUB_SERVER_URL",
+    "GITEA_ACTIONS",
+    "CI_SERVER_URL",
+    "CI_PROJECT_PATH",
+    "DISCIPLINE_FORGE",
+    "DISCIPLINE_FORGE_URL",
+    "DISCIPLINE_FORGE_REPO",
+    "DISCIPLINE_FORGE_TOKEN",
+    "GITEA_TOKEN",
+    "FORGEJO_TOKEN",
+    "GITLAB_TOKEN",
+    "CI_PIPELINE_SOURCE",
+    "DISCIPLINE_ALLOW_COMMAND_CHANGE",
+    "DISCIPLINE_ALLOW_CROSS_HOST_BENCH",
+    "DISCIPLINE_BENCH_BASE_FILE",
+    "DISCIPLINE_BENCH_HEAD_FILE",
+    "DISCIPLINE_BENCH_PROVENANCE",
+    "DISCIPLINE_COMMAND",
+    "DISCIPLINE_TRUST_WORKSPACE",
+    "DOCS_HOSTNAME_DENYLIST",
+    "FORGEJO_EVENT_NAME",
+    "GITEA_EVENT_NAME",
+    "GITHUB_HEAD_REF",
+    "GITHUB_OUTPUT",
+    "GITHUB_REF",
+    "GITHUB_REF_NAME",
+    "GITHUB_REF_TYPE",
+    "GITHUB_WORKFLOW_REF",
+    "GITHUB_REPOSITORY_OWNER",
+    "DISCIPLINE_FORGE_API_URL",
+    "DISCIPLINE_FORGE_ALLOW_HTTP",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
     "GITLAB_CI",
     "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",
     "CI_MERGE_REQUEST_DIFF_BASE_SHA",
     "CI_DEFAULT_BRANCH",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_BEFORE",
+    "GITEA_EVENT_BEFORE",
+    "FORGEJO_EVENT_BEFORE",
+    "CI_COMMIT_BEFORE_SHA",
+    "DISCIPLINE_ACTOR",
+    "GITHUB_ACTOR",
+    "GITEA_ACTOR",
+    "FORGEJO_ACTOR",
+    "GITLAB_USER_LOGIN",
+    "CI_MERGE_REQUEST_IID",
+    "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA",
+    "CI_COMMIT_SHA",
+];
+
+/// Configuration every harness git command runs with. No signing and no hooks, and no
+/// automatic maintenance: since git 2.54 a commit ends with a detached
+/// `git maintenance run --auto` whose repack fires on two loose objects in `objects/17/`,
+/// so a test repository could be repacked in the background mid-test.
+const HARNESS_GIT_CONFIG: &[&str] = &[
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "gc.auto=0",
 ];
 
 impl Repo {
@@ -127,12 +206,7 @@ impl Repo {
     pub fn git(&self, args: &[&str]) {
         let out = Command::new("git")
             .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
-            .args([
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-            ])
+            .args(HARNESS_GIT_CONFIG)
             .args(args)
             .current_dir(self.path())
             .output()
@@ -142,6 +216,22 @@ impl Repo {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    pub fn git_output(&self, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.email=t@example.invalid", "-c", "user.name=t"])
+            .args(HARNESS_GIT_CONFIG)
+            .args(args)
+            .current_dir(self.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     pub fn commit(&self, message: &str) {
@@ -223,6 +313,14 @@ impl Repo {
         for var in ISOLATED_ENV_VARS {
             cmd.env_remove(var);
         }
+        // Prefix-built names too (`DISCIPLINE_COMMAND_<GATE>`, ...).
+        for (k, _) in std::env::vars() {
+            if k.starts_with("DISCIPLINE_") {
+                cmd.env_remove(k);
+            }
+        }
+        // No test reaches a real forge: only a loopback FakeForge is allowed.
+        cmd.env("DISCIPLINE_NO_NETWORK", "1");
         let has_pr_body = env.iter().any(|(k, _)| *k == "PR_BODY");
         let has_pr_title = env.iter().any(|(k, _)| *k == "PR_TITLE");
         if has_pr_body && !has_pr_title {
@@ -243,6 +341,13 @@ impl Repo {
         for var in ISOLATED_ENV_VARS {
             cmd.env_remove(var);
         }
+        // Prefix-built names too (`DISCIPLINE_COMMAND_<GATE>`, ...).
+        for (k, _) in std::env::vars() {
+            if k.starts_with("DISCIPLINE_") {
+                cmd.env_remove(k);
+            }
+        }
+        cmd.env("DISCIPLINE_NO_NETWORK", "1");
         cmd.envs(env.iter().copied());
         let out = cmd.output().unwrap();
         Run {
@@ -250,5 +355,128 @@ impl Repo {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
+    }
+}
+
+/// Canned responses by API path: status, extra headers, body.
+type Routes = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, (u16, Vec<(String, String)>, String)>>,
+>;
+/// Recorded requests: path and lower-cased headers.
+type Requests = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>;
+/// Recorded writes: method, path and body.
+type Writes = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+/// A forge REST API on a loopback port: canned responses by path, every request recorded.
+/// Unknown paths answer 403 with a rate-limit message, like an exhausted anonymous quota.
+pub struct FakeForge {
+    addr: std::net::SocketAddr,
+    routes: Routes,
+    requests: Requests,
+    writes: Writes,
+}
+
+impl FakeForge {
+    pub fn start() -> Self {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let routes: Routes = Default::default();
+        let requests: Requests = Default::default();
+        let writes: Writes = Default::default();
+        let (r, q, w) = (routes.clone(), requests.clone(), writes.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let method = line.split_whitespace().next().unwrap_or("GET").to_string();
+                let target = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let mut headers = Vec::new();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.trim_end().split_once(':') {
+                        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                    }
+                }
+                let path = target.trim_start_matches('/').to_string();
+                let length: usize = headers
+                    .iter()
+                    .find(|(k, _)| k == "content-length")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(0);
+                if method != "GET" {
+                    let mut body = vec![0u8; length];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                    w.lock().unwrap().push((
+                        method.clone(),
+                        path.clone(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    ));
+                }
+                q.lock().unwrap().push((path.clone(), headers));
+                let (status, extra, body) = r.lock().unwrap().get(&path).cloned().unwrap_or((
+                    403,
+                    Vec::new(),
+                    r#"{"message":"API rate limit exceeded"}"#.to_string(),
+                ));
+                let mut resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (k, v) in extra {
+                    resp.push_str(&format!("{k}: {v}\r\n"));
+                }
+                resp.push_str("\r\n");
+                resp.push_str(&body);
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        Self {
+            addr,
+            routes,
+            requests,
+            writes,
+        }
+    }
+
+    /// Base URL for `DISCIPLINE_FORGE_API_URL`.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Answer `path` (relative to the API base, with any query) with 200 and `body`.
+    pub fn serve(&self, path: &str, body: Value) {
+        self.serve_raw(path, 200, &[], &body.to_string());
+    }
+
+    pub fn serve_raw(&self, path: &str, status: u16, headers: &[(&str, &str)], body: &str) {
+        self.routes.lock().unwrap().insert(
+            path.trim_start_matches('/').to_string(),
+            (
+                status,
+                headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                body.to_string(),
+            ),
+        );
+    }
+
+    /// Writes received so far: method, path and body.
+    pub fn writes(&self) -> Vec<(String, String, String)> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    /// Requests received so far: path and lower-cased headers.
+    pub fn requests(&self) -> Vec<(String, Vec<(String, String)>)> {
+        self.requests.lock().unwrap().clone()
     }
 }

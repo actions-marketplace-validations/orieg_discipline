@@ -22,7 +22,8 @@ spec:
         value: ""
         description: "Pull request body markdown text for directive and hygiene inspection"
       - name: discipline-image
-        value: "ghcr.io/orieg/discipline:latest"
+        # Major tag tracks the latest v0 release; pin an exact version (v0.12.2) or a digest for reproducible gating.
+        value: "ghcr.io/orieg/discipline:v0"
         description: "Discipline container image"
 
   templates:
@@ -101,6 +102,8 @@ spec:
         env:
           - name: PR_BODY
             value: "{{inputs.parameters.pr-body}}"
+          - name: DISCIPLINE_TRUST_WORKSPACE
+            value: "1"
         command: ["/bin/sh", "-c"]
         args:
           - |

@@ -4,10 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Discipline — Universal CI/CD Diff Sentinel & AI Coding Agent Gatekeeper</title>
-  <meta name="description" content="Universal CI/CD diff sentinel and AI coding agent gatekeeper built in Rust. Traverses AST diffs via tree-sitter to reject assertion weakening, vacuous tests, unannotated unsafe, and test erosion.">
+  <meta name="description" content="Universal CI/CD diff sentinel and AI coding agent gatekeeper built in Rust. Traverses AST diffs via tree-sitter to reject assertion weakening, vacuous and mock-only tests, stub bodies, swallowed errors, loosened toolchain configuration, and prompt injection in comments.">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Discipline — Universal CI/CD Diff Sentinel & AI Coding Agent Gatekeeper">
-  <meta property="og:description" content="Universal CI/CD diff sentinel and AI coding agent gatekeeper built in Rust. Prevents assertion weakening, vacuous tests, unannotated unsafe, and algorithmic regressions.">
+  <meta property="og:description" content="Universal CI/CD diff sentinel and AI coding agent gatekeeper built in Rust. Prevents assertion weakening, vacuous and mock-only tests, stub bodies, swallowed errors, loosened toolchain configuration, and prompt injection in comments.">
   <meta property="og:url" content="https://orieg.github.io/discipline/">
   <meta property="og:site_name" content="Discipline">
   <meta name="twitter:card" content="summary_large_image">
@@ -567,6 +567,37 @@
     .badge-warn { background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.3); }
     .badge-lang { background: var(--card-inner); color: var(--text-muted); border: 1px solid var(--border); }
 
+    /* Gate Search Bar */
+    .gate-search-wrapper {
+      margin-bottom: 1.25rem;
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .gate-search-input {
+      flex: 1;
+      min-width: 240px;
+      max-width: 480px;
+      padding: 0.65rem 1rem;
+      font-size: 0.92rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--card-inner);
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .gate-search-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+    }
+    .gate-count {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+    }
+
     /* Override box */
     .directive-card {
       background: var(--card-inner);
@@ -763,6 +794,10 @@
     <li><a href="#gates">Gate Reference</a></li>
     <li><a href="#architecture">Architecture</a></li>
     <li><a href="#install">Install</a></li>
+    <li><a href="tutorials/getting-started/">Tutorial</a></li>
+    <li><a href="https://github.com/orieg/discipline/blob/main/docs/CONFIGURATION.md">Docs</a></li>
+    <li><a href="apt/">APT</a></li>
+    <li><a href="rpm/">RPM</a></li>
   </ul>
 
   <div class="nav-actions">
@@ -791,7 +826,7 @@
 
     <h1>Universal CI/CD Diff Sentinel &<br><span>AI Coding Agent Gatekeeper</span></h1>
     <p class="hero-sub">
-      Traverses AST diffs via tree-sitter over merge-base git graphs. Rejects assertion weakening, vacuous tests, unannotated <code>unsafe</code>, test suppression, and algorithmic regressions across pull requests and merge requests.
+      Traverses AST diffs via tree-sitter over merge-base git graphs. Rejects assertion weakening, vacuous and mock-only tests, stub bodies, swallowed errors, test suppression, loosened toolchain configuration, and text aimed at the next agent, across pull requests and merge requests. And it guards its own trust boundary: a change cannot switch its run to advisory or excuse itself without review.
     </p>
 
     <div class="hero-actions">
@@ -803,20 +838,20 @@
     <!-- Stat Bar -->
     <div class="stat-bar">
       <div class="stat-item">
-        <h3>12</h3>
-        <p>Active Fail-Closed Gates</p>
+        <h3>37</h3>
+        <p>Fail-Closed Gates</p>
       </div>
       <div class="stat-item">
-        <h3>4</h3>
-        <p>AST Language Packs (RS, PY, TS, PHPT)</p>
+        <h3>14</h3>
+        <p>AST Language Packs</p>
       </div>
       <div class="stat-item">
-        <h3>7</h3>
+        <h3>9</h3>
         <p>Supported CI Integrations</p>
       </div>
       <div class="stat-item">
         <h3>0</h3>
-        <p>External Network Calls</p>
+        <p>Network Calls by Default</p>
       </div>
     </div>
   </header>
@@ -833,7 +868,7 @@
         <div>
           <div class="card-icon-box">&#x1f333;</div>
           <h3>Tree-Sitter AST Diff Inspection</h3>
-          <p>Unlike fragile regex checks that trigger on comments or log messages, Discipline parses the complete AST of changed functions against the merge base. It accurately counts executable assertions and distinguishes real invariants from dead code.</p>
+          <p>Unlike fragile regex checks that trigger on comments or log messages, Discipline parses the complete AST of changed functions against the merge base. It counts executable assertions and distinguishes real invariants from dead code: an assertion under <code>if false</code> or after a <code>return</code> counts for nothing, and a property-test budget inside a string or comment is not a budget. Fourteen packs: Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C.</p>
         </div>
         <div class="card-tags">
           <span class="card-tag">tree-sitter-rust</span>
@@ -846,12 +881,18 @@
         <div>
           <div class="card-icon-box">&#x1f916;</div>
           <h3>AI Coding Agent Guardrails</h3>
-          <p>Flags silent test erosion: assertion count reductions (e.g. <code>assert_eq!</code> &rarr; <code>assert!</code>), test suppression (<code>#[ignore]</code>, <code>@pytest.mark.skip</code>, <code>it.skip</code>), tautological vacuous tests (<code>assert!(true)</code>), and stealth test deletions.</p>
+          <p>Flags silent test erosion: assertion count reductions (e.g. <code>assert_eq!</code> &rarr; <code>assert!</code>), test suppression and retries (<code>#[ignore]</code>, <code>@pytest.mark.flaky</code>, <code>it.skip</code>), tautological or mock-only tests (<code>assert!(true)</code>, <code>toHaveBeenCalled</code> alone), stealth test deletions, stub bodies even when padded with a log line (<code>todo!()</code>, <code>raise NotImplementedError</code>), swallowed errors (<code>except: pass</code>, a handler that only logs, <code>let _ = fallible()</code>, <code>rescue nil</code>, PHP <code>@call()</code>), a snapshot added for a test that already existed, a repointed lockfile entry, hard-coded sleeps and not-null-only assertions, and injection text in comments, PR descriptions or agent instruction files.</p>
         </div>
         <div class="card-tags">
           <span class="card-tag">Claude Code</span>
-          <span class="card-tag">Gemini CLI</span>
-          <span class="card-tag">Codex / Copilot</span>
+          <span class="card-tag">Codex CLI</span>
+          <span class="card-tag">Cursor</span>
+          <span class="card-tag">Aider</span>
+          <span class="card-tag">Copilot CLI</span>
+          <span class="card-tag">Antigravity</span>
+          <span class="card-tag">Qwen Code</span>
+          <span class="card-tag">OpenCode</span>
+          <span class="card-tag">MCP</span>
         </div>
       </div>
 
@@ -859,7 +900,7 @@
         <div>
           <div class="card-icon-box">&#x1f512;</div>
           <h3>Fail-Closed Engineering</h3>
-          <p>If git history cannot be resolved, a clone is shallow, or a configuration file is malformed, Discipline exits with code <code>2</code>. It never yields a false-positive pass on broken pipelines or empty diff outputs.</p>
+          <p>If git history cannot be resolved, a clone is shallow, or a configuration file is malformed, Discipline exits with code <code>2</code>. It never yields a false-positive pass on broken pipelines or empty diff outputs. The trust boundary is guarded too: a change cannot switch its own run to advisory, disable <code>config-integrity</code>, loosen <code>tsconfig.json</code> / <code>ruff.toml</code> / <code>[lints]</code> / coverage floors, mask the CI step, or add a <code>postinstall</code> hook or a <code>.npmrc</code> registry that runs on every install, without a scoped directive.</p>
         </div>
         <div class="card-tags">
           <span class="card-tag">exit 0: pass</span>
@@ -900,6 +941,7 @@
         <button class="platform-btn" data-target="pane-docker">Container (Docker)</button>
         <button class="platform-btn" data-target="pane-precommit">pre-commit</button>
         <button class="platform-btn" data-target="pane-cli">Standalone CLI</button>
+        <button class="platform-btn" data-target="pane-agents">Coding Agents</button>
       </nav>
 
       <!-- GitHub Actions -->
@@ -923,7 +965,7 @@
   <span class="code-prop">sentinel:</span>
     <span class="code-prop">runs-on:</span> ubuntu-latest
     <span class="code-prop">steps:</span>
-      - <span class="code-prop">uses:</span> actions/checkout@v4
+      - <span class="code-prop">uses:</span> actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 <span class="code-comment"># v7.0.1</span>
         <span class="code-prop">with:</span>
           <span class="code-prop">fetch-depth:</span> 0   <span class="code-comment"># Ensure git merge-base is reachable</span>
 
@@ -938,9 +980,9 @@
         <p style="margin-bottom: 1rem; color: var(--text-muted); font-size: 0.9rem;">
           Native GitLab CI/CD integration. Populates GitLab Merge Request Code Quality diffs and JUnit test reports.
         </p>
-        <div class="code-block"><span class="code-comment"># .gitlab-ci.yml using the Discipline CI/CD Component</span>
+        <div class="code-block"><span class="code-comment"># .gitlab-ci.yml including the Discipline job template, pinned to a release</span>
 <span class="code-keyword">include:</span>
-  - <span class="code-prop">component:</span> $CI_SERVER_FQDN/orieg/discipline/discipline@v0.2.0
+  - <span class="code-prop">remote:</span> https://raw.githubusercontent.com/orieg/discipline/v0.12.2/templates/discipline.gitlab-ci.yml
     <span class="code-prop">inputs:</span>
       <span class="code-prop">stage:</span> test
       <span class="code-prop">allow_failure:</span> false
@@ -949,7 +991,7 @@
 <span class="code-prop">discipline:gate:</span>
   <span class="code-prop">stage:</span> test
   <span class="code-prop">image:</span>
-    <span class="code-prop">name:</span> ghcr.io/orieg/discipline:latest
+    <span class="code-prop">name:</span> ghcr.io/orieg/discipline:v0
     <span class="code-prop">entrypoint:</span> [<span class="code-string">""</span>]
   <span class="code-prop">variables:</span>
     <span class="code-prop">GIT_STRATEGY:</span> clone
@@ -988,7 +1030,7 @@
   <span class="code-prop">discipline:</span>
     <span class="code-prop">runs-on:</span> ubuntu-latest
     <span class="code-prop">steps:</span>
-      - <span class="code-prop">uses:</span> actions/checkout@v4
+      - <span class="code-prop">uses:</span> actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 <span class="code-comment"># v7.0.1</span>
         <span class="code-prop">with:</span>
           <span class="code-prop">fetch-depth:</span> 0
 
@@ -1014,7 +1056,7 @@
   <span class="code-prop">discipline:</span>
     <span class="code-prop">runs-on:</span> ubuntu-latest
     <span class="code-prop">steps:</span>
-      - <span class="code-prop">uses:</span> actions/checkout@v4
+      - <span class="code-prop">uses:</span> actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 <span class="code-comment"># v7.0.1</span>
         <span class="code-prop">with:</span>
           <span class="code-prop">fetch-depth:</span> 0
 
@@ -1067,7 +1109,7 @@ docker run --rm \
         <div class="code-block"><span class="code-comment"># .pre-commit-config.yaml</span>
 <span class="code-prop">repos:</span>
   - <span class="code-prop">repo:</span> https://github.com/orieg/discipline
-    <span class="code-prop">rev:</span> v0.2.0
+    <span class="code-prop">rev:</span> v0.12.2
     <span class="code-prop">hooks:</span>
       - <span class="code-prop">id:</span> discipline         <span class="code-comment"># Compiles via cargo</span>
       <span class="code-comment"># - id: discipline-system   # Or uses binary on PATH</span></div>
@@ -1088,7 +1130,34 @@ discipline check --staged
 discipline gates
 
 <span class="code-comment"># Run embedded verification controls</span>
-discipline self-test</div>
+discipline self-test
+
+<span class="code-comment"># What a gate checks, and what your last 50 merged changes would have hit</span>
+discipline explain assertion-reduction
+discipline replay --last 50</div>
+      </div>
+
+      <!-- Coding agents -->
+      <div class="platform-pane" id="pane-agents">
+        <p style="margin-bottom: 1rem; color: var(--text-muted); font-size: 0.9rem;">
+          Tell the agent while it edits: the hook blocks an edit that weakens a test and hands the agent the repair, judged by the default branch's configuration so the change cannot switch its own check off.
+        </p>
+        <div class="code-block"><span class="code-comment"># Claude Code, Codex, Cursor, Aider, Copilot CLI, agy, Qwen Code or OpenCode</span>
+discipline hook install --agent claude-code
+
+<span class="code-comment"># Any MCP client: register the server (tools: check_diff, list_gates, explain_finding)</span>
+claude mcp add discipline -- discipline mcp
+
+<span class="code-comment"># What the agent reads after an edit that weakens a test (exit 2)</span>
+### Issue 1 [assertion-reduction]: Assertion Reduction In Existing Test
+- Location: tests/cart.rs:6
+- Problem: Test `adds`: effective assertions dropped from 2 to 0.
+- Repair: Restore the assertions that were removed or weakened ...</div>
+        <p style="margin-top: 1rem; color: var(--text-muted); font-size: 0.9rem;">
+          Every agent's contract, the MCP registration for each client, and what a change cannot do to its check:
+          <a href="https://github.com/orieg/discipline/blob/main/docs/CONFIGURATION.md#agent-hooks">Agent Hooks</a> and
+          <a href="https://github.com/orieg/discipline/blob/main/docs/CONFIGURATION.md#mcp-server">MCP Server</a>.
+        </p>
       </div>
     </div>
   </section>
@@ -1100,13 +1169,20 @@ discipline self-test</div>
       <p class="section-desc">Every gate operates with fail-closed semantics, truthful examination counts, and explicit remediation instructions.</p>
     </div>
 
+    <div class="gate-search-wrapper">
+<!-- generated:gate-search -->
+      <input type="text" id="gate-search" class="gate-search-input" placeholder="Search 37 gates by id, category, language, or rule..." aria-label="Search active gates">
+      <span id="gate-count" class="gate-count">Showing 37 of 37 gates</span>
+<!-- /generated -->
+    </div>
+
     <div class="gate-table-wrapper">
       <table class="gate-table">
         <thead>
           <tr>
             <th>Gate ID</th>
             <th>Category</th>
-            <th>Severity</th>
+            <th>Default</th>
             <th>Languages</th>
             <th>Rule Description</th>
           </tr>
@@ -1116,7 +1192,7 @@ discipline self-test</div>
           <tr>
             <td class="gate-id">agents-md</td>
             <td>Agent Guard</td>
-            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-warn">Warning</span></td>
             <td><span class="gate-badge badge-lang">Any</span></td>
             <td>AGENTS.md exists; CLAUDE.md / GEMINI.md do not fork it</td>
           </tr>
@@ -1124,21 +1200,21 @@ discipline self-test</div>
             <td class="gate-id">assertion-reduction</td>
             <td>Agent Guard</td>
             <td><span class="gate-badge badge-error">Error</span></td>
-            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby</span></td>
+            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C</span></td>
             <td>assertion count / strength must not drop in an existing test</td>
           </tr>
           <tr>
             <td class="gate-id">vacuous-tests</td>
             <td>Agent Guard</td>
             <td><span class="gate-badge badge-error">Error</span></td>
-            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby</span></td>
+            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C</span></td>
             <td>new tests must carry a non-tautological assertion</td>
           </tr>
           <tr>
             <td class="gate-id">ignored-tests</td>
             <td>Agent Guard</td>
             <td><span class="gate-badge badge-error">Error</span></td>
-            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby</span></td>
+            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, PHPT, Java, Go, PHP, C/C++, C#, Ruby, Kotlin, Swift, Scala, Objective-C</span></td>
             <td>tests must not be newly #[ignore]d or skipped without directive</td>
           </tr>
           <tr>
@@ -1158,7 +1234,7 @@ discipline self-test</div>
           <tr>
             <td class="gate-id">time-estimates</td>
             <td>Hygiene</td>
-            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-warn">Warning</span></td>
             <td><span class="gate-badge badge-lang">Any</span></td>
             <td>no calendar / duration estimates in markdown or the PR body</td>
           </tr>
@@ -1186,9 +1262,16 @@ discipline self-test</div>
           <tr>
             <td class="gate-id">issue-link</td>
             <td>Hygiene</td>
-            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
             <td><span class="gate-badge badge-lang">Any</span></td>
             <td>PR title or description links a tracking issue (#123, Fixes #123)</td>
+          </tr>
+          <tr>
+            <td class="gate-id">commit-provenance</td>
+            <td>Hygiene</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>commits carry the required trailers; an agent-produced commit carries a review by someone else</td>
           </tr>
           <tr>
             <td class="gate-id">config-integrity</td>
@@ -1198,9 +1281,58 @@ discipline self-test</div>
             <td>a change cannot weaken its own discipline.toml without a token</td>
           </tr>
           <tr>
+            <td class="gate-id">stub-bodies</td>
+            <td>Agent Guard</td>
+            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective-C</span></td>
+            <td>added functions are not stubs; existing bodies are not replaced by todo!() / NotImplementedError / return null</td>
+          </tr>
+          <tr>
+            <td class="gate-id">error-swallowing</td>
+            <td>Agent Guard</td>
+            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective-C</span></td>
+            <td>no new empty error handler or discarded Result outside tests</td>
+          </tr>
+          <tr>
+            <td class="gate-id">instruction-smuggling</td>
+            <td>Agent Guard</td>
+            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">any (invisible characters, instruction files); Rust, Python, JS/TS, Go, Java, C#, PHP, Ruby, C/C++, Kotlin, Swift, Scala, Objective-C and prose files (phrases)</span></td>
+            <td>no invisible Unicode, unreviewed agent-instruction edits, or instruction-like text in comments and prose</td>
+          </tr>
+          <tr>
+            <td class="gate-id">build-hooks</td>
+            <td>Integrity</td>
+            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">package.json, build.rs, setup.py, .npmrc, .pypirc, pip.conf, .cargo/config.toml, .env*</span></td>
+            <td>install and build hooks that gain network or shell access, and package-manager configuration edits, need a token</td>
+          </tr>
+          <tr>
+            <td class="gate-id">toolchain-config</td>
+            <td>Integrity</td>
+            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">tsconfig, ruff, mypy, pytest, coverage, flake8, Cargo lints, rustflags, nextest, eslintrc, golangci, jest, codecov, phpstan, phpunit</span></td>
+            <td>compiler, linter, type-checker, test-runner and coverage configuration cannot be loosened without a token</td>
+          </tr>
+          <tr>
+            <td class="gate-id">scope-confinement</td>
+            <td>Agent Guard</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>changes stay inside authorized paths</td>
+          </tr>
+          <tr>
+            <td class="gate-id">suppression-delta</td>
+            <td>Agent Guard</td>
+            <td><span class="gate-badge badge-warn">Warning</span></td>
+            <td><span class="gate-badge badge-lang">per pack</span></td>
+            <td>newly added linter / compiler suppression annotations</td>
+          </tr>
+          <tr>
             <td class="gate-id">provenance-tags</td>
             <td>Hygiene</td>
-            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
             <td><span class="gate-badge badge-lang">Any</span></td>
             <td>published numerics carry (measured|target|projected)</td>
           </tr>
@@ -1210,6 +1342,13 @@ discipline self-test</div>
             <td><span class="gate-badge badge-error">Error</span></td>
             <td><span class="gate-badge badge-lang">Any</span></td>
             <td>workflow weakening: continue-on-error, || true, unpinned actions</td>
+          </tr>
+          <tr>
+            <td class="gate-id">ci-skip-set</td>
+            <td>Integrity</td>
+            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>rollup skip set matches each job's `if:` under the observed filter outputs</td>
           </tr>
           <tr>
             <td class="gate-id">test-floor</td>
@@ -1240,6 +1379,13 @@ discipline self-test</div>
             <td>property-test and fuzz effort ratchet (cases, shrink iters, fuzztime, seed corpus)</td>
           </tr>
           <tr>
+            <td class="gate-id">pr-checklist</td>
+            <td>Hygiene</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>ticked PR checkboxes are reconciled against the diff</td>
+          </tr>
+          <tr>
             <td class="gate-id">command</td>
             <td>Verification</td>
             <td><span class="gate-badge badge-error">Error</span></td>
@@ -1247,11 +1393,60 @@ discipline self-test</div>
             <td>fail-closed wrapper for any tool: zero-tests guard, canary, count ratchet</td>
           </tr>
           <tr>
+            <td class="gate-id">sanitizers</td>
+            <td>Verification</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Rust, C/C++</span></td>
+            <td>ASan / TSan preset with audited suppressions and a race canary</td>
+          </tr>
+          <tr>
+            <td class="gate-id">msrv</td>
+            <td>Quality</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Rust</span></td>
+            <td>cargo check under the pinned MSRV</td>
+          </tr>
+          <tr>
+            <td class="gate-id">miri</td>
+            <td>Verification</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Rust</span></td>
+            <td>Miri tiers with zero-tests guard</td>
+          </tr>
+          <tr>
+            <td class="gate-id">unsafe-budget</td>
+            <td>Verification</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Rust</span></td>
+            <td>unsafe count ratchet</td>
+          </tr>
+          <tr>
             <td class="gate-id">bench-regression</td>
             <td>Performance</td>
-            <td><span class="gate-badge badge-error">Error</span></td>
+            <td><span class="gate-badge badge-warn">Warning</span></td>
             <td><span class="gate-badge badge-lang">Rust, Go, Python, C/C++</span></td>
             <td>benchmark drift via harness adapters (deterministic counts or BCa intervals)</td>
+          </tr>
+          <tr>
+            <td class="gate-id">archive-contents</td>
+            <td>Integrity</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>distribution archive must contain required paths and zero forbidden developer artifacts</td>
+          </tr>
+          <tr>
+            <td class="gate-id">manifest-sync</td>
+            <td>Integrity</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>reconcile git-tracked files against packaging manifest declarations</td>
+          </tr>
+          <tr>
+            <td class="gate-id">version-lockstep</td>
+            <td>Integrity</td>
+            <td><span class="gate-badge badge-lang">Off</span></td>
+            <td><span class="gate-badge badge-lang">Any</span></td>
+            <td>version declarations across headers, manifests, and files must remain in lockstep</td>
           </tr>
 <!-- /generated -->
         </tbody>
@@ -1262,13 +1457,18 @@ discipline self-test</div>
     <div style="margin-top: 2rem;">
       <h3 style="font-size: 1.15rem; color: var(--heading); margin-bottom: 0.5rem;">Audit-Trailed Override Directives</h3>
       <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.75rem;">
-        Legitimate deletions or changes are authorized through explicit, scoped directives in the PR description or commit message:
+        Legitimate deletions or changes are authorized through explicit, scoped directives in the PR description or commit message; on a push to the default branch, the merged pull request's body is read through the forge (<code>merged-pr-body</code>), because a squash or rebase merge drops it from the commit message. Every applied override is recorded in the report; <code>directives.max_overrides</code> caps them per change, and <code>directives.require_approval</code> makes them count only once the forge shows an approving review of the head commit by a listed reviewer other than the author. <code>policy_from: base</code> judges a change by the base branch's <code>discipline.toml</code>, so a policy edit takes effect once it has merged.
       </p>
       <div class="directive-card">
         removes: tests/legacy/ replaced by proptest property suite<br>
         allow-assertion-drop: test_allocator single large allocation split into benchmark<br>
         allow-ignore: test_darwin_kqueue requires macos runner environment<br>
-        allow-golden-update: tests/snapshots/v2.snap updated for new serializer format
+        allow-golden-update: tests/snapshots/v2.snap updated for new serializer format<br>
+        allow-stub: validate schema lands with the next migration<br>
+        allow-toolchain-weakening: strict migrating the legacy tree file by file<br>
+        allow-agent-instructions: AGENTS.md the new rule was reviewed in #90<br>
+        allow-build-hook: prepare husky installs the commit hooks<br>
+allow-gate-weakening: ci-integrity the discipline step runs on pull_request only; merged-pr-body covers pushes
       </div>
     </div>
 
@@ -1292,7 +1492,7 @@ discipline self-test</div>
     <tr>
       <td class="gate-id">config</td>
       <td><code>discipline.toml</code></td>
-      <td>Path to discipline.toml. When the file is absent, built-in defaults apply (every available gate on).</td>
+      <td>Path to discipline.toml. When the file is absent, built-in defaults apply (each gate at its built-in default enablement and severity).</td>
     </tr>
     <tr>
       <td class="gate-id">suite</td>
@@ -1335,9 +1535,34 @@ discipline self-test</div>
       <td>Treat applied overrides as failures (requires human sign-off).</td>
     </tr>
     <tr>
+      <td class="gate-id">advisory</td>
+      <td><code>false</code></td>
+      <td>Advisory mode: run all checks and emit reports, but exit code 0 even if violations occur.</td>
+    </tr>
+    <tr>
+      <td class="gate-id">comment</td>
+      <td><code>false</code></td>
+      <td>Post the report as one pull-request comment, edited on every run. Needs `pull-requests: write` (GitHub) or a token that can comment; a fork's read-only token is reported, not failed.</td>
+    </tr>
+    <tr>
+      <td class="gate-id">token</td>
+      <td><code>${{ github.token }}</code></td>
+      <td>Token used to post the comment. Passed to discipline only when `comment` is true.</td>
+    </tr>
+    <tr>
+      <td class="gate-id">policy_from</td>
+      <td><code>head</code></td>
+      <td>Which side's discipline.toml judges the change: 'head' (the change's own copy) or 'base' (the base ref's, so a policy edit takes effect once merged; config-integrity still reports it).</td>
+    </tr>
+    <tr>
+      <td class="gate-id">actor</td>
+      <td><code>${{ github.event.pull_request.user.login || github.actor }}</code></td>
+      <td>Login judged against allowed_override_actors. Default: the pull request author (github.event.pull_request.user.login), which the server sets; otherwise github.actor or the forge equivalent. The triggering login is not used on a pull request, since whoever edits the description must not be able to authorize their own override.</td>
+    </tr>
+    <tr>
       <td class="gate-id">directive_sources</td>
       <td><em>(none)</em></td>
-      <td>Comma-separated list of allowed directive sources (pr-body, commits).</td>
+      <td>Comma-separated list of allowed directive sources (pr-body, commits, merged-pr-body). merged-pr-body reads, on a push event, the body of the merged pull request each pushed commit arrived through.</td>
     </tr>
     <tr>
       <td class="gate-id">pr_body</td>
@@ -1368,6 +1593,21 @@ discipline self-test</div>
       <td class="gate-id">download_url</td>
       <td><code>https://github.com/orieg/discipline/releases</code></td>
       <td>Base URL of the release store, for mirrors.</td>
+    </tr>
+    <tr>
+      <td class="gate-id">baseline_file</td>
+      <td><em>(none)</em></td>
+      <td>Path to grandfathering baseline file (defaults to discipline-baseline.toml if present).</td>
+    </tr>
+    <tr>
+      <td class="gate-id">no_baseline</td>
+      <td><code>false</code></td>
+      <td>Ignore grandfathering baseline even if present.</td>
+    </tr>
+    <tr>
+      <td class="gate-id">ci_context</td>
+      <td><em>(none)</em></td>
+      <td>Rollup job only: `toJson(needs)` of the rollup job (inline JSON, or a path to a file holding it) for the ci-skip-set gate. Empty: the gate reports &quot;not evaluated&quot;.</td>
     </tr>
   </tbody>
 </table>
@@ -1411,6 +1651,10 @@ discipline self-test</div>
       <td>Number of applied override directives</td>
     </tr>
     <tr>
+      <td class="gate-id">baselined</td>
+      <td>Number of grandfathered findings matching baseline (not blocking)</td>
+    </tr>
+    <tr>
       <td class="gate-id">overridden_gates</td>
       <td>Comma separated ids of the gates that had an override applied</td>
     </tr>
@@ -1429,6 +1673,10 @@ discipline self-test</div>
     <tr>
       <td class="gate-id">install_error</td>
       <td>Why installing the binary failed (empty on success)</td>
+    </tr>
+    <tr>
+      <td class="gate-id">bin</td>
+      <td>Path to the installed discipline executable</td>
     </tr>
   </tbody>
 </table>
@@ -1474,7 +1722,7 @@ discipline self-test</div>
         <rect x="80" y="214" width="340" height="176" rx="8" class="arch-box arch-box-card"/>
         <rect x="95" y="228" width="180" height="22" rx="4" class="arch-badge-blue"/>
         <text x="185" y="243" class="arch-badge-text-blue" text-anchor="middle">Tree-Sitter AST Diff Engine</text>
-        <text x="95" y="268" class="arch-meta">10 language packs behind shared fact model</text>
+        <text x="95" y="268" class="arch-meta">14 language packs behind shared fact model</text>
         <circle cx="103" cy="289" r="3" class="arch-dot-blue"/>
         <text x="115" y="293" class="arch-bullet">Assertion count &amp; strength ratchets</text>
         <circle cx="103" cy="311" r="3" class="arch-dot-blue"/>
@@ -1482,7 +1730,7 @@ discipline self-test</div>
         <circle cx="103" cy="333" r="3" class="arch-dot-blue"/>
         <text x="115" y="337" class="arch-bullet">// SAFETY: justification invariants</text>
         <circle cx="103" cy="355" r="3" class="arch-dot-blue"/>
-        <text x="115" y="359" class="arch-bullet">Newly skipped / #[ignore]d test sentinel</text>
+        <text x="115" y="359" class="arch-bullet">Skips, retries, stubs, mocks &amp; swallowed errors</text>
 
         <!-- 3B. Hygiene & Policy Sweeps -->
         <rect x="440" y="214" width="340" height="176" rx="8" class="arch-box arch-box-card"/>
@@ -1496,7 +1744,7 @@ discipline self-test</div>
         <circle cx="463" cy="333" r="3" class="arch-dot-purple"/>
         <text x="475" y="337" class="arch-bullet">Agent scratch state deny (.claude/, *.tmp)</text>
         <circle cx="463" cy="355" r="3" class="arch-dot-purple"/>
-        <text x="475" y="359" class="arch-bullet">Dependency delta &amp; discipline.toml integrity</text>
+        <text x="475" y="359" class="arch-bullet">Lockfile, toolchain, CI, build-hook &amp; config integrity</text>
 
         <!-- Connector: AST & Hygiene -> Evaluator -->
         <path class="arch-line" d="M 250 390 L 250 412 L 610 412 L 610 390"/>
@@ -1541,14 +1789,49 @@ discipline self-test</div>
   <section class="section-block" id="install">
     <div class="section-head">
       <div class="section-title">Installation & Distribution</div>
-      <p class="section-desc">Available as a pre-compiled static binary, container image, or from source via Cargo.</p>
+      <p class="section-desc">Available as a one-line installer, native APT/RPM packages, Homebrew formula, pre-compiled static binary, container image, or from source via Cargo.</p>
     </div>
 
     <div class="install-grid">
       <div class="install-card">
+        <h4>Quick Install (Linux & macOS)</h4>
+        <div class="install-snippet">curl -fsSL -o install.sh https://orieg.github.io/discipline/install.sh && bash install.sh</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Recommended download-verify-run workflow. Or via one-liner: <code>curl -fsSL https://orieg.github.io/discipline/install.sh | bash</code></p>
+      </div>
+      <div class="install-card">
+        <h4>Debian / Ubuntu (APT)</h4>
+        <div class="install-snippet">curl -fsSL https://orieg.github.io/discipline/apt/discipline-archive-keyring.gpg | sudo tee /usr/share/keyrings/discipline-archive-keyring.gpg &gt;/dev/null && echo "deb [signed-by=/usr/share/keyrings/discipline-archive-keyring.gpg] https://orieg.github.io/discipline/apt/ stable main" | sudo tee /etc/apt/sources.list.d/discipline.list && sudo apt update && sudo apt install -y discipline</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Signed APT repo for Debian 11+ and Ubuntu 20.04+. <a href="apt/" style="color: var(--accent);">Browse repo &rarr;</a></p>
+      </div>
+      <div class="install-card">
+        <h4>Enterprise Linux / Fedora (RPM)</h4>
+        <div class="install-snippet">sudo dnf config-manager --add-repo https://orieg.github.io/discipline/rpm/discipline.repo && sudo dnf install -y discipline</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Signed RPM repo (repository metadata is GPG-verified) for RHEL 8/9/10, Fedora, CentOS, Rocky, Alma. <a href="rpm/" style="color: var(--accent);">Browse repo &rarr;</a></p>
+      </div>
+      <div class="install-card">
+        <h4>Homebrew (macOS & Linux)</h4>
+        <div class="install-snippet">brew install orieg/tap/discipline</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Native formula for Apple Silicon, Intel macOS, and Linux.</p>
+      </div>
+      <div class="install-card">
+        <h4>MacPorts (macOS)</h4>
+        <div class="install-snippet">curl -fsSL -o ~/ports/devel/discipline/Portfile https://github.com/orieg/discipline/releases/latest/download/Portfile</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">A generated Portfile is attached to each release; install it from a local ports tree (see the README).</p>
+      </div>
+      <div class="install-card">
+        <h4>Cargo Binstall (Pre-built)</h4>
+        <div class="install-snippet">cargo binstall discipline</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Fast binary fetch directly from verified GitHub release assets.</p>
+      </div>
+      <div class="install-card">
         <h4>Cargo (From Source)</h4>
         <div class="install-snippet">cargo install --git https://github.com/orieg/discipline</div>
         <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Pure Rust build requiring rustc 1.80+.</p>
+      </div>
+      <div class="install-card">
+        <h4>Shell Completions</h4>
+        <div class="install-snippet">discipline completions zsh &gt; ~/.zfunc/_discipline</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">The APT, RPM, Homebrew and MacPorts packages install bash, zsh and fish completions. For a tarball or Cargo install, generate them into your shell's completion directory and regenerate after each upgrade (see the README).</p>
       </div>
       <div class="install-card">
         <h4>Docker Container</h4>
@@ -1556,14 +1839,14 @@ discipline self-test</div>
         <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Non-root Alpine container with static binary.</p>
       </div>
       <div class="install-card">
-        <h4>GitLab CI/CD Component</h4>
-        <div class="install-snippet">component: $CI_SERVER_FQDN/orieg/discipline@v0.2.0</div>
-        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">GitLab 16.0+ CI/CD Catalog Component.</p>
-      </div>
-      <div class="install-card">
         <h4>GitHub Action</h4>
         <div class="install-snippet">uses: orieg/discipline@v0</div>
         <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Composite action with automatic binary bootstrap.</p>
+      </div>
+      <div class="install-card">
+        <h4>GitLab CI/CD</h4>
+        <div class="install-snippet">include: - remote: https://raw.githubusercontent.com/orieg/discipline/v0.12.2/templates/discipline.gitlab-ci.yml</div>
+        <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Job template with <code>spec: inputs</code> (GitLab 16.0+), pinned to a release.</p>
       </div>
       <div class="install-card">
         <h4>Forgejo Action</h4>
@@ -1598,7 +1881,9 @@ discipline self-test</div>
       <strong>Discipline</strong> is open source software released under dual MIT / Apache-2.0 licenses.<br>
       Maintained by <a href="https://nicolas.brousse.info/">Nicolas Brousse</a> &bull;
       <a href="https://github.com/orieg/discipline">GitHub</a> &bull;
-      <a href="./">Docs</a>
+      <a href="./">Docs</a> &bull;
+      <a href="apt/">APT Repo</a> &bull;
+      <a href="rpm/">RPM Repo</a>
     </p>
   </div>
 </footer>
@@ -1635,6 +1920,30 @@ discipline self-test</div>
       document.getElementById(targetId).classList.add('active');
     });
   });
+
+  // Real-time client-side gate search/filter
+  const gateSearch = document.getElementById('gate-search');
+  const gateCount = document.getElementById('gate-count');
+  if (gateSearch) {
+    const gateRows = document.querySelectorAll('#gates .gate-table tbody tr');
+    const totalGates = gateRows.length;
+    gateSearch.addEventListener('input', function() {
+      const query = this.value.trim().toLowerCase();
+      let matchCount = 0;
+      gateRows.forEach(row => {
+        const text = row.textContent.toLowerCase();
+        if (!query || text.includes(query)) {
+          row.style.display = '';
+          matchCount++;
+        } else {
+          row.style.display = 'none';
+        }
+      });
+      if (gateCount) {
+        gateCount.textContent = `Showing ${matchCount} of ${totalGates} gates`;
+      }
+    });
+  }
 </script>
 
 </body>

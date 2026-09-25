@@ -1,19 +1,43 @@
 pub mod agent_diff;
+pub mod archive_contents;
+pub mod archive_formats;
+pub mod archive_presets;
+pub mod build_hooks;
+pub mod ci_gitlab;
 pub mod ci_integrity;
+pub mod ci_skip_set;
+pub mod claim_registry;
 pub mod command;
+pub mod commit_provenance;
 pub mod dependency;
+pub mod error_swallowing;
 pub mod hygiene;
+pub mod instruction_smuggling;
 pub mod integrity;
 pub mod issue_link;
+pub mod lockfile;
+pub mod manifest_sync;
+pub mod miri;
+pub mod msrv;
 pub mod perf;
+pub mod pr_checklist;
 pub mod presets;
 pub mod provenance_tags;
+pub mod sanitizers;
+pub mod scope_confinement;
 pub mod shell_secrets;
+pub mod source_maps;
+pub mod stub_bodies;
+pub mod suppression_delta;
 pub mod test_budget;
 pub mod test_floor;
+pub mod toolchain_config;
+pub mod unsafe_budget;
+pub mod version_lockstep;
 
 use crate::cli::SuiteChoice;
-use crate::config::{gate_info, DisciplineConfig, GateSettings, Severity, Suite, GATES};
+pub use crate::config::Severity;
+use crate::config::{gate_info, DisciplineConfig, GateSettings, Suite, GATES};
 use crate::gitctx::GitCtx;
 use anyhow::{anyhow, bail, Context as _, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -40,6 +64,8 @@ pub struct GateOutcome {
     pub examined: usize,
     /// Lines skipped through an inline `discipline:allow(<gate>)` marker.
     pub inline_exemptions: usize,
+    /// Findings matching the grandfathering baseline (not blocking).
+    pub baselined: usize,
     /// Named degradations: what the gate could not verify, and why.
     pub notes: Vec<String>,
     pub violations: Vec<Violation>,
@@ -47,6 +73,14 @@ pub struct GateOutcome {
 }
 
 impl GateOutcome {
+    /// Enabled, examined nothing, found nothing, and says why: "not evaluated: ...".
+    pub fn is_not_evaluated(&self) -> bool {
+        self.enabled
+            && self.examined == 0
+            && self.violations.is_empty()
+            && self.notes.iter().any(|n| n.starts_with("not evaluated"))
+    }
+
     pub fn new(gate: &'static str) -> Self {
         let info = gate_info(gate).expect("gate id registered in config::GATES");
         Self {
@@ -55,6 +89,7 @@ impl GateOutcome {
             enabled: true,
             examined: 0,
             inline_exemptions: 0,
+            baselined: 0,
             notes: Vec::new(),
             violations: Vec::new(),
             overrides: Vec::new(),
@@ -80,6 +115,26 @@ impl GateOutcome {
             remediation: Some(remediation.to_string()),
         });
     }
+
+    pub fn add_violation(
+        &mut self,
+        severity: Severity,
+        file: impl AsRef<str>,
+        line: usize,
+        message: impl Into<String>,
+        remediation: impl Into<String>,
+    ) {
+        let msg = message.into();
+        self.violations.push(Violation {
+            gate: self.gate,
+            severity,
+            title: msg.clone(),
+            file: Some(file.as_ref().to_string()),
+            line: Some(line),
+            message: msg,
+            remediation: Some(remediation.into()),
+        });
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -87,18 +142,33 @@ pub struct CheckSummary {
     pub base: String,
     pub errors: usize,
     pub warnings: usize,
+    pub notes: usize,
     pub overrides: usize,
+    pub baselined: usize,
     pub outcomes: Vec<GateOutcome>,
     /// Gates the roadmap plans but this binary does not ship. Listed in every
     /// report so their absence is never mistaken for coverage.
     pub planned_gates: Vec<&'static str>,
+    /// Run-level refusals that no single gate owns (an exhausted override budget,
+    /// overrides awaiting approval). Any entry fails the run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub policy_failures: Vec<String>,
 }
 
 impl CheckSummary {
     pub fn is_success(&self, fail_on_warnings: bool, fail_on_overrides: bool) -> bool {
         self.errors == 0
+            && self.policy_failures.is_empty()
             && (!fail_on_warnings || self.warnings == 0)
             && (!fail_on_overrides || self.total_overrides() == 0)
+    }
+
+    /// Overrides granted by a directive in the PR body or a commit body. Inline markers
+    /// are reviewed as part of the tree and are not counted.
+    pub fn directive_overrides(&self) -> usize {
+        self.overrides()
+            .filter(|o| !matches!(o.source, crate::tokens::OverrideSource::Inline { .. }))
+            .count()
     }
 
     pub fn violations(&self) -> impl Iterator<Item = &Violation> {
@@ -133,11 +203,12 @@ impl CheckSummary {
                 let has_failure = o.violations.iter().any(|v| match v.severity {
                     Severity::Error => true,
                     Severity::Warning => fail_on_warnings,
+                    Severity::Note => false,
                 }) || (fail_on_overrides && !o.overrides.is_empty());
 
                 if has_failure {
                     failed += 1;
-                } else {
+                } else if !o.is_not_evaluated() {
                     passed += 1;
                 }
             }
@@ -145,14 +216,30 @@ impl CheckSummary {
 
         (passed, failed, disabled, examined)
     }
+
+    /// Enabled gates that examined nothing because their input was absent (a named
+    /// "not evaluated" note). Counted neither as passed nor as failed.
+    pub fn not_evaluated_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.is_not_evaluated())
+            .count()
+    }
 }
 
 /// Everything a gate needs.
 pub struct Context<'a> {
     pub config: &'a DisciplineConfig,
+    /// The change's own configuration when the run is judged by the base ref's
+    /// (`--policy-from base`); `None` when `config` already is the change's own.
+    pub head_config: Option<&'a DisciplineConfig>,
     pub git: &'a GitCtx,
     /// Repo-relative path of the configuration file (for config-integrity).
     pub config_path: &'a str,
+    /// Repo-relative path of the baseline file if grandfathering is active.
+    pub baseline_path: Option<&'a str>,
+    /// Loaded baseline if grandfathering is active.
+    pub baseline: Option<&'a crate::baseline::DisciplineBaseline>,
     pub staged: bool,
     pub pr_title: Option<String>,
     pub pr_body: Option<String>,
@@ -164,7 +251,39 @@ pub struct Context<'a> {
     pub bench_head_file: Option<std::path::PathBuf>,
 }
 
+/// Set by `discipline replay` on each case's `check`: the configuration under test is
+/// newer than the replayed trees.
+pub const REPLAY_CASE_ENV: &str = "DISCIPLINE_REPLAY_CASE";
+
 impl Context<'_> {
+    /// The base side's configuration text: the file `--config` names when the base tree
+    /// has it, else the base `discipline.toml`. A `--config` outside the repository is in
+    /// no tree, so only the base `discipline.toml` is read.
+    pub fn base_config_text(&self) -> Result<Option<String>> {
+        let own = if crate::gitctx::config_in_tree(self.config_path) {
+            self.git.base_content(self.config_path)?
+        } else {
+            None
+        };
+        Ok(match own {
+            Some(s) => Some(s),
+            None if self.config_path != "discipline.toml" => {
+                self.git.base_content("discipline.toml")?
+            }
+            None => None,
+        })
+    }
+
+    /// Under `discipline replay`, a file the configuration names that neither side of the
+    /// replayed change has predates the configuration, so the part of a gate that reads it
+    /// does not apply to that change. Outside replay (or when either side has the file) a
+    /// missing file stays a configuration error.
+    pub fn predates_config(&self, path: &str) -> Result<bool> {
+        Ok(std::env::var_os(REPLAY_CASE_ENV).is_some()
+            && self.git.base_content(path)?.is_none()
+            && self.git.head_content(path)?.is_none())
+    }
+
     pub fn find_override(
         &self,
         gate: &str,
@@ -172,15 +291,6 @@ impl Context<'_> {
         subject: &str,
     ) -> Option<crate::tokens::OverrideRecord> {
         crate::tokens::find_override(&self.directives, gate, names, subject)
-    }
-
-    pub fn find_gate_or_subject_override(
-        &self,
-        gate: &str,
-        names: &[&str],
-        subject: &str,
-    ) -> Option<crate::tokens::OverrideRecord> {
-        crate::tokens::find_gate_or_subject_override(&self.directives, gate, names, subject)
     }
 
     /// A finding that an override directive could lift is only a warning in
@@ -235,6 +345,31 @@ pub fn run_checks(
         bail!("git tracks no files here; refusing to report a pass over an empty tree");
     }
 
+    // Gates whose rule describes a change (base against head). A whole-tree run has no
+    // change: every file is "added", so these would record every dependency, every
+    // ignored test and every instruction file as debt.
+    const DELTA_ONLY_GATES: &[&str] = &[
+        "assertion-reduction",
+        "ignored-tests",
+        "deletion-rationale",
+        "config-integrity",
+        "toolchain-config",
+        "build-hooks",
+        "ci-integrity",
+        "ci-skip-set",
+        "golden-output",
+        "dependency-delta",
+        "test-budget",
+        "test-floor",
+        "suppression-delta",
+        "error-swallowing",
+        "stub-bodies",
+        "scope-confinement",
+        "commit-provenance",
+        "bench-regression",
+    ];
+    let whole_tree = ctx.git.is_whole_tree();
+
     let mut outcomes = Vec::new();
     let mut ast_outcomes = None;
     for gate in selected {
@@ -242,9 +377,22 @@ pub fn run_checks(
             .gates
             .settings(gate.id)
             .ok_or_else(|| anyhow!("gate `{}` has no settings entry", gate.id))?;
-        if !settings.enabled() {
+        // The gate that guards the configuration is switched by the base side (F9).
+        let held_on = gate.id == "config-integrity"
+            && !settings.enabled()
+            && integrity::enabled_on_base(ctx)?;
+        if !settings.enabled() && !held_on {
             let mut o = GateOutcome::new(gate.id);
             o.enabled = false;
+            outcomes.push(o);
+            continue;
+        }
+        if whole_tree && DELTA_ONLY_GATES.contains(&gate.id) {
+            let mut o = GateOutcome::new(gate.id);
+            o.notes.push(
+                "not evaluated: this rule describes a change, and a whole-tree baseline has no change to describe"
+                    .to_string(),
+            );
             outcomes.push(o);
             continue;
         }
@@ -255,7 +403,13 @@ pub fn run_checks(
             "agent-scratch" => hygiene::agent_scratch(ctx),
             "shell-secrets" => shell_secrets::evaluate_shell_secrets(ctx),
             "issue-link" => issue_link::evaluate_issue_link(ctx),
+            "commit-provenance" => commit_provenance::commit_provenance(ctx),
             "config-integrity" => integrity::config_integrity(ctx),
+            "toolchain-config" => toolchain_config::toolchain_config(ctx),
+            "stub-bodies" => stub_bodies::stub_bodies(ctx),
+            "error-swallowing" => error_swallowing::error_swallowing(ctx),
+            "instruction-smuggling" => instruction_smuggling::instruction_smuggling(ctx),
+            "build-hooks" => build_hooks::build_hooks(ctx),
             "golden-output" => integrity::golden_output(ctx),
             "bench-regression" => perf::bench_regression(ctx),
             "command" => command::evaluate_command(ctx),
@@ -263,7 +417,18 @@ pub fn run_checks(
             "test-budget" => test_budget::evaluate_test_budget(ctx),
             "test-floor" => test_floor::evaluate_test_floor(ctx),
             "ci-integrity" => ci_integrity::evaluate_ci_integrity(ctx),
+            "ci-skip-set" => ci_skip_set::evaluate_ci_skip_set(ctx),
             "provenance-tags" => provenance_tags::evaluate_provenance_tags(ctx),
+            "archive-contents" => archive_contents::evaluate_archive_contents(ctx),
+            "manifest-sync" => manifest_sync::evaluate_manifest_sync(ctx),
+            "version-lockstep" => version_lockstep::evaluate_version_lockstep(ctx),
+            "scope-confinement" => scope_confinement::evaluate_scope_confinement(ctx),
+            "suppression-delta" => suppression_delta::evaluate_suppression_delta(ctx),
+            "pr-checklist" => pr_checklist::evaluate_pr_checklist(ctx),
+            "unsafe-budget" => unsafe_budget::evaluate_unsafe_budget(ctx),
+            "msrv" => msrv::evaluate_msrv(ctx),
+            "miri" => miri::evaluate_miri(ctx),
+            "sanitizers" => sanitizers::evaluate_sanitizers(ctx),
             "assertion-reduction"
             | "vacuous-tests"
             | "ignored-tests"
@@ -283,6 +448,22 @@ pub fn run_checks(
         }
         .with_context(|| format!("gate `{}` could not run", gate.id))?;
         outcomes.push(outcome);
+    }
+
+    // A submodule pointer change is skipped by every gate (its content is another
+    // repository). Say so where a deletion or an out-of-scope change would be judged.
+    let submodules = ctx.git.changed_submodules()?;
+    if !submodules.is_empty() {
+        let note = format!(
+            "not inspected: submodule pointer change(s) at {} (review the submodule's own history)",
+            submodules.join(", ")
+        );
+        for o in outcomes
+            .iter_mut()
+            .filter(|o| o.enabled && matches!(o.gate, "deletion-rationale" | "scope-confinement"))
+        {
+            o.notes.push(note.clone());
+        }
     }
 
     for note in &ctx.directive_notes {
@@ -311,6 +492,38 @@ pub fn run_checks(
             || note.contains("allow-ci-change")
         {
             "ci-integrity"
+        } else if note.contains("allow-archive-leak") {
+            "archive-contents"
+        } else if note.contains("allow-manifest-drift") {
+            "manifest-sync"
+        } else if note.contains("allow-version-mismatch") {
+            "version-lockstep"
+        } else if note.contains("allow-scope") {
+            "scope-confinement"
+        } else if note.contains("allow-build-hook") {
+            "build-hooks"
+        } else if note.contains("allow-commit-provenance") {
+            "commit-provenance"
+        } else if note.contains("allow-agent-instructions") {
+            "instruction-smuggling"
+        } else if note.contains("allow-swallow") {
+            "error-swallowing"
+        } else if note.contains("allow-stub") {
+            "stub-bodies"
+        } else if note.contains("allow-toolchain-weakening") {
+            "toolchain-config"
+        } else if note.contains("allow-suppression") {
+            "suppression-delta"
+        } else if note.contains("allow-checklist") {
+            "pr-checklist"
+        } else if note.contains("allow-unsafe") {
+            "unsafe-budget"
+        } else if note.contains("allow-msrv") {
+            "msrv"
+        } else if note.contains("allow-miri") {
+            "miri"
+        } else if note.contains("allow-sanitizers") {
+            "sanitizers"
         } else if note.contains("allow-nul") || note.contains("allow-corrupt") {
             "assertion-reduction"
         } else {
@@ -324,6 +537,12 @@ pub fn run_checks(
                         | "assertion-reduction"
                         | "ignored-tests"
                         | "config-integrity"
+                        | "toolchain-config"
+                        | "stub-bodies"
+                        | "error-swallowing"
+                        | "instruction-smuggling"
+                        | "commit-provenance"
+                        | "build-hooks"
                         | "golden-output"
                         | "bench-regression"
                         | "command"
@@ -331,6 +550,16 @@ pub fn run_checks(
                         | "test-budget"
                         | "test-floor"
                         | "ci-integrity"
+                        | "archive-contents"
+                        | "manifest-sync"
+                        | "version-lockstep"
+                        | "scope-confinement"
+                        | "suppression-delta"
+                        | "pr-checklist"
+                        | "unsafe-budget"
+                        | "msrv"
+                        | "miri"
+                        | "sanitizers"
                 ) {
                     o.notes.push(note.clone());
                 }
@@ -338,6 +567,20 @@ pub fn run_checks(
                 o.notes.push(note.clone());
             }
         }
+    }
+
+    // Deduplicate violations per gate by (file, line, title, message) preserving discovery order
+    for o in &mut outcomes {
+        let mut seen = std::collections::HashSet::new();
+        o.violations.retain(|v| {
+            let key = (v.file.clone(), v.line, v.title.clone(), v.message.clone());
+            seen.insert(key)
+        });
+    }
+
+    // Grandfathered findings baseline matching
+    if let Some(baseline) = ctx.baseline {
+        crate::baseline::apply_baseline_with_git(ctx.git, baseline, &mut outcomes);
     }
 
     let count = |s: Severity| {
@@ -348,17 +591,21 @@ pub fn run_checks(
             .count()
     };
     let total_overrides = outcomes.iter().map(|o| o.overrides.len()).sum();
+    let total_baselined = outcomes.iter().map(|o| o.baselined).sum();
     Ok(CheckSummary {
         base: ctx.git.base_label().to_string(),
         errors: count(Severity::Error),
         warnings: count(Severity::Warning),
+        notes: count(Severity::Note),
         overrides: total_overrides,
+        baselined: total_baselined,
         planned_gates: GATES
             .iter()
             .filter(|g| !g.available)
             .map(|g| g.id)
             .collect(),
         outcomes,
+        policy_failures: Vec::new(),
     })
 }
 
@@ -383,9 +630,12 @@ pub fn exempt_filter(settings: &dyn GateSettings) -> Result<PathFilter> {
     PathFilter::new(settings.exempt_paths())
 }
 
-/// `discipline:allow(gate-a, gate-b)` or `docs-lint: allow` anywhere on a line exempts that line.
+/// `discipline:allow(gate-a, gate-b)` anywhere on a line exempts that line.
+/// For backwards compatibility with documentation lints, `docs-lint: allow` exempts `time-estimates` and `pii` only.
 pub fn line_allows(line: &str, gate: &str) -> bool {
-    if line.contains("docs-lint: allow") {
+    if (gate == "time-estimates" || gate == "pii")
+        && (line.contains("docs-lint: allow") || line.contains("docs-lint:allow"))
+    {
         return true;
     }
     const MARKER: &str = "discipline:allow(";
@@ -397,6 +647,44 @@ pub fn line_allows(line: &str, gate: &str) -> bool {
         return false;
     };
     rest[..end].split(',').any(|g| g.trim() == gate)
+}
+
+/// Signatures that mean **the tool never ran**, as opposed to the tool running
+/// and finding a violation.
+///
+/// Fail-closed contract (docs/ARCHITECTURE.md §3, F1/F2): "could not check" is
+/// exit 2 and must never be reported as "violation found". A missing rustup
+/// component or a nightly-only flag on a stable toolchain is an environment
+/// fault; reporting it as detected undefined behaviour or a detected data race
+/// inverts the meaning of the result and trains readers to distrust the gate.
+const TOOLCHAIN_UNAVAILABLE_SIGNATURES: &[&str] = &[
+    "is not available for the", // rustup: component missing for this toolchain
+    "only accepted on the nightly", // -Z flag used on a stable channel
+    "no such subcommand",       // cargo subcommand not installed
+    "is not installed",         // rustup: toolchain not installed
+    "command not found",
+    "not recognized as an internal or external command",
+    "error: rustup could not",
+    "requires a nightly",
+    "requires nightly",
+];
+
+/// Returns the offending diagnostic line when `stdout`/`stderr` show that the
+/// tool could not run at all. Callers turn this into an `Err` (exit 2) instead
+/// of a violation.
+pub fn toolchain_unavailable(stdout: &str, stderr: &str) -> Option<String> {
+    for stream in [stderr, stdout] {
+        for line in stream.lines() {
+            let lower = line.to_lowercase();
+            if TOOLCHAIN_UNAVAILABLE_SIGNATURES
+                .iter()
+                .any(|sig| lower.contains(sig))
+            {
+                return Some(line.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -419,6 +707,10 @@ mod tests {
             "pii"
         ));
         assert!(!line_allows(
+            "#[allow(dead_code)] // docs-lint: allow",
+            "suppression-delta"
+        ));
+        assert!(!line_allows(
             "x <!-- discipline:allow(time-estimates) -->",
             "pii"
         ));
@@ -433,5 +725,41 @@ mod tests {
         assert!(f.matches("Cargo.lock"));
         assert!(!f.matches("docs/GATES.md"));
         assert!(PathFilter::new(&["[".into()]).is_err());
+    }
+
+    #[test]
+    fn toolchain_unavailable_distinguishes_environment_faults_from_findings() {
+        // Positive controls: the tool never ran.
+        for bad in [
+            "error: the 'miri' component which provides the command 'cargo-miri' is not available for the 'stable-aarch64-apple-darwin' toolchain",
+            "error: the `-Z` flag is only accepted on the nightly channel of Cargo, but this is the `stable` channel",
+            "error: no such subcommand: `miri`",
+            "error: toolchain 'nightly-x86_64-unknown-linux-gnu' is not installed",
+            "cargo: command not found",
+        ] {
+            assert!(
+                toolchain_unavailable("", bad).is_some(),
+                "missed environment fault: {bad}"
+            );
+        }
+
+        // Negative controls: the tool RAN and found something. These must stay
+        // violations, or the fix would silently disarm both gates.
+        for real in [
+            "error: Undefined Behavior: attempting a read access using <untagged> at alloc1[0x0]",
+            "ERROR: AddressSanitizer: heap-use-after-free on address 0x602000000010",
+            "WARNING: ThreadSanitizer: data race (pid=1234)",
+            "test result: FAILED. 3 passed; 1 failed",
+            "assertion `left == right` failed",
+        ] {
+            assert!(
+                toolchain_unavailable("", real).is_none(),
+                "environment fault falsely claimed for a real finding: {real}"
+            );
+        }
+
+        // stdout is inspected too, and the offending line is returned.
+        let hit = toolchain_unavailable("error: no such subcommand: `miri`", "").unwrap();
+        assert!(hit.contains("no such subcommand"), "got: {hit}");
     }
 }

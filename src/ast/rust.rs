@@ -3,7 +3,10 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use super::{AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts, TestFn, UnsafeSite};
+use super::functions::{self, FunctionSpec};
+use super::{
+    AssertVocabulary, EscapeHatchSite, Fact, LanguagePack, ParsedFileFacts, TestFn, UnsafeSite,
+};
 
 /// Rust language pack implementing [`LanguagePack`].
 pub struct RustPack;
@@ -11,6 +14,19 @@ pub struct RustPack;
 impl LanguagePack for RustPack {
     fn id(&self) -> &'static str {
         "rust"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests
+                | Fact::EscapeHatches
+                | Fact::UnsafeSites
+                | Fact::Functions
+                | Fact::Handlers
+                | Fact::Prose
+                | Fact::Budgets
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -21,7 +37,7 @@ impl LanguagePack for RustPack {
         super::extension(path) == Some("rs")
     }
 
-    fn extract(&self, _path: &str, src: &str, vocab: &AssertVocabulary) -> Result<ParsedFileFacts> {
+    fn extract(&self, path: &str, src: &str, vocab: &AssertVocabulary) -> Result<ParsedFileFacts> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -32,6 +48,7 @@ impl LanguagePack for RustPack {
         let root = tree.root_node();
 
         let mut cx = Extractor {
+            dead: super::reach::dead_ranges(root, src, &RS_REACH),
             src: src.as_bytes(),
             lines: src.lines().collect(),
             line_starts: std::iter::once(0)
@@ -53,6 +70,63 @@ impl LanguagePack for RustPack {
         cx.visit(root, &mut Vec::new());
         cx.resolve_same_file_helpers();
         cx.facts.build_compile_time_test();
+        cx.facts.functions = functions::extract(root, src, path, &RUST_FUNCTIONS);
+        super::mocks::count(
+            root,
+            src,
+            &mut cx.facts.tests,
+            &RUST_MOCKS,
+            &vocab.mock_setup_fns,
+            &vocab.mock_assert_fns,
+        );
+        {
+            let tests = &cx.facts.tests;
+            let spans: Vec<(usize, usize)> = tests
+                .iter()
+                .map(|t| (t.line, t.end_line.max(t.line)))
+                .collect();
+            // A file in a test directory, or one the repository declares as test scope, is
+            // test code line for line.
+            let whole_file = super::functions::test_path(path)
+                || super::functions::declared_test_path(path, &vocab.test_paths);
+            let is_test_line =
+                |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+            cx.facts.swallowed = super::handlers::extract(root, src, &RUST_HANDLERS, &is_test_line);
+        }
+        super::retries::mark(root, src, &mut cx.facts.tests, &RUST_RETRIES);
+        if super::functions::declared_test_path(path, &vocab.test_paths) {
+            for f in &mut cx.facts.functions {
+                f.is_test = true;
+            }
+        }
+        super::calls::count(
+            root,
+            src,
+            &mut cx.facts.tests,
+            &RUST_MOCKS,
+            super::calls::SLEEP_VOCAB,
+            super::calls::sleeps,
+        );
+        super::calls::count(
+            root,
+            src,
+            &mut cx.facts.tests,
+            &RUST_MOCKS,
+            super::calls::TRIVIAL_ASSERT_VOCAB,
+            super::calls::trivial_asserts,
+        );
+        super::bounds::rust(root, src, &mut cx.facts.tests);
+        cx.facts.prose = super::prose::extract(
+            root,
+            src,
+            &[
+                "line_comment",
+                "block_comment",
+                "string_literal",
+                "raw_string_literal",
+            ],
+        );
+        cx.facts.budgets = super::budgets::extract(root, src, &RS_BUDGETS);
         Ok(cx.facts)
     }
 }
@@ -68,6 +142,8 @@ struct Comment {
 }
 
 struct Extractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     lines: Vec<&'a str>,
     /// Byte offset of each line start (robust to CRLF, unlike summing `lines`).
@@ -90,15 +166,24 @@ impl<'a> Extractor<'a> {
     fn collect_comments(&mut self, node: Node) {
         if matches!(node.kind(), "line_comment" | "block_comment") {
             let text = self.text(node);
+            // A line comment's end position sits at column 0 of the next row; that row is
+            // not part of the comment, or a run walk pairs each row with the comment above.
+            let end = node.end_position();
+            let end_row = if end.column == 0 && end.row > node.start_position().row {
+                end.row - 1
+            } else {
+                end.row
+            };
             self.comments.push(Comment {
                 start_row: node.start_position().row,
-                end_row: node.end_position().row,
+                end_row,
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
-                has_safety: has_valid_safety_comment_with_placeholders(
-                    text,
-                    &self.vocab.safety_placeholders,
-                ),
+                has_safety: is_safety_doc_section(text)
+                    || has_valid_safety_comment_with_placeholders(
+                        text,
+                        &self.vocab.safety_placeholders,
+                    ),
             });
             return;
         }
@@ -110,6 +195,25 @@ impl<'a> Extractor<'a> {
 
     fn visit(&mut self, node: Node, mods: &mut Vec<String>) {
         match node.kind() {
+            "attribute_item" | "inner_attribute_item" => {
+                let text = self.text(node);
+                let name = attribute_name(text);
+                if name == "allow" || name == "expect" {
+                    let rule = text
+                        .split_once('(')
+                        .map(|(_, r)| r.trim_end_matches(']').trim_end_matches(')').trim())
+                        .unwrap_or("")
+                        .to_string();
+                    self.facts
+                        .escape_hatches
+                        .push(EscapeHatchSite::LinterDisable {
+                            line: node.start_position().row + 1,
+                            rule,
+                            snippet: text.trim().to_string(),
+                        });
+                }
+                return;
+            }
             "mod_item" => {
                 let name = node
                     .child_by_field_name("name")
@@ -144,6 +248,13 @@ impl<'a> Extractor<'a> {
                             &mut helper_test,
                             is_fallible_return,
                             &mut dummy_calls,
+                        );
+                        helper_test.total_asserts += super::count_failure_exits(
+                            body,
+                            self.src,
+                            &["macro_invocation"],
+                            RUST_FAILURE_EXITS,
+                            &["function_item", "closure_expression"],
                         );
                     }
                     let facts = HelperFacts {
@@ -238,6 +349,9 @@ impl<'a> Extractor<'a> {
                         test.strong_asserts += h.strong_asserts;
                         test.tautologies += h.tautologies;
                         test.fatal_asserts += h.fatal_asserts;
+                        if h.total_asserts > h.tautologies {
+                            test.helper_checks += 1;
+                        }
                     }
                 }
             }
@@ -250,7 +364,10 @@ impl<'a> Extractor<'a> {
         mods: &[String],
         direct_calls: &mut Vec<String>,
     ) -> Option<TestFn> {
-        let mut is_test = false;
+        let mut is_test = node
+            .child_by_field_name("name")
+            .map(|n| self.text(n))
+            .is_some_and(|name| self.vocab.test_functions.iter().any(|f| f == name));
         let mut ignored = false;
         let mut conditional_ignore = None;
         let mut should_panic = false;
@@ -332,6 +449,13 @@ impl<'a> Extractor<'a> {
             conditional_ignore,
             fatal_asserts: 0,
             should_panic,
+            mock_setups: 0,
+            mock_asserts: 0,
+            retries: None,
+            sleeps: 0,
+            trivial_asserts: 0,
+            helper_checks: 0,
+            bounds: Vec::new(),
         };
         let is_fallible_return = node
             .child_by_field_name("return_type")
@@ -342,6 +466,7 @@ impl<'a> Extractor<'a> {
             .unwrap_or(false);
         if let Some(body) = node.child_by_field_name("body") {
             self.count_asserts(body, &mut test, is_fallible_return, direct_calls);
+            super::dispatch_calls(body, self.src, &RS_DISPATCH, direct_calls);
         }
         Some(test)
     }
@@ -353,6 +478,9 @@ impl<'a> Extractor<'a> {
         is_fallible_return: bool,
         direct_calls: &mut Vec<String>,
     ) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         match node.kind() {
             "function_item" => {
                 // Do not recurse into nested function items.
@@ -834,6 +962,156 @@ fn split_top_level(s: &str) -> Vec<&str> {
     parts.push(&s[start..]);
     parts
 }
+
+/// A rustdoc comment carrying a `# Safety` section: the convention for `unsafe trait` and
+/// `unsafe fn` that clippy's `missing_safety_doc` checks.
+fn is_safety_doc_section(comment: &str) -> bool {
+    let c = comment.trim_start();
+    (c.starts_with("///") || c.starts_with("//!") || c.starts_with("/**"))
+        && c.lines().any(|l| {
+            l.trim_start_matches(['/', '!', '*', ' '])
+                .trim()
+                .eq_ignore_ascii_case("# safety")
+        })
+}
+
+/// A `#[test]`-like attribute precedes the function.
+fn rust_fn_is_test(node: tree_sitter::Node, src: &str, path: &str) -> bool {
+    if functions::test_path(path) {
+        return true;
+    }
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        match p.kind() {
+            "attribute_item" => {
+                let name = attribute_name(p.utf8_text(src.as_bytes()).unwrap_or(""));
+                if matches!(
+                    name.as_str(),
+                    "test" | "rstest" | "test_case" | "quickcheck" | "bench"
+                ) {
+                    return true;
+                }
+                prev = p.prev_sibling();
+            }
+            "line_comment" | "block_comment" => prev = p.prev_sibling(),
+            _ => break,
+        }
+    }
+    false
+}
+
+/// A trait method with a default body is a real body; one without is not a `function_item`
+/// with a `body` field, so nothing to skip here beyond `#[cfg(test)]` modules.
+fn rust_fn_skip(node: tree_sitter::Node, src: &str) -> bool {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == "mod_item" {
+            let mut prev = p.prev_sibling();
+            while let Some(a) = prev {
+                if a.kind() != "attribute_item" {
+                    break;
+                }
+                if is_cfg_test_suppression(a.utf8_text(src.as_bytes()).unwrap_or(""))
+                    || a.utf8_text(src.as_bytes()).unwrap_or("").replace(' ', "") == "#[cfg(test)]"
+                {
+                    return true;
+                }
+                prev = a.prev_sibling();
+            }
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+pub const RUST_FUNCTIONS: FunctionSpec = FunctionSpec {
+    function_kinds: &["function_item"],
+    name_fields: &["name"],
+    body_fields: &["body"],
+    ignored_kinds: &["line_comment", "block_comment"],
+    skip: rust_fn_skip,
+    is_test: rust_fn_is_test,
+    classify: functions::classify_rust,
+};
+
+pub const RUST_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &["call_expression", "macro_invocation"],
+    callee_fields: &["function", "macro"],
+};
+
+pub const RUST_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    handler_kinds: &[],
+    arm_of: &[],
+    body_fields: &[],
+    ignored_kinds: &["line_comment", "block_comment"],
+    trivial: &[],
+    discard_kinds: &["let_declaration", "expression_statement"],
+    discards: super::handlers::rust_discards,
+    classify_discard: Some(super::handlers::rust_discard_class),
+    call_value_kinds: &[
+        "call_expression",
+        "macro_invocation",
+        "await_expression",
+        "try_expression",
+    ],
+    silence_kinds: &[],
+    silences: super::handlers::no_discard,
+};
+
+pub const RUST_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["attribute_item"],
+};
+
+pub const RS_BUDGETS: super::budgets::BudgetSpec = super::budgets::BudgetSpec {
+    key_values: &[super::budgets::KeyValueShape {
+        kind: "field_initializer",
+        key_field: "field",
+        value_field: "value",
+    }],
+    keys: &[
+        ("cases", "proptest cases"),
+        ("max_shrink_iters", "proptest max_shrink_iters"),
+        ("tests", "quickcheck tests"),
+        ("gen_size", "quickcheck gen_size"),
+    ],
+    call_kind: "call_expression",
+    callee_field: "function",
+    arguments_field: "arguments",
+    methods: &[
+        ("with_cases", "proptest cases"),
+        ("tests", "quickcheck tests"),
+        ("gen_size", "quickcheck gen_size"),
+        ("max_shrink_iters", "proptest max_shrink_iters"),
+    ],
+    integer_kinds: &["integer_literal"],
+    token_tree_kinds: &["token_tree"],
+};
+
+/// Macros that end a same-file helper on a failure path: a helper that panics on a
+/// mismatch is a check, the way a Python helper that raises is.
+const RUST_FAILURE_EXITS: &[&str] = &["panic!", "std::panic!", "core::panic!", "unreachable!"];
+
+pub const RS_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if_expression"],
+    block_kinds: &["block"],
+    ignored_kinds: &["line_comment", "block_comment"],
+    terminators: &[
+        "return",
+        "panic!(",
+        "unreachable!(",
+        "todo!(",
+        "unimplemented!(",
+        "std::process::exit(",
+        "process::exit(",
+    ],
+};
+
+/// Functions a test body runs through a dispatch table (`super::dispatch_calls`).
+pub const RS_DISPATCH: super::DispatchSpec = super::DispatchSpec {
+    containers: &["array_expression"],
+    names: &["identifier"],
+    references: &[],
+};
 
 #[cfg(test)]
 mod tests {

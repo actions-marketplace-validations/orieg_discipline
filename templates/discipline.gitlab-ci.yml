@@ -9,7 +9,8 @@ spec:
       default: test
       description: "Pipeline stage in which the discipline check job runs"
     image:
-      default: "ghcr.io/orieg/discipline:latest"
+      # Major tag tracks the latest v0 release; pin an exact version (v0.12.2) or a digest for reproducible gating.
+      default: "ghcr.io/orieg/discipline:v0"
       description: "Container image containing the statically-linked discipline binary"
     base_ref:
       default: ""
@@ -43,6 +44,7 @@ discipline:
   variables:
     GIT_STRATEGY: clone
     GIT_DEPTH: 0
+    DISCIPLINE_TRUST_WORKSPACE: "1"
   allow_failure: $[[ inputs.allow_failure ]]
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

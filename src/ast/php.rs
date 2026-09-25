@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use super::{AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts, TestFn};
+use super::functions::{self, FunctionSpec};
+use super::{AssertVocabulary, EscapeHatchSite, Fact, LanguagePack, ParsedFileFacts, TestFn};
 
 /// PHP language pack implementing [`LanguagePack`].
 pub struct PhpPack;
@@ -11,6 +12,13 @@ pub struct PhpPack;
 impl LanguagePack for PhpPack {
     fn id(&self) -> &'static str {
         "php"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -32,20 +40,126 @@ impl LanguagePack for PhpPack {
         let root = tree.root_node();
 
         let mut extractor = PhpExtractor {
+            dead: super::reach::dead_ranges(root, src, &PHP_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_php_test_path(path),
+            declared_test_path: functions::declared_test_path(path, &vocab.test_paths),
             facts: ParsedFileFacts {
                 has_parse_errors: root.has_error(),
                 ..Default::default()
             },
+            test_calls: Vec::new(),
+            helpers: std::collections::HashMap::new(),
         };
 
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
+        extractor.facts.functions = functions::extract(root, src, path, &PHP_FUNCTIONS);
+        super::mocks::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &PHP_MOCKS,
+            &vocab.mock_setup_fns,
+            &vocab.mock_assert_fns,
+        );
+        {
+            let tests = &extractor.facts.tests;
+            let spans: Vec<(usize, usize)> = tests
+                .iter()
+                .map(|t| (t.line, t.end_line.max(t.line)))
+                .collect();
+            let whole_file = is_php_test_path(path)
+                || functions::test_path(path)
+                || functions::declared_test_path(path, &vocab.test_paths);
+            let is_test_line =
+                |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+            extractor.facts.swallowed =
+                super::handlers::extract(root, src, &PHP_HANDLERS, &is_test_line);
+        }
+        super::retries::mark(root, src, &mut extractor.facts.tests, &PHP_RETRIES);
+        if functions::declared_test_path(path, &vocab.test_paths) {
+            for f in &mut extractor.facts.functions {
+                f.is_test = true;
+            }
+        }
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &PHP_MOCKS,
+            super::calls::SLEEP_VOCAB,
+            super::calls::sleeps,
+        );
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &PHP_MOCKS,
+            super::calls::TRIVIAL_ASSERT_VOCAB,
+            super::calls::trivial_asserts,
+        );
+        extractor.facts.prose = super::prose::extract(
+            root,
+            src,
+            &["comment", "string", "encapsed_string", "heredoc", "nowdoc"],
+        );
         Ok(extractor.facts)
     }
 }
+
+fn php_fn_is_test(node: Node, src: &str, path: &str) -> bool {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+        .unwrap_or("");
+    let mut cursor = node.walk();
+    let attributed = node.children(&mut cursor).any(|c| {
+        c.kind() == "attribute_list" && c.utf8_text(src.as_bytes()).unwrap_or("").contains("Test")
+    });
+    name.starts_with("test") || attributed || is_php_test_path(path) || functions::test_path(path)
+}
+
+pub const PHP_FUNCTIONS: FunctionSpec = FunctionSpec {
+    // An abstract or interface method has no `body` and is never described.
+    function_kinds: &["function_definition", "method_declaration"],
+    name_fields: &["name"],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    skip: functions::skip_none,
+    is_test: php_fn_is_test,
+    classify: functions::classify_php,
+};
+
+pub const PHP_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &[
+        "function_call_expression",
+        "member_call_expression",
+        "scoped_call_expression",
+        "object_creation_expression",
+    ],
+    callee_fields: &["function", "name"],
+};
+
+pub const PHP_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    handler_kinds: &["catch_clause"],
+    arm_of: &[],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    trivial: &["return", "return null", "return false", "continue"],
+    discard_kinds: &[],
+    discards: super::handlers::no_discard,
+    classify_discard: None,
+    call_value_kinds: &[],
+    // `@call()`: the error-control operator drops every diagnostic the call raises.
+    silence_kinds: &["error_suppression_expression"],
+    silences: super::handlers::php_silences,
+};
+
+pub const PHP_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["attribute_list", "comment"],
+};
 
 /// Determines whether a path is conventionally a PHP test file.
 pub fn is_php_test_path(path: &str) -> bool {
@@ -60,11 +174,29 @@ pub fn is_php_test_path(path: &str) -> bool {
 }
 
 struct PhpExtractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     vocab: &'a AssertVocabulary,
     is_test_path: bool,
+    /// Under a `[tests] paths` glob: a `test*` top-level function there is a test.
+    declared_test_path: bool,
     facts: ParsedFileFacts,
+    /// Same-file callees of each test (`Class::method` or `function`), in test order.
+    test_calls: Vec<Vec<String>>,
+    /// Non-test methods and functions a test may call.
+    helpers: std::collections::HashMap<String, super::HelperFacts>,
 }
+
+/// Closure nodes whose body runs only when called.
+const PHP_CLOSURE_KINDS: &[&str] = &[
+    "anonymous_function",
+    "anonymous_function_creation_expression",
+    "arrow_function",
+    "function_definition",
+    "method_declaration",
+    "class_declaration",
+];
 
 impl<'a> PhpExtractor<'a> {
     fn text(&self, node: Node) -> &'a str {
@@ -108,6 +240,106 @@ impl<'a> PhpExtractor<'a> {
 
     fn visit_root(&mut self, root: Node) {
         self.walk_top_level(root);
+        self.resolve_same_file_helpers();
+    }
+
+    /// Records a non-test method or function as a helper: its assertions and its
+    /// `throw`s are the failure paths a test inherits when it calls it.
+    fn record_helper(&mut self, key: String, node: Node) {
+        if self.helpers.contains_key(&key) {
+            return;
+        }
+        let mut h = TestFn::default();
+        if let Some(body) = node.child_by_field_name("body") {
+            self.scan_block(body, &mut h);
+            h.total_asserts += super::count_failure_exits(
+                body,
+                self.src,
+                &["throw_expression", "throw_statement"],
+                &[],
+                PHP_CLOSURE_KINDS,
+            );
+        }
+        self.helpers.insert(
+            key,
+            super::HelperFacts {
+                total_asserts: h.total_asserts,
+                strong_asserts: h.strong_asserts,
+                tautologies: h.tautologies,
+                fatal_asserts: h.fatal_asserts,
+            },
+        );
+    }
+
+    /// The same-file callees a test body runs: `$this->m()`, `self::m()`,
+    /// `static::m()` resolve to a method of `class_name`, `f()` to a function. A
+    /// closure assigned and not called runs nothing.
+    fn collect_calls(&self, node: Node, class_name: &str, calls: &mut Vec<String>) {
+        if PHP_CLOSURE_KINDS.contains(&node.kind())
+            && node
+                .parent()
+                .is_some_and(|p| p.kind() == "assignment_expression")
+        {
+            return;
+        }
+        match node.kind() {
+            "member_call_expression" => {
+                let on_this = node
+                    .child_by_field_name("object")
+                    .is_some_and(|o| self.text(o) == "$this");
+                if let (true, Some(n)) = (on_this, node.child_by_field_name("name")) {
+                    calls.push(format!("{class_name}::{}", self.text(n)));
+                }
+            }
+            "scoped_call_expression" => {
+                let scope = node
+                    .child_by_field_name("scope")
+                    .map(|s| self.text(s))
+                    .unwrap_or("");
+                if matches!(scope, "self" | "static") || scope == class_name {
+                    if let Some(n) = node.child_by_field_name("name") {
+                        calls.push(format!("{class_name}::{}", self.text(n)));
+                    }
+                }
+            }
+            "function_call_expression" => {
+                if let Some(f) = node.child_by_field_name("function") {
+                    if f.kind() == "name" {
+                        calls.push(self.text(f).to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.collect_calls(child, class_name, calls);
+        }
+    }
+
+    /// Adds each called helper's failure paths to the test. One level: a helper's
+    /// own callees are not followed.
+    fn resolve_same_file_helpers(&mut self) {
+        for (test, calls) in self.facts.tests.iter_mut().zip(&self.test_calls) {
+            for call in calls {
+                let Some(h) = self.helpers.get(call) else {
+                    continue;
+                };
+                let leaf = call.rsplit("::").next().unwrap_or(call);
+                // A configured assertion helper was already counted at the call.
+                if self.vocab.helper_fns.iter().any(|n| n == leaf) {
+                    test.total_asserts = test.total_asserts.saturating_sub(1);
+                    test.strong_asserts = test.strong_asserts.saturating_sub(1);
+                }
+                test.total_asserts += h.total_asserts;
+                test.strong_asserts += h.strong_asserts;
+                test.tautologies += h.tautologies;
+                test.fatal_asserts += h.fatal_asserts;
+                if h.total_asserts > h.tautologies {
+                    test.helper_checks += 1;
+                }
+            }
+        }
     }
 
     fn walk_top_level(&mut self, node: Node) {
@@ -127,7 +359,9 @@ impl<'a> PhpExtractor<'a> {
             return;
         }
 
-        if kind == "function_declaration" {
+        // tree-sitter-php names a top-level function `function_definition`; the older
+        // `function_declaration` kind is kept so a grammar bump cannot silently drop them.
+        if kind == "function_definition" || kind == "function_declaration" {
             self.visit_function(node);
             return;
         }
@@ -193,6 +427,7 @@ impl<'a> PhpExtractor<'a> {
         let name_is_test = method_name.starts_with("test");
 
         if !name_is_test && !annotated_as_test {
+            self.record_helper(format!("{class_name}::{method_name}"), node);
             return;
         }
 
@@ -216,11 +451,14 @@ impl<'a> PhpExtractor<'a> {
             ..Default::default()
         };
 
+        let mut calls = Vec::new();
         if let Some(body) = node.child_by_field_name("body") {
             self.scan_block(body, &mut test_fn);
+            self.collect_calls(body, class_name, &mut calls);
         }
 
         self.facts.tests.push(test_fn);
+        self.test_calls.push(calls);
     }
 
     fn visit_function(&mut self, node: Node) {
@@ -228,8 +466,13 @@ impl<'a> PhpExtractor<'a> {
         let func_name = name_node.map(|n| self.text(n)).unwrap_or("");
 
         let (annotated_as_test, is_ignored) = self.check_doc_or_attrs_for_test(node);
-        let name_is_test = func_name.starts_with("test");
+        // No PHP runner collects a top-level function by its name, so `testsCovering()`
+        // in `examples/` is not a test; the name counts only under a declared test path.
+        let name_is_test = func_name.starts_with("test") && self.declared_test_path;
 
+        // Any top-level function can be called from a test; in a test path it is also
+        // collected as a test itself, as before.
+        self.record_helper(func_name.to_string(), node);
         if !name_is_test && !annotated_as_test && !self.is_test_path {
             return;
         }
@@ -248,11 +491,14 @@ impl<'a> PhpExtractor<'a> {
             ..Default::default()
         };
 
+        let mut calls = Vec::new();
         if let Some(body) = node.child_by_field_name("body") {
             self.scan_block(body, &mut test_fn);
+            self.collect_calls(body, "", &mut calls);
         }
 
         self.facts.tests.push(test_fn);
+        self.test_calls.push(calls);
     }
 
     fn try_pest_test(&mut self, node: Node) {
@@ -301,19 +547,26 @@ impl<'a> PhpExtractor<'a> {
                     closure_or_fn = c;
                 }
             }
+            let mut calls = Vec::new();
             if let Some(body) = closure_or_fn.child_by_field_name("body") {
                 self.scan_block(body, &mut test_fn);
+                self.collect_calls(body, "", &mut calls);
             } else {
                 let mut cursor = closure_or_fn.walk();
                 for child in closure_or_fn.children(&mut cursor) {
                     if child.kind() == "compound_statement" {
                         self.scan_block(child, &mut test_fn);
+                        self.collect_calls(child, "", &mut calls);
                     }
                 }
             }
+            self.facts.tests.push(test_fn);
+            self.test_calls.push(calls);
+            return;
         }
 
         self.facts.tests.push(test_fn);
+        self.test_calls.push(Vec::new());
     }
 
     fn collect_arguments<'b>(&self, args_node: Node<'b>) -> Vec<Node<'b>> {
@@ -335,6 +588,9 @@ impl<'a> PhpExtractor<'a> {
     }
 
     fn scan_block(&self, node: Node, test_fn: &mut TestFn) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         let kind = node.kind();
 
         if kind == "member_call_expression"
@@ -482,6 +738,13 @@ impl<'a> PhpExtractor<'a> {
     }
 }
 
+pub const PHP_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if_statement"],
+    block_kinds: &["compound_statement"],
+    ignored_kinds: &["comment"],
+    terminators: &["return", "throw", "exit(", "die("],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,9 +780,9 @@ class CalcTest extends PHPUnit\Framework\TestCase {
     }
 
     #[test]
-    fn test_expanse_php_test_parsing() {
+    fn test_example_php_test_parsing() {
         let src = r#"<?php
-class ExpanseTest extends PHPUnit\Framework\TestCase
+class ExampleTest extends PHPUnit\Framework\TestCase
 {
     public function testSet()
     {
@@ -534,14 +797,41 @@ class ExpanseTest extends PHPUnit\Framework\TestCase
         let pack = PhpPack;
         let vocab = AssertVocabulary::default();
         let facts = pack
-            .extract("bindings/php/tests/ExpanseTest.php", src, &vocab)
+            .extract("bindings/php/tests/ExampleTest.php", src, &vocab)
             .unwrap();
 
         assert_eq!(facts.tests.len(), 1);
-        assert_eq!(facts.tests[0].name, "ExpanseTest::testSet");
+        assert_eq!(facts.tests[0].name, "ExampleTest::testSet");
         assert_eq!(facts.tests[0].total_asserts, 4);
         assert_eq!(facts.tests[0].strong_asserts, 1);
         assert!(!facts.tests[0].is_vacuous());
+    }
+
+    #[test]
+    fn top_level_test_named_function_outside_a_test_path_is_not_a_test() {
+        let src = "<?php\nfunction testsCovering(array $c, int $line): array\n{\n    return $c[$line] ?? [];\n}\n/** @test */\nfunction checks_cover(): void { assert(testsCovering([], 1) === []); }\n";
+        let pack = PhpPack;
+        let vocab = AssertVocabulary::default();
+        let names = |path: &str, vocab: &AssertVocabulary| -> Vec<String> {
+            let facts = pack.extract(path, src, vocab).unwrap();
+            facts.tests.iter().map(|t| t.name.clone()).collect()
+        };
+        assert_eq!(
+            names("examples/coverage-index.php", &vocab),
+            vec!["checks_cover"]
+        );
+        assert_eq!(
+            names("tests/coverage.php", &vocab),
+            vec!["testsCovering", "checks_cover"]
+        );
+        let declared = AssertVocabulary {
+            test_paths: vec!["qa/**".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            names("qa/coverage.php", &declared),
+            vec!["testsCovering", "checks_cover"]
+        );
     }
 
     #[test]
@@ -630,6 +920,55 @@ it('checks condition', function () {
         assert_eq!(facts.tests[1].name, "it: checks condition");
         assert_eq!(facts.tests[1].strong_asserts, 1);
         assert!(!facts.tests[1].is_vacuous());
+    }
+
+    #[test]
+    fn same_file_helpers_resolve_for_phpunit_and_pest() {
+        let src = r#"<?php
+class RowTest extends TestCase {
+    private function checkRow(array $r): void {
+        $this->assertSame(1, $r['id']);
+    }
+    private static function checkRole(array $r): void {
+        if ($r['role'] !== 'writer') { throw new RuntimeException('role'); }
+    }
+    public function testRow(): void {
+        $r = load();
+        $this->checkRow($r);
+        self::checkRole($r);
+    }
+    public function testDefinesButNeverRuns(): void {
+        $later = function () { $this->checkRow(load()); };
+    }
+}
+
+function expectValid(array $r): void {
+    if (!isset($r['id'])) { throw new InvalidArgumentException('id'); }
+}
+
+test('row is valid', function () {
+    expectValid(load());
+});
+"#;
+        let facts = PhpPack
+            .extract("tests/RowTest.php", src, &AssertVocabulary::default())
+            .unwrap();
+        let by = |n: &str| {
+            facts
+                .tests
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap_or_else(|| panic!("{n}: {:?}", facts.tests))
+        };
+        let row = by("RowTest::testRow");
+        assert_eq!(
+            (row.total_asserts, row.strong_asserts, row.helper_checks),
+            (2, 1, 2),
+            "{row:?}"
+        );
+        assert!(by("RowTest::testDefinesButNeverRuns").is_vacuous());
+        let pest = by("test: row is valid");
+        assert_eq!((pest.total_asserts, pest.helper_checks), (1, 1), "{pest:?}");
     }
 
     #[test]

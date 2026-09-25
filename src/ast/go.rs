@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use super::{AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts, TestFn};
+use super::functions::{self, FunctionSpec};
+use super::{AssertVocabulary, EscapeHatchSite, Fact, LanguagePack, ParsedFileFacts, TestFn};
 
 /// Go language pack implementing [`LanguagePack`].
 pub struct GoPack;
@@ -11,6 +12,13 @@ pub struct GoPack;
 impl LanguagePack for GoPack {
     fn id(&self) -> &'static str {
         "go"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -32,6 +40,7 @@ impl LanguagePack for GoPack {
         let root = tree.root_node();
 
         let mut extractor = GoExtractor {
+            dead: super::reach::dead_ranges(root, src, &GO_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_go_test_path(path),
@@ -46,6 +55,62 @@ impl LanguagePack for GoPack {
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
         extractor.resolve_same_file_helpers();
+        extractor.facts.functions = functions::extract(root, src, path, &GO_FUNCTIONS);
+        super::mocks::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &GO_MOCKS,
+            &vocab.mock_setup_fns,
+            &vocab.mock_assert_fns,
+        );
+        {
+            let tests = &extractor.facts.tests;
+            let spans: Vec<(usize, usize)> = tests
+                .iter()
+                .map(|t| (t.line, t.end_line.max(t.line)))
+                .collect();
+            // A file in a test directory, or one the repository declares as test scope, is
+            // test code line for line.
+            let whole_file = super::functions::test_path(path)
+                || super::functions::declared_test_path(path, &vocab.test_paths);
+            let is_test_line =
+                |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+            extractor.facts.swallowed =
+                super::handlers::extract(root, src, &GO_HANDLERS, &is_test_line);
+        }
+        super::retries::mark(root, src, &mut extractor.facts.tests, &GO_RETRIES);
+        if super::functions::declared_test_path(path, &vocab.test_paths) {
+            for f in &mut extractor.facts.functions {
+                f.is_test = true;
+            }
+        }
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &GO_MOCKS,
+            super::calls::SLEEP_VOCAB,
+            super::calls::sleeps,
+        );
+        super::calls::count(
+            root,
+            src,
+            &mut extractor.facts.tests,
+            &GO_MOCKS,
+            super::calls::TRIVIAL_ASSERT_VOCAB,
+            super::calls::trivial_asserts,
+        );
+        super::bounds::go(root, src, &mut extractor.facts.tests);
+        extractor.facts.prose = super::prose::extract(
+            root,
+            src,
+            &[
+                "comment",
+                "interpreted_string_literal",
+                "raw_string_literal",
+            ],
+        );
         Ok(extractor.facts)
     }
 }
@@ -78,6 +143,8 @@ pub fn is_go_test_path(path: &str) -> bool {
 }
 
 struct GoExtractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     vocab: &'a AssertVocabulary,
     is_test_path: bool,
@@ -102,7 +169,10 @@ impl<'a> GoExtractor<'a> {
                 .trim_end_matches("*/")
                 .trim();
 
-            if trimmed.starts_with("nolint") || trimmed.starts_with("revive:disable") {
+            if trimmed.starts_with("nolint")
+                || trimmed.starts_with("lint:ignore")
+                || trimmed.starts_with("revive:disable")
+            {
                 self.facts
                     .escape_hatches
                     .push(EscapeHatchSite::LinterDisable {
@@ -158,6 +228,7 @@ impl<'a> GoExtractor<'a> {
             let mut direct_calls = Vec::new();
             if let Some(body) = node.child_by_field_name("body") {
                 self.scan_block(body, &mut test_fn, func_name, &mut direct_calls);
+                super::dispatch_calls(body, self.src, &GO_DISPATCH, &mut direct_calls);
             }
 
             self.facts.tests.push(test_fn);
@@ -167,6 +238,13 @@ impl<'a> GoExtractor<'a> {
                 let mut helper_fn = TestFn::default();
                 let mut dummy_calls = Vec::new();
                 self.scan_block(body, &mut helper_fn, func_name, &mut dummy_calls);
+                helper_fn.total_asserts += super::count_failure_exits(
+                    body,
+                    self.src,
+                    &["call_expression"],
+                    &["panic("],
+                    &["func_literal"],
+                );
                 let facts = super::HelperFacts {
                     total_asserts: helper_fn.total_asserts,
                     strong_asserts: helper_fn.strong_asserts,
@@ -251,6 +329,9 @@ impl<'a> GoExtractor<'a> {
         parent_name: &str,
         direct_calls: &mut Vec<String>,
     ) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         match node.kind() {
             "call_expression" => {
                 self.inspect_call(node, test_fn, parent_name, direct_calls);
@@ -307,6 +388,7 @@ impl<'a> GoExtractor<'a> {
             if let Some(func_lit) = args.iter().find(|a| a.kind() == "func_literal") {
                 if let Some(sub_body) = func_lit.child_by_field_name("body") {
                     self.scan_block(sub_body, &mut sub_test, &sub_name, &mut sub_calls);
+                    super::dispatch_calls(sub_body, self.src, &GO_DISPATCH, &mut sub_calls);
                 }
             }
 
@@ -324,7 +406,12 @@ impl<'a> GoExtractor<'a> {
             || call_text == "Skip"
             || call_text == "Skipf"
         {
-            test_fn.ignored = true;
+            // `if testing.Short() { t.Skip(...) }` runs in a full run: a conditional skip,
+            // reported as a note. A constant condition skips every run.
+            match enclosing_if_condition(node, self.src) {
+                Some(cond) if cond != "true" => test_fn.conditional_ignore = Some(cond),
+                _ => test_fn.ignored = true,
+            }
             return;
         }
 
@@ -436,6 +523,9 @@ impl<'a> GoExtractor<'a> {
                         test.strong_asserts += h.strong_asserts;
                         test.tautologies += h.tautologies;
                         test.fatal_asserts += h.fatal_asserts;
+                        if h.total_asserts > h.tautologies {
+                            test.helper_checks += 1;
+                        }
                     }
                 }
             }
@@ -466,6 +556,85 @@ impl<'a> GoExtractor<'a> {
         }
     }
 }
+
+fn go_fn_is_test(node: tree_sitter::Node, src: &str, path: &str) -> bool {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+        .unwrap_or("");
+    path.ends_with("_test.go") || is_go_test_function_name(name)
+}
+
+/// The condition of the nearest `if` whose body holds `node`, stopping at the function
+/// the call is in; `None` when the call runs unconditionally.
+fn enclosing_if_condition(node: Node, src: &[u8]) -> Option<String> {
+    let mut cur = node;
+    while let Some(p) = cur.parent() {
+        match p.kind() {
+            "function_declaration" | "method_declaration" | "func_literal" => return None,
+            "if_statement" => {
+                let cond = p.child_by_field_name("condition")?;
+                let in_body = p
+                    .child_by_field_name("consequence")
+                    .is_some_and(|c| c.id() == cur.id());
+                if in_body {
+                    return cond.utf8_text(src).ok().map(|t| t.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+        cur = p;
+    }
+    None
+}
+
+pub const GO_FUNCTIONS: FunctionSpec = FunctionSpec {
+    function_kinds: &["function_declaration", "method_declaration"],
+    name_fields: &["name"],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    skip: functions::skip_none,
+    is_test: go_fn_is_test,
+    classify: functions::classify_go,
+};
+
+pub const GO_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &["call_expression"],
+    callee_fields: &["function"],
+};
+
+pub const GO_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    handler_kinds: &[],
+    arm_of: &[],
+    body_fields: &[],
+    ignored_kinds: &["comment"],
+    trivial: &[],
+    discard_kinds: &["assignment_statement", "short_var_declaration"],
+    discards: super::handlers::go_discards,
+    classify_discard: Some(super::handlers::go_discard_class),
+    call_value_kinds: &[],
+    silence_kinds: &[],
+    silences: super::handlers::no_discard,
+};
+
+pub const GO_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["call_expression"],
+};
+
+pub const GO_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if_statement"],
+    // A Go block holds its statements in a `statement_list`.
+    block_kinds: &["statement_list"],
+    ignored_kinds: &["comment"],
+    terminators: &["return", "panic(", "t.FailNow()", "os.Exit("],
+};
+
+/// Functions a test body runs through a dispatch table (`super::dispatch_calls`).
+pub const GO_DISPATCH: super::DispatchSpec = super::DispatchSpec {
+    containers: &["literal_value"],
+    names: &["identifier"],
+    references: &[],
+};
 
 #[cfg(test)]
 mod tests {
@@ -500,6 +669,20 @@ func TestCalculator(t *testing.T) {
         assert_eq!(t.strong_asserts, 2);
         assert!(!t.is_vacuous());
         assert!(!t.ignored);
+    }
+
+    #[test]
+    fn a_skip_under_an_if_is_conditional_and_an_unconditional_one_is_ignored() {
+        let src = "package p\n\nimport \"testing\"\n\nfunc TestShort(t *testing.T) {\n\tif testing.Short() {\n\t\tt.Skip(\"short mode\")\n\t}\n\tif 1+1 != 2 {\n\t\tt.Fatal(\"math\")\n\t}\n}\n\nfunc TestAlways(t *testing.T) {\n\tt.Skip(\"later\")\n}\n\nfunc TestConstant(t *testing.T) {\n\tif true {\n\t\tt.Skip(\"later\")\n\t}\n}\n";
+        let facts = GoPack
+            .extract("p_test.go", src, &AssertVocabulary::default())
+            .unwrap();
+        let by = |n: &str| facts.tests.iter().find(|t| t.name == n).unwrap();
+        let short = by("TestShort");
+        assert!(!short.ignored);
+        assert_eq!(short.conditional_ignore.as_deref(), Some("testing.Short()"));
+        assert!(by("TestAlways").ignored && by("TestAlways").conditional_ignore.is_none());
+        assert!(by("TestConstant").ignored && by("TestConstant").conditional_ignore.is_none());
     }
 
     #[test]

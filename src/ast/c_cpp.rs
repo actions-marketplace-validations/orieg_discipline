@@ -3,9 +3,58 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
+use super::functions::{self, FunctionSpec};
 use super::{
-    collect_error_nodes_info, AssertVocabulary, EscapeHatchSite, LanguagePack, ParsedFileFacts,
-    TestFn,
+    collect_error_nodes_info, AssertVocabulary, EscapeHatchSite, Fact, LanguagePack,
+    ParsedFileFacts, TestFn,
+};
+
+/// How many calls deep a test's same-file helpers are followed: a C or C++ test `main`
+/// usually drives check functions that call one `require`-style helper that aborts.
+const HELPER_DEPTH: usize = 3;
+
+/// A same-file helper's checks with those of the helpers it calls, up to `HELPER_DEPTH`
+/// levels; a recursive call is not followed again. `None` when `name` is not a helper.
+fn transitive_helper(
+    name: &str,
+    helpers: &std::collections::HashMap<String, super::HelperFacts>,
+    calls: &std::collections::HashMap<String, Vec<String>>,
+    path: &mut Vec<String>,
+) -> Option<super::HelperFacts> {
+    let own = helpers.get(name)?;
+    if path.iter().any(|p| p == name) {
+        return None;
+    }
+    let mut out = super::HelperFacts {
+        total_asserts: own.total_asserts,
+        strong_asserts: own.strong_asserts,
+        tautologies: own.tautologies,
+        fatal_asserts: own.fatal_asserts,
+    };
+    if path.len() + 1 < HELPER_DEPTH {
+        path.push(name.to_string());
+        for callee in calls.get(name).into_iter().flatten() {
+            if let Some(sub) = transitive_helper(callee, helpers, calls, path) {
+                out.total_asserts += sub.total_asserts;
+                out.strong_asserts += sub.strong_asserts;
+                out.tautologies += sub.tautologies;
+                out.fatal_asserts += sub.fatal_asserts;
+            }
+        }
+        path.pop();
+    }
+    Some(out)
+}
+
+/// Functions a test or helper body runs through a table (`super::dispatch_calls`):
+/// `std::vector<std::pair<std::string, void (*)(Scope)>> tests = {{"get", TestGet}}`,
+/// `void (*checks[])(void) = {check_a, &check_b}`. A table declared at file scope is
+/// outside the body and is not read.
+pub const C_DISPATCH: super::DispatchSpec = super::DispatchSpec {
+    containers: &["initializer_list"],
+    names: &["identifier"],
+    // `&check_b` in a table: the name's grandparent is the list, so `names` finds it.
+    references: &[],
 };
 
 /// C language pack implementing [`LanguagePack`].
@@ -14,6 +63,13 @@ pub struct CPack;
 impl LanguagePack for CPack {
     fn id(&self) -> &'static str {
         "c"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -25,10 +81,34 @@ impl LanguagePack for CPack {
     }
 
     fn extract(&self, path: &str, src: &str, vocab: &AssertVocabulary) -> Result<ParsedFileFacts> {
+        let facts = self.extract_as_c(path, src, vocab)?;
+        // A `.h` header may be C++ (a class, a namespace): when the C grammar leaves error
+        // regions, the C++ reading is kept if it leaves fewer.
+        if facts.has_parse_errors && super::extension(path) == Some("h") {
+            let cpp = CppPack.extract(path, src, vocab)?;
+            if cpp.skipped_error_nodes_count < facts.skipped_error_nodes_count {
+                return Ok(cpp);
+            }
+        }
+        Ok(facts)
+    }
+}
+
+impl CPack {
+    fn extract_as_c(
+        &self,
+        path: &str,
+        src: &str,
+        vocab: &AssertVocabulary,
+    ) -> Result<ParsedFileFacts> {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_c::LANGUAGE.into())
             .map_err(|e| anyhow!("failed to load the C grammar: {e}"))?;
+        let masked = mask_macros(src, vocab);
+        let src = masked.as_deref().unwrap_or(src);
+        let guarded = super::c_macros::mask_cplusplus_guards(src);
+        let src = guarded.as_deref().unwrap_or(src);
         let tree = parser
             .parse(src, None)
             .ok_or_else(|| anyhow!("tree-sitter returned no tree"))?;
@@ -36,11 +116,13 @@ impl LanguagePack for CPack {
 
         let (has_errors, first_line, error_count) = collect_error_nodes_info(root);
         let mut extractor = CCppExtractor {
+            dead: super::reach::dead_ranges(root, src, &C_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_c_cpp_test_path(path),
             test_spans: Vec::new(),
             helpers: std::collections::HashMap::new(),
+            helper_calls: std::collections::HashMap::new(),
             test_calls: Vec::new(),
             facts: ParsedFileFacts {
                 has_parse_errors: has_errors,
@@ -52,6 +134,7 @@ impl LanguagePack for CPack {
 
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
+        shared_facts(root, src, path, vocab, &mut extractor.facts);
         Ok(extractor.facts)
     }
 }
@@ -62,6 +145,13 @@ pub struct CppPack;
 impl LanguagePack for CppPack {
     fn id(&self) -> &'static str {
         "cpp"
+    }
+
+    fn supplies(&self, fact: Fact) -> bool {
+        matches!(
+            fact,
+            Fact::Tests | Fact::EscapeHatches | Fact::Functions | Fact::Handlers | Fact::Prose
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -80,6 +170,8 @@ impl LanguagePack for CppPack {
         parser
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
             .map_err(|e| anyhow!("failed to load the C++ grammar: {e}"))?;
+        let masked = mask_macros(src, vocab);
+        let src = masked.as_deref().unwrap_or(src);
         let tree = parser
             .parse(src, None)
             .ok_or_else(|| anyhow!("tree-sitter returned no tree"))?;
@@ -87,11 +179,13 @@ impl LanguagePack for CppPack {
 
         let (has_errors, first_line, error_count) = collect_error_nodes_info(root);
         let mut extractor = CCppExtractor {
+            dead: super::reach::dead_ranges(root, src, &C_REACH),
             src: src.as_bytes(),
             vocab,
             is_test_path: is_c_cpp_test_path(path),
             test_spans: Vec::new(),
             helpers: std::collections::HashMap::new(),
+            helper_calls: std::collections::HashMap::new(),
             test_calls: Vec::new(),
             facts: ParsedFileFacts {
                 has_parse_errors: has_errors,
@@ -103,9 +197,156 @@ impl LanguagePack for CppPack {
 
         extractor.collect_comments_and_escape_hatches(root);
         extractor.visit_root(root);
+        shared_facts(root, src, path, vocab, &mut extractor.facts);
         Ok(extractor.facts)
     }
 }
+
+/// `src` with the extension macros the grammar cannot read rewritten, byte for byte
+/// (`super::c_macros`); `None` when the file uses none.
+fn mask_macros(src: &str, vocab: &AssertVocabulary) -> Option<String> {
+    use super::c_macros::{lists, mask, BUILTIN_FUNCTION_MACROS, BUILTIN_MACROS};
+    mask(
+        src,
+        &lists(&vocab.c_macros, BUILTIN_MACROS),
+        &lists(&vocab.c_function_macros, BUILTIN_FUNCTION_MACROS),
+    )
+}
+
+/// The facts the shared walkers supply, for both grammars (they share node kinds).
+fn shared_facts(
+    root: Node,
+    src: &str,
+    path: &str,
+    vocab: &AssertVocabulary,
+    facts: &mut ParsedFileFacts,
+) {
+    facts.functions = functions::extract(root, src, path, &C_FUNCTIONS);
+    super::mocks::count(
+        root,
+        src,
+        &mut facts.tests,
+        &C_MOCKS,
+        &vocab.mock_setup_fns,
+        &vocab.mock_assert_fns,
+    );
+    {
+        let spans: Vec<(usize, usize)> = facts
+            .tests
+            .iter()
+            .map(|t| (t.line, t.end_line.max(t.line)))
+            .collect();
+        let whole_file = is_c_cpp_test_path(path)
+            || functions::test_path(path)
+            || functions::declared_test_path(path, &vocab.test_paths);
+        let is_test_line = |l: usize| whole_file || spans.iter().any(|(a, b)| *a <= l && l <= *b);
+        facts.swallowed = super::handlers::extract(root, src, &C_HANDLERS, &is_test_line);
+    }
+    super::retries::mark(root, src, &mut facts.tests, &C_RETRIES);
+    if functions::declared_test_path(path, &vocab.test_paths) {
+        for f in &mut facts.functions {
+            f.is_test = true;
+        }
+    }
+    super::calls::count(
+        root,
+        src,
+        &mut facts.tests,
+        &C_MOCKS,
+        super::calls::SLEEP_VOCAB,
+        super::calls::sleeps,
+    );
+    super::calls::count(
+        root,
+        src,
+        &mut facts.tests,
+        &C_MOCKS,
+        super::calls::TRIVIAL_ASSERT_VOCAB,
+        super::calls::trivial_asserts,
+    );
+    facts.prose = super::prose::extract(
+        root,
+        src,
+        &["comment", "string_literal", "raw_string_literal"],
+    );
+}
+
+/// A test-framework macro body (`TEST(Suite, Name) {}`) parses as a function definition
+/// whose declarator is the macro call; a C driver's `test_*` / `*_smoke` function or
+/// anything in a test path is a test too.
+fn c_fn_is_test(node: Node, src: &str, path: &str) -> bool {
+    let decl = node
+        .child_by_field_name("declarator")
+        .and_then(|n| n.utf8_text(src.as_bytes()).ok())
+        .unwrap_or("");
+    let name = decl
+        .split(['(', ' '])
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('*');
+    const MACROS: &[&str] = &[
+        "TEST",
+        "TEST_F",
+        "TEST_P",
+        "TYPED_TEST",
+        "TYPED_TEST_P",
+        "TEST_CASE",
+        "TEST_CASE_METHOD",
+        "SCENARIO",
+        "TEST_CASE_TEMPLATE",
+    ];
+    MACROS.contains(&name)
+        || name.starts_with("test_")
+        || name.ends_with("_test")
+        || name.starts_with("smoke_")
+        || name.ends_with("_smoke")
+        || is_c_cpp_test_path(path)
+        || functions::test_path(path)
+}
+
+pub const C_FUNCTIONS: FunctionSpec = FunctionSpec {
+    // `= default` / `= delete` and a pure-virtual declaration have no `body`.
+    function_kinds: &["function_definition"],
+    name_fields: &["declarator"],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    skip: functions::skip_none,
+    is_test: c_fn_is_test,
+    classify: functions::classify_c,
+};
+
+pub const C_MOCKS: super::mocks::MockSpec = super::mocks::MockSpec {
+    call_kinds: &["call_expression"],
+    callee_fields: &["function"],
+};
+
+pub const C_HANDLERS: super::handlers::HandlerSpec = super::handlers::HandlerSpec {
+    // C has no `catch_clause`; the kind never matches there.
+    handler_kinds: &["catch_clause"],
+    arm_of: &[],
+    body_fields: &["body"],
+    ignored_kinds: &["comment"],
+    trivial: &[
+        "return",
+        "return false",
+        "return nullptr",
+        "return NULL",
+        "return {}",
+        "continue",
+        "break",
+    ],
+    // `(void)call()` throws the result away; `(void)x` of a variable is not a call.
+    discard_kinds: &["cast_expression"],
+    discards: super::handlers::c_discards,
+    classify_discard: Some(super::handlers::c_discard_class),
+    call_value_kinds: &["call_expression"],
+    silence_kinds: &[],
+    silences: super::handlers::no_discard,
+};
+
+pub const C_RETRIES: super::retries::RetrySpec = super::retries::RetrySpec {
+    marker_kinds: &["call_expression"],
+};
 
 /// Determines whether a path is conventionally a C or C++ test file.
 pub fn is_c_cpp_test_path(path: &str) -> bool {
@@ -136,11 +377,16 @@ pub fn is_c_cpp_test_path(path: &str) -> bool {
 }
 
 struct CCppExtractor<'a> {
+    /// Byte ranges no execution reaches (`super::reach`).
+    dead: super::reach::DeadRanges,
     src: &'a [u8],
     vocab: &'a AssertVocabulary,
     is_test_path: bool,
     test_spans: Vec<std::ops::Range<usize>>,
     helpers: std::collections::HashMap<String, super::HelperFacts>,
+    /// The calls each same-file helper makes: `main` -> `check_seek` -> `require` is a
+    /// test's checks two levels down.
+    helper_calls: std::collections::HashMap<String, Vec<String>>,
     test_calls: Vec<Vec<String>>,
     facts: ParsedFileFacts,
 }
@@ -187,10 +433,14 @@ impl<'a> CCppExtractor<'a> {
     }
 
     fn resolve_same_file_helpers(&mut self) {
+        let (helpers, helper_calls) = (&self.helpers, &self.helper_calls);
         for (i, test) in self.facts.tests.iter_mut().enumerate() {
             if let Some(calls) = self.test_calls.get(i) {
                 for call in calls {
-                    if let Some(h) = self.helpers.get(call) {
+                    let mut path = Vec::new();
+                    if let Some(h) =
+                        transitive_helper(call, helpers, helper_calls, &mut path).as_ref()
+                    {
                         if self.vocab.helper_fns.iter().any(|name| name == call) {
                             test.total_asserts = test.total_asserts.saturating_sub(1);
                         }
@@ -198,6 +448,9 @@ impl<'a> CCppExtractor<'a> {
                         test.strong_asserts += h.strong_asserts;
                         test.tautologies += h.tautologies;
                         test.fatal_asserts += h.fatal_asserts;
+                        if h.total_asserts > h.tautologies {
+                            test.helper_checks += 1;
+                        }
                     }
                 }
             }
@@ -256,6 +509,7 @@ impl<'a> CCppExtractor<'a> {
                         let mut helper_fn = TestFn::default();
                         let mut dummy_calls = Vec::new();
                         self.extract_assertions_in_body(body, &mut helper_fn, &mut dummy_calls);
+                        super::dispatch_calls(body, self.src, &C_DISPATCH, &mut dummy_calls);
                         self.helpers.insert(
                             fn_name.to_string(),
                             super::HelperFacts {
@@ -265,6 +519,7 @@ impl<'a> CCppExtractor<'a> {
                                 fatal_asserts: helper_fn.fatal_asserts,
                             },
                         );
+                        self.helper_calls.insert(fn_name.to_string(), dummy_calls);
                     }
                 }
                 i += 1;
@@ -299,6 +554,7 @@ impl<'a> CCppExtractor<'a> {
                                 };
                                 let mut calls = Vec::new();
                                 self.extract_assertions_in_body(body, &mut test_fn, &mut calls);
+                                super::dispatch_calls(body, self.src, &C_DISPATCH, &mut calls);
                                 self.test_calls.push(calls);
                                 self.test_spans.push(call.start_byte()..body.end_byte());
                                 self.facts.tests.push(test_fn);
@@ -363,6 +619,7 @@ impl<'a> CCppExtractor<'a> {
             };
             let mut calls = Vec::new();
             self.extract_assertions_in_body(body, &mut test_fn, &mut calls);
+            super::dispatch_calls(body, self.src, &C_DISPATCH, &mut calls);
             self.test_calls.push(calls);
             return Some(test_fn);
         }
@@ -391,6 +648,7 @@ impl<'a> CCppExtractor<'a> {
             };
             let mut calls = Vec::new();
             self.extract_assertions_in_body(body, &mut test_fn, &mut calls);
+            super::dispatch_calls(body, self.src, &C_DISPATCH, &mut calls);
             self.test_calls.push(calls);
             return Some(test_fn);
         }
@@ -418,6 +676,7 @@ impl<'a> CCppExtractor<'a> {
             };
             let mut calls = Vec::new();
             self.extract_assertions_in_body(body, &mut test_fn, &mut calls);
+            super::dispatch_calls(body, self.src, &C_DISPATCH, &mut calls);
             self.test_calls.push(calls);
             return Some(test_fn);
         }
@@ -534,6 +793,9 @@ impl<'a> CCppExtractor<'a> {
         test_fn: &mut TestFn,
         calls: &mut Vec<String>,
     ) {
+        if super::reach::is_dead(&self.dead, node.start_byte()) {
+            return;
+        }
         let kind = node.kind();
 
         if kind == "static_assert_declaration" {
@@ -599,6 +861,11 @@ impl<'a> CCppExtractor<'a> {
             {
                 test_fn.total_asserts += 1;
                 test_fn.strong_asserts += 1;
+                // Ending the process is as fatal as `assert` / `ASSERT_*`; `fail` means
+                // different things in different frameworks.
+                if fn_name != "fail" {
+                    test_fn.fatal_asserts += 1;
+                }
                 return;
             }
 
@@ -861,6 +1128,13 @@ impl<'a> CCppExtractor<'a> {
     }
 }
 
+pub const C_REACH: super::reach::ReachSpec = super::reach::ReachSpec {
+    if_kinds: &["if_statement"],
+    block_kinds: &["compound_statement"],
+    ignored_kinds: &["comment"],
+    terminators: &["return", "abort()", "exit(", "_exit(", "throw"],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,44 +1235,44 @@ TEST_CASE("skipped case", "[.hidden]") {
     }
 
     #[test]
-    fn test_c_abi_smoke_modern_api_expanse_fixture() {
+    fn test_c_abi_smoke_modern_api_example_fixture() {
         let src = r#"
-/* Compile-and-run check of include/expanse.h against the built library. */
-#include <expanse.h>
+/* Compile-and-run check of include/example.h against the built library. */
+#include <example.h>
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
 
 int main(void) {
-    printf("libexpanse %s\n", expanse_version());
+    printf("libexample %s\n", example_version());
 
-    expanse_map_t *m = expanse_map_new();
+    example_map_t *m = example_map_new();
     for (uint64_t k = 0; k < 1000; k++) {
-        uint64_t *slot = expanse_map_ins_slot(m, k * 3);
+        uint64_t *slot = example_map_ins_slot(m, k * 3);
         *slot = k;
     }
     uint64_t v = 0, key = 0;
-    assert(expanse_map_get(m, 300, &v) && v == 100);
-    assert(expanse_map_count_range(m, 0, 299) == 100);
-    assert(expanse_map_by_count(m, 10, &key, &v) && key == 30 && v == 10);
-    assert(expanse_map_next_after(m, 30, &key, NULL) && key == 33);
+    assert(example_map_get(m, 300, &v) && v == 100);
+    assert(example_map_count_range(m, 0, 299) == 100);
+    assert(example_map_by_count(m, 10, &key, &v) && key == 30 && v == 10);
+    assert(example_map_next_after(m, 30, &key, NULL) && key == 33);
     printf("map: len=%llu mem=%zu rank/select ok\n",
-           (unsigned long long) expanse_map_len(m), expanse_map_mem_used(m));
-    expanse_map_free(m);
+           (unsigned long long) example_map_len(m), example_map_mem_used(m));
+    example_map_free(m);
 
-    expanse_sync_map_t *s = expanse_sync_map_new();
-    expanse_sync_map_insert(s, 7, 77, NULL);
-    expanse_sync_map_reader_t *r = expanse_sync_map_reader_new(s);
-    assert(expanse_sync_map_reader_get(r, 7, &v) && v == 77);
-    expanse_sync_map_reader_free(r);
-    expanse_sync_map_free(s);
+    example_sync_map_t *s = example_sync_map_new();
+    example_sync_map_insert(s, 7, 77, NULL);
+    example_sync_map_reader_t *r = example_sync_map_reader_new(s);
+    assert(example_sync_map_reader_get(r, 7, &v) && v == 77);
+    example_sync_map_reader_free(r);
+    example_sync_map_free(s);
     printf("sync: concurrent reader ok\n");
 
-    expanse_bytesmap_t *b = expanse_bytesmap_new();
-    expanse_bytesmap_insert(b, "a\0b", 3, 5, NULL);
-    assert(expanse_bytesmap_get(b, "a\0b", 3, &v) && v == 5);
-    assert(!expanse_bytesmap_get(b, "a", 1, &v));
-    expanse_bytesmap_free(b);
+    example_bytesmap_t *b = example_bytesmap_new();
+    example_bytesmap_insert(b, "a\0b", 3, 5, NULL);
+    assert(example_bytesmap_get(b, "a\0b", 3, &v) && v == 5);
+    assert(!example_bytesmap_get(b, "a", 1, &v));
+    example_bytesmap_free(b);
     printf("bytesmap: embedded NUL ok\nok\n");
     return 0;
 }
@@ -1006,7 +1280,7 @@ int main(void) {
         let c_pack = CPack;
         let facts = c_pack
             .extract(
-                "crates/expanse-capi/smoke/modern_api_smoke.c",
+                "crates/example-capi/smoke/modern_api_smoke.c",
                 src,
                 &AssertVocabulary::default(),
             )
@@ -1216,5 +1490,122 @@ int main() {
         assert_eq!(facts2.tests.len(), 1);
         assert!(!facts2.tests[0].is_vacuous());
         assert_eq!(facts2.tests[0].strong_asserts, 1);
+    }
+
+    fn parse_errors(src: &str, vocab: &AssertVocabulary) -> usize {
+        CPack
+            .extract("ext/judy.c", src, vocab)
+            .unwrap()
+            .skipped_error_nodes_count
+    }
+
+    #[test]
+    fn extension_macros_parse_without_error_regions() {
+        let v = AssertVocabulary::default();
+        for src in [
+            "PHP_METHOD(Judy, size)\n{\n\tRETURN_LONG(1);\n}\n",
+            "ZEND_DECLARE_MODULE_GLOBALS(judy)\n\nstatic int f(void) { return 1; }\n",
+            "ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_x, 0, 0, IS_LONG, 0)\n\tZEND_ARG_TYPE_INFO(0, i, IS_LONG, 0)\nZEND_END_ARG_INFO()\n",
+            "static void f(zval *z) {\n\tZEND_PARSE_PARAMETERS_START(1, 1)\n\t\tZ_PARAM_ZVAL(z)\n\tZEND_PARSE_PARAMETERS_END();\n}\n",
+            "static const zend_function_entry m[] = {\n\tPHP_ME(Judy, size, arginfo_x, ZEND_ACC_PUBLIC)\n\tPHP_FE_END\n};\n",
+            "typedef struct {\n\tPyObject_HEAD\n\tint n;\n} Box;\n",
+        ] {
+            assert_eq!(parse_errors(src, &v), 0, "{src}");
+        }
+        // Negative control: a macro no list names is still an error region, and becomes
+        // readable once configured.
+        let own = "MYEXT_METHOD(Judy, size)\n{\n\tMYEXT_CHECK(1)\n\treturn;\n}\n";
+        assert!(parse_errors(own, &v) > 0);
+        let configured = AssertVocabulary {
+            c_macros: vec!["MYEXT_CHECK".to_string()],
+            c_function_macros: vec!["MYEXT_METHOD".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(parse_errors(own, &configured), 0);
+    }
+
+    #[test]
+    fn findings_inside_a_macro_function_keep_their_lines() {
+        let src = "ZEND_BEGIN_ARG_INFO_EX(arginfo_clear, 0, 0, 0)\nZEND_END_ARG_INFO()\n\nPHP_METHOD(Judy, clear)\n{\n\tZEND_PARSE_PARAMETERS_NONE();\n\t(void)zend_hash_clean(h);\n}\n\nPHP_METHOD(Judy, later)\n{\n}\n";
+        let facts = CPack
+            .extract("ext/judy.c", src, &AssertVocabulary::default())
+            .unwrap();
+        assert_eq!(facts.skipped_error_nodes_count, 0);
+        let lines: Vec<usize> = facts.swallowed.iter().map(|s| s.line).collect();
+        assert_eq!(lines, vec![7], "{:?}", facts.swallowed);
+        assert!(facts.swallowed[0]
+            .snippet
+            .starts_with("(void)zend_hash_clean"));
+        let later = facts
+            .functions
+            .iter()
+            .find(|f| f.name == "Judy_later")
+            .unwrap_or_else(|| panic!("{:?}", facts.functions));
+        assert_eq!(
+            (later.line, later.shape.clone()),
+            (10, functions::BodyShape::Empty)
+        );
+    }
+
+    #[test]
+    fn helpers_are_followed_three_calls_deep_and_recursion_stops() {
+        let v = AssertVocabulary::default();
+        let asserts =
+            |src: &str| CppPack.extract("tests/t.cc", src, &v).unwrap().tests[0].total_asserts;
+        let require = "namespace {\nvoid Require(bool c) { if (!c) std::abort(); }\n";
+        // main -> CheckA -> Require: the checks moved two levels down still count.
+        let two = format!("{require}void CheckA() {{ Require(f()); Require(g()); }}\n}}  // namespace\nint main() {{ CheckA(); return 0; }}\n");
+        assert_eq!(asserts(&two), 2);
+        // Three levels is the limit; a fourth is not followed.
+        let three = format!("{require}void CheckA() {{ Require(f()); }}\nvoid Suite() {{ CheckA(); }}\n}}\nint main() {{ Suite(); return 0; }}\n");
+        assert_eq!(asserts(&three), 1);
+        let four = format!("{require}void CheckA() {{ Require(f()); }}\nvoid Suite() {{ CheckA(); }}\nvoid All() {{ Suite(); }}\n}}\nint main() {{ All(); return 0; }}\n");
+        assert_eq!(asserts(&four), 0);
+        // Mutual recursion terminates and counts each helper once per path.
+        let cycle = "void A(int n);\nvoid B(int n) { if (n) A(n - 1); assert(n >= 0); }\nvoid A(int n) { if (n) B(n - 1); }\nint main() { A(3); return 0; }\n";
+        assert_eq!(asserts(cycle), 1);
+        // A self-recursive helper's checks count once, not once per level.
+        let recursive = "void Walk(int n) { assert(n >= 0); if (n) Walk(n - 1); }\nint main() { Walk(3); return 0; }\n";
+        assert_eq!(asserts(recursive), 1);
+    }
+
+    #[test]
+    fn c_headers_with_extern_c_guards_and_cpp_headers_parse() {
+        let v = AssertVocabulary::default();
+        let guarded = "#ifndef X_H\n#define X_H\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nint x_open(const char *p);\n#ifdef __cplusplus\n}\n#endif\n#endif\n";
+        assert_eq!(
+            CPack
+                .extract("include/x.h", guarded, &v)
+                .unwrap()
+                .skipped_error_nodes_count,
+            0
+        );
+        let cpp = "#pragma once\n#include <string>\nnamespace db {\nclass Table {\n public:\n  explicit Table(std::string name);\n  bool Contains(const std::string& k) const;\n private:\n  std::string name_;\n};\n}  // namespace db\n";
+        let facts = CPack.extract("include/table.h", cpp, &v).unwrap();
+        assert_eq!(facts.skipped_error_nodes_count, 0);
+        // A `.c` file is never re-read as C++.
+        assert!(
+            CPack
+                .extract("src/table.c", cpp, &v)
+                .unwrap()
+                .skipped_error_nodes_count
+                > 0
+        );
+    }
+
+    #[test]
+    fn a_test_main_calling_its_tests_through_a_table_counts_their_checks() {
+        let v = AssertVocabulary::default();
+        let asserts =
+            |src: &str| CppPack.extract("tests/t.cc", src, &v).unwrap().tests[0].total_asserts;
+        let tests =
+            "void TestFirst() { assert(a()); assert(b()); }\nvoid TestSecond() { assert(c()); }\n";
+        let direct = format!("{tests}int main() {{ TestFirst(); TestSecond(); return 0; }}\n");
+        let table = format!("{tests}int main() {{\n  const std::vector<std::pair<std::string, void (*)()>> tests = {{{{\"first\", TestFirst}}, {{\"second\", &TestSecond}}}};\n  for (const auto& t : tests) t.second();\n  return 0;\n}}\n");
+        assert_eq!(asserts(&direct), 3);
+        assert_eq!(asserts(&table), 3);
+        // A name in a table that is not a same-file helper counts nothing.
+        let other = "int main() { const int codes[] = {ERR_A, ERR_B}; use(codes); return 0; }\n";
+        assert_eq!(asserts(other), 0);
     }
 }

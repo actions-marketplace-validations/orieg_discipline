@@ -31,11 +31,10 @@ pub struct Located<'a> {
     pub test: &'a TestFn,
 }
 
-/// Runs every diff-based agent-guard gate and returns one outcome per gate.
-/// Disabled gates are filtered by the caller; computing them is cheap.
-pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
-    let gates = &ctx.config.gates;
-    let vocab = AssertVocabulary {
+/// The assertion vocabulary the agent-guard gates extract facts with.
+pub(crate) fn assert_vocabulary(config: &crate::config::DisciplineConfig) -> AssertVocabulary {
+    let gates = &config.gates;
+    AssertVocabulary {
         extra_macros: [
             &gates.assertion_reduction.extra_assert_macros[..],
             &gates.vacuous_tests.extra_assert_macros[..],
@@ -47,7 +46,28 @@ pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
         ]
         .concat(),
         safety_placeholders: gates.unsafe_safety_comment.placeholders.clone(),
-    };
+        mock_setup_fns: [
+            &gates.assertion_reduction.mock_setup_fns[..],
+            &gates.vacuous_tests.mock_setup_fns[..],
+        ]
+        .concat(),
+        mock_assert_fns: [
+            &gates.assertion_reduction.mock_assert_fns[..],
+            &gates.vacuous_tests.mock_assert_fns[..],
+        ]
+        .concat(),
+        test_functions: config.tests.functions.clone(),
+        test_paths: config.tests.paths.clone(),
+        c_macros: config.languages.c.macros.clone(),
+        c_function_macros: config.languages.c.function_macros.clone(),
+    }
+}
+
+/// Runs every diff-based agent-guard gate and returns one outcome per gate.
+/// Disabled gates are filtered by the caller; computing them is cheap.
+pub fn run(ctx: &Context) -> Result<Vec<GateOutcome>> {
+    let gates = &ctx.config.gates;
+    let vocab = assert_vocabulary(ctx.config);
 
     let registry = default_registry();
     let changed = ctx.git.changed_files()?;
@@ -477,13 +497,6 @@ pub(crate) fn leaf_name(test: &TestFn) -> &str {
     s.rsplit(" > ").next().unwrap_or(s)
 }
 
-fn analyzed_files(files: &[FileFacts], exempt: &PathFilter) -> usize {
-    files
-        .iter()
-        .filter(|f| f.head.is_some() && !exempt.matches(&f.file.path))
-        .count()
-}
-
 pub(crate) fn report_parse_errors(
     files: &[FileFacts],
     severity: crate::config::Severity,
@@ -613,10 +626,30 @@ pub fn evaluate_assertion_reduction(
         let (b, h) = (p.base, p.head);
         let b_eff = b.effective_asserts();
         let h_eff = h.effective_asserts();
-        let total_drop = h_eff < b_eff;
-        let strong_drop = h.strong_asserts < b.strong_asserts;
+        let mut total_drop = h_eff < b_eff;
+        let mut strong_drop = h.strong_asserts < b.strong_asserts;
+        // Checks moved into same-file helpers that fail (assert, raise, throw, panic): one
+        // `raise` in a helper's loop stands for many inline assertions, so the count drops
+        // while the test calls more failing helpers than before. Deleting a helper call
+        // lowers `helper_checks` and is still a drop.
+        if (total_drop || strong_drop) && h.helper_checks > b.helper_checks {
+            out.notes.push(format!(
+                "`{}` in `{}`: assertions {} -> {} read as moved into same-file helpers that fail ({} -> {} calls)",
+                h.name, p.path, b_eff, h_eff, b.helper_checks, h.helper_checks
+            ));
+            total_drop = false;
+            strong_drop = false;
+        }
         let fatal_drop = h.fatal_asserts < b.fatal_asserts;
-        if !(total_drop || strong_drop || fatal_drop) {
+        // More doubles in the test, and no stronger assertion on what the code produced:
+        // the shape of an integration failure sidestepped by mocking it away.
+        let mock_growth = h.mock_setups > b.mock_setups
+            && h.strong_asserts <= b.strong_asserts
+            && h_eff.saturating_sub(h.mock_asserts) <= b_eff.saturating_sub(b.mock_asserts);
+        // The same assertion with its numeric bound moved the loose way: the count holds.
+        let loosened = crate::ast::bounds::loosened(&b.bounds, &h.bounds);
+        let dropped = total_drop || strong_drop || fatal_drop || mock_growth;
+        if !dropped && loosened.is_empty() {
             continue;
         }
 
@@ -653,6 +686,50 @@ pub fn evaluate_assertion_reduction(
             format!("Test `{}`", h.name)
         };
         let directive_name = if p.forced { leaf_name(b) } else { leaf_name(h) };
+
+        for l in &loosened {
+            out.push(
+                if is_staged {
+                    crate::config::Severity::Warning
+                } else {
+                    settings.severity()
+                },
+                "Assertion Bound Loosened",
+                Some(p.path),
+                Some(l.line),
+                // The line and the two literals only: the assertion's text is the change's
+                // own and is not echoed into a report agents read.
+                format!(
+                    "{test_label}: the assertion on line {} moved its bound from {} to {}, which accepts more results.",
+                    l.line, l.from, l.to
+                ),
+                &format!(
+                    "Restore the bound, or justify the change on its own line in the PR body or a commit message: `allow-assertion-drop: {} <reason>`.",
+                    directive_name
+                ),
+            );
+        }
+        if !dropped {
+            continue;
+        }
+
+        if !total_drop && !strong_drop && !fatal_drop && mock_growth {
+            out.push(
+                crate::config::Severity::Warning,
+                "Mocking Grew Without Stronger Assertions",
+                Some(p.path),
+                Some(h.line),
+                format!(
+                    "{test_label}: test doubles rose from {} to {} while assertions on real output did not grow (equality / pattern assertions: {} -> {}).",
+                    b.mock_setups, h.mock_setups, b.strong_asserts, h.strong_asserts
+                ),
+                &format!(
+                    "Assert on what the code produces alongside the new doubles, or justify the change in the PR body: `allow-assertion-drop: {} <reason>`.",
+                    directive_name
+                ),
+            );
+            continue;
+        }
 
         if !total_drop && !strong_drop && fatal_drop {
             out.push(
@@ -725,6 +802,47 @@ pub fn evaluate_vacuous_tests(
     out.examined = added.len();
 
     for a in added.iter().filter(|a| !exempt.matches(a.path)) {
+        // Every assertion is on a double's interactions: the test checks that the mock
+        // was called, and nothing about what the code produced.
+        if a.test.mock_asserts > 0
+            && a.test.mock_asserts >= a.test.effective_asserts()
+            && a.test.strong_asserts == 0
+            && !a.test.should_panic
+        {
+            out.push(
+                crate::config::Severity::Warning,
+                "Test Asserts Only On Mocks",
+                Some(a.path),
+                Some(a.test.line),
+                format!(
+                    "New test `{}` makes {} assertion(s), all on test-double interactions; it does not check what the code produces.",
+                    a.test.name, a.test.mock_asserts
+                ),
+                "Assert on the result or the observable effect as well; interaction checks alone pass whatever the code returns.",
+            );
+            continue;
+        }
+        // Every assertion holds for nearly any value: `is not None`, `toBeDefined`,
+        // `is_ok()`. The test runs the code and checks that something came back.
+        // (`is not None` is a comparison, so the pack may count it as strong; the
+        // trivial count decides.)
+        if a.test.trivial_asserts > 0
+            && a.test.trivial_asserts >= a.test.effective_asserts()
+            && !a.test.should_panic
+        {
+            out.push(
+                crate::config::Severity::Warning,
+                "Test Asserts Only Trivial Properties",
+                Some(a.path),
+                Some(a.test.line),
+                format!(
+                    "New test `{}` makes {} assertion(s) that hold for nearly any value (not-null, defined, ok, truthy); it does not check what the code produced.",
+                    a.test.name, a.test.trivial_asserts
+                ),
+                "Assert on the value or the effect; a not-null check passes any wrong answer.",
+            );
+            continue;
+        }
         if a.test.is_vacuous() {
             let why = if a.test.total_asserts == 0 {
                 "contains no assertion".to_string()
@@ -851,6 +969,86 @@ pub fn evaluate_ignored_tests(
         );
     }
 
+    // A test made green by running it again. A retry marker does not skip the test, but
+    // it lets a failure through as often as the marker allows.
+    // A delay added to a test: the shape of a race fixed by waiting for it.
+    let newly_slept = pairs
+        .iter()
+        .filter(|p| p.head.sleeps > p.base.sleeps)
+        .map(|p| (p.path, p.head, p.base.sleeps))
+        .chain(
+            added
+                .iter()
+                .filter(|a| a.test.sleeps > 0)
+                .map(|a| (a.path, a.test, 0)),
+        );
+    for (path, test, before) in newly_slept {
+        if exempt.matches(path) {
+            continue;
+        }
+        if let Some(record) =
+            tokens::find_override(directives, GATE, tokens::ALLOW_IGNORE, leaf_name(test))
+        {
+            out.overrides.push(record);
+            continue;
+        }
+        out.push(
+            crate::config::Severity::Warning,
+            "Test Sleeps",
+            Some(path),
+            Some(test.line),
+            format!(
+                "Test `{}` carries {} hard-coded delay(s) (was {before}); a timing-dependent pass slows the suite and hides the race.",
+                test.name, test.sleeps
+            ),
+            &format!(
+                "Synchronise on the event the test waits for, or justify the delay: `allow-ignore: {} <reason>`.",
+                leaf_name(test)
+            ),
+        );
+    }
+
+    let newly_retried = pairs
+        .iter()
+        .filter(|p| p.head.retries.is_some() && p.base.retries.is_none())
+        .map(|p| (p.path, p.head))
+        .chain(
+            added
+                .iter()
+                .filter(|a| a.test.retries.is_some())
+                .map(|a| (a.path, a.test)),
+        );
+    for (path, test) in newly_retried {
+        if exempt.matches(path) {
+            continue;
+        }
+        if let Some(record) =
+            tokens::find_override(directives, GATE, tokens::ALLOW_IGNORE, leaf_name(test))
+        {
+            out.overrides.push(record);
+            continue;
+        }
+        let marker = test.retries.as_deref().unwrap_or("");
+        out.push(
+            if is_staged {
+                crate::config::Severity::Warning
+            } else {
+                settings.severity()
+            },
+            "Test Retries On Failure",
+            Some(path),
+            Some(test.line),
+            format!(
+                "Test `{}` carries a retry marker (`{marker}`); a failure passes on a later attempt.",
+                test.name
+            ),
+            &format!(
+                "Fix the cause of the flakiness, or justify the retry on its own line in the PR body or a commit message: `allow-ignore: {} <reason>`.",
+                leaf_name(test)
+            ),
+        );
+    }
+
     let newly_cond_ignored = pairs
         .iter()
         .filter(|p| {
@@ -884,7 +1082,7 @@ pub fn evaluate_ignored_tests(
             continue;
         }
         out.push(
-            crate::config::Severity::Warning,
+            crate::config::Severity::Note,
             "Test Conditionally Skipped",
             Some(path),
             Some(test.line),
@@ -906,11 +1104,42 @@ pub fn evaluate_unsafe_safety_comment(
     const GATE: &str = "unsafe-safety-comment";
     let exempt = exempt_filter(settings)?;
     let mut out = GateOutcome::new(GATE);
-    out.examined = analyzed_files(files, &exempt);
+    // Only a pack that reads unsafe sites examines a file for this gate. A file in a
+    // language with its own explicit unsafe construct (Go's `unsafe` package, C#
+    // `unsafe` blocks, Swift's `Unsafe*Pointer`) that no pack reads is named, never
+    // counted as examined; a language without one has nothing here to miss.
+    let registry = default_registry();
+    let reads_unsafe = |path: &str| {
+        registry
+            .find_pack(path)
+            .is_some_and(|p| p.supplies(crate::ast::Fact::UnsafeSites))
+    };
+    let mut unread: Vec<&str> = Vec::new();
+    for ff in files {
+        if ff.head.is_none() || exempt.matches(&ff.file.path) {
+            continue;
+        }
+        if reads_unsafe(&ff.file.path) {
+            out.examined += 1;
+        } else if matches!(
+            crate::ast::extension(&ff.file.path),
+            Some("go" | "cs" | "swift")
+        ) {
+            unread.push(&ff.file.path);
+        }
+    }
+    if !unread.is_empty() {
+        let sample: Vec<&str> = unread.iter().take(3).copied().collect();
+        out.notes.push(format!(
+            "{} changed file(s) are in a language with unsafe code this gate does not read (Go, C#, Swift) and were NOT analysed for it (e.g. {})",
+            unread.len(),
+            sample.join(", ")
+        ));
+    }
 
     for ff in files {
         let Some(head) = &ff.head else { continue };
-        if exempt.matches(&ff.file.path) {
+        if exempt.matches(&ff.file.path) || !reads_unsafe(&ff.file.path) {
             continue;
         }
         let undocumented =

@@ -27,8 +27,12 @@ def check_no_prd_references():
         # Prune ignored directories
         dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
         for fname in filenames:
-            # Skip binary artifacts or backup files
-            if fname.endswith((".tar.gz", ".zip", ".bin", ".pyc", ".png", ".ico")):
+            # Skip binary artifacts, packages, archives or compiled objects per Rule 1.11
+            if fname.endswith((
+                ".tar.gz", ".tgz", ".zip", ".bin", ".pyc", ".png", ".ico",
+                ".deb", ".rpm", ".gz", ".xz", ".bz2", ".woff", ".woff2",
+                ".dylib", ".so", ".a", ".o"
+            )):
                 continue
             fpath = Path(dirpath) / fname
             if fpath.resolve() == this_file:
@@ -59,6 +63,14 @@ def _make_slug(s):
     return slug
 
 
+def _github_slug(s):
+    """GitHub's own anchor rule: drop punctuation, keep repeated hyphens
+    ("3. Forgejo & Gitea Actions" -> "3-forgejo--gitea-actions")."""
+    slug = s.strip().lower()
+    slug = re.sub(r'[^\w\- ]', '', slug)
+    return slug.replace(' ', '-')
+
+
 def slugify_heading(text):
     """Generate slug candidates for a markdown heading."""
     # Strip markdown links: [text](url) -> text
@@ -70,6 +82,9 @@ def slugify_heading(text):
         text = text.replace(ch, '')
 
     slugs = set()
+    gh = _github_slug(text)
+    if gh:
+        slugs.add(gh)
     s1 = _make_slug(text)
     if s1:
         slugs.add(s1)
@@ -116,7 +131,7 @@ def check_markdown_links():
     md_files = [ROOT / "README.md", ROOT / "AGENTS.md"]
     docs_dir = ROOT / "docs"
     if docs_dir.exists():
-        md_files.extend(docs_dir.glob("*.md"))
+        md_files.extend(docs_dir.rglob("*.md"))
 
     link_pattern = re.compile(r'(?<!\!)\[([^\]]+)\]\(([^)]+)\)')
 
@@ -180,13 +195,122 @@ def check_markdown_links():
     return True
 
 
+def check_container_tags():
+    """Verify that all ghcr.io/orieg/discipline container tags referenced in docs are valid."""
+    print("Checking container image tags in documentation...")
+    cargo_path = ROOT / "Cargo.toml"
+    current_version = None
+    with open(cargo_path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r'^version\s*=\s*"([^"]+)"', line.strip())
+            if m:
+                current_version = m.group(1)
+                break
+
+    if not current_version:
+        print("FAILED: Could not determine current version from Cargo.toml", file=sys.stderr)
+        return False
+
+    major = current_version.split(".")[0]
+    allowed_tags = {"latest", f"v{major}", f"v{current_version}", "test"}
+
+    check_files = [ROOT / "README.md", ROOT / "AGENTS.md"]
+    docs_dir = ROOT / "docs"
+    if docs_dir.exists():
+        check_files.extend(docs_dir.glob("*.md"))
+        check_files.extend(docs_dir.glob("*.html"))
+    templates_dir = ROOT / "templates"
+    if templates_dir.exists():
+        check_files.extend(templates_dir.glob("*"))
+
+    tag_pattern = re.compile(r'ghcr\.io/orieg/discipline:([a-zA-Z0-9_\.-]+)')
+    violations = []
+
+    for fpath in check_files:
+        if not fpath.is_file():
+            continue
+        rel_path = fpath.relative_to(ROOT)
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            for lno, line in enumerate(f, 1):
+                for match in tag_pattern.finditer(line):
+                    tag = match.group(1).rstrip('`"\'.,;:)<>')
+                    tag = re.sub(r'[<>/].*$', '', tag)
+                    if tag not in allowed_tags and not tag.startswith("${{"):
+                        violations.append(
+                            f"{rel_path}:{lno}: invalid or obsolete container tag '{tag}' (allowed: {sorted(allowed_tags)})"
+                        )
+
+    if violations:
+        print(f"FAILED: Found {len(violations)} invalid container tag(s):", file=sys.stderr)
+        for v in violations:
+            print(f"  {v}", file=sys.stderr)
+        return False
+
+    print(f"OK: All container image tags valid across documentation (allowed: {sorted(allowed_tags)}).")
+    return True
+
+
+def check_ci_recipes():
+    """Reject two workflow-recipe defects that make a gate never run or never fail.
+
+    `runs-on: docker://image` matches no runner label on act_runner or
+    forgejo-runner (the job queues forever); a `git clone` inside a job's
+    steps lands on the default branch, so a pull-request gate compares the
+    base with itself and passes every change. The correct recipe is the one
+    executed by tests/action/test-container-recipe.sh.
+    """
+    print("Checking CI recipes in documentation and templates...")
+    check_files = [ROOT / "README.md", ROOT / "AGENTS.md"]
+    for sub in ("docs", "templates"):
+        d = ROOT / sub
+        if d.exists():
+            check_files.extend(p for p in d.rglob("*") if p.is_file()
+                               and p.suffix in {".md", ".html", ".yml", ".yaml"})
+    runs_on_image = re.compile(r"runs-on:\s*docker://")
+    steps_key = re.compile(r"^\s*steps:\s*$")
+    fence = re.compile(r"^\s*```")
+    violations = []
+    for fpath in sorted(check_files):
+        if not fpath.is_file():
+            continue
+        rel_path = fpath.relative_to(ROOT)
+        in_workflow_block = False
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            for lno, line in enumerate(f, 1):
+                if runs_on_image.search(line):
+                    violations.append(
+                        f"{rel_path}:{lno}: `runs-on:` names an image; it must name a runner label "
+                        f"(put the image under `container: image:`)"
+                    )
+                if fpath.suffix in {".yml", ".yaml"}:
+                    in_workflow_block = in_workflow_block or bool(steps_key.match(line))
+                elif fence.match(line):
+                    in_workflow_block = False
+                elif steps_key.match(line):
+                    in_workflow_block = True
+                if in_workflow_block and "git clone" in line:
+                    violations.append(
+                        f"{rel_path}:{lno}: `git clone` in a workflow job lands on the default branch; "
+                        f"fetch the pull request head (see the container recipe in docs/CONFIGURATION.md)"
+                    )
+    if violations:
+        print(f"FAILED: Found {len(violations)} CI recipe defect(s):", file=sys.stderr)
+        for v in violations:
+            print(f"  {v}", file=sys.stderr)
+        return False
+    print("OK: No CI recipe names an image as a runner label or clones the default branch in a job.")
+    return True
+
+
 def main():
     prd_ok = check_no_prd_references()
     links_ok = check_markdown_links()
+    tags_ok = check_container_tags()
+    recipes_ok = check_ci_recipes()
 
-    if not (prd_ok and links_ok):
+    if not (prd_ok and links_ok and tags_ok and recipes_ok):
         sys.exit(1)
-    print("All link and reference checks passed successfully.")
+    print("All link, reference, and tag checks passed successfully.")
     sys.exit(0)
 
 

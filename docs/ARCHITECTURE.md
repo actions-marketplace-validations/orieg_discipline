@@ -40,7 +40,7 @@ Discipline's operational rigors were developed to defend high-assurance reposito
 ```mermaid
 flowchart TD
     subgraph CFG_LAYER["Layered Configuration & Directives"]
-        D["1. Built-in Defaults<br/>(All available gates ON, severity: error)"]
+        D["1. Built-in Defaults<br/>(All gates ON; correctness/integrity: error, heuristic/bench: warning)"]
         F["2. discipline.toml<br/>(Repository configuration)"]
         O["3. Inline Overrides / Directives<br/>(--config-override, PR body)"]
         CLI["4. CLI Flags & Environment<br/>(--enable, --disable, denylist)"]
@@ -85,7 +85,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    D["1. Built-in Defaults<br/>(All available gates ON, severity error)"] --> M1["Merge Layer 1"]
+    D["1. Built-in Defaults<br/>(All gates ON; correctness: error, heuristic/bench: warning)"] --> M1["Merge Layer 1"]
     F["2. discipline.toml<br/>(Repository configuration)"] --> M1
     M1 --> M2["Merge Layer 2"]
     O["3. Inline Override<br/>(--config-override / action input)"] --> M2
@@ -204,6 +204,15 @@ Every gate in Discipline must satisfy the following 12 load-bearing invariant ru
 | **F11** | **Untrusted text never reaches a shell parser.** All action inputs pass through `env:`, never inline `${{ }}` interpolation. | Inline shell injection vulnerabilities in workflow expressions. |
 | **F12** | **The installer verifies what it runs.** Actions download release archives and verify them against `SHA256SUMS` with no opt-out; no fallbacks to unverified compilation. | Scaffold download failure falling back to unverified local build. |
 
+### 3.1 Defaults Are Part of the Compatibility Contract
+
+A consumer who runs Discipline with zero configuration, or who configures only some gates, relies on the built-in default **enablement** and **severity** of every other gate. A default that becomes looser (a gate turned off, or moved from `error` to `warning` or `note`) silently stops blocking for that consumer, with no diff in their repository to review. Defaults are therefore versioned like the configuration schema:
+
+- **Within a major version, a default may only become stricter** (off to on, `note` to `warning`, `warning` to `error`) without further ceremony.
+- **A looser default within a major version requires a release-note entry** in the [Default Changes ledger](ROADMAP.md#default-changes-compatibility-ledger) naming the gate, the old and new default, the reason, and the one-line configuration that restores the old behaviour. The entry lands in the same pull request as the change.
+- **Every default is pinned by a test.** `tests/test_config.rs::default_enablement_and_severity_match_snapshot` compares the compiled defaults of every available gate against a committed snapshot. Changing a default fails that test until the snapshot is edited, so the change is visible in review next to its ledger entry.
+- **The reference is generated.** The *Default* column of the configuration table in `docs/CONFIGURATION.md` is rendered by `discipline docs` from the compiled defaults and the JSON Schema, so documentation cannot claim a default the binary does not ship. Per-gate rationale lives in `docs/GATES.md` ("Default Severity by Gate").
+
 ---
 
 ## 4. Module Map
@@ -213,7 +222,7 @@ Every gate in Discipline must satisfy the following 12 load-bearing invariant ru
 | `src/config.rs` | Gate registry (`GATES`), schema definition, layered configuration resolution |
 | `src/gitctx.rs` | Git interaction via `libgit2`: base ref detection, merge-base computation, blob streaming, index inspection |
 | `src/tokens.rs` | Line-anchored override directive parser and validation |
-| `src/ast.rs` | Tree-sitter dispatch and language-specific fact extraction |
+| `src/ast/` | Tree-sitter dispatch (`mod.rs`: registry, `Fact`, shared helper and dispatch-table resolution) and one module per language pack (`rust.rs`, `python.rs`, `javascript.rs`, `java.rs`, `kotlin.rs`, `go.rs`, `php.rs`, `c_cpp.rs`, `csharp.rs`, `ruby.rs`, `swift.rs`, `scala.rs`, `objc.rs`, `golden.rs`), plus the facts every pack shares: `functions.rs` (stubs), `handlers.rs` (swallowed errors), `prose.rs`, `reach.rs` (unreachable code), `mocks.rs`, `calls.rs`, `retries.rs`, `budgets.rs` |
 | `src/guards/agent_diff.rs` | Semantic diff inspection across base vs. head AST facts |
 | `src/guards/hygiene.rs` | Repository sweeps: `time-estimates`, `pii`, `agent-scratch`, `agents-md` |
 | `src/guards/integrity.rs` | Structural integrity gates: `config-integrity`, `golden-output` |
@@ -223,6 +232,17 @@ Every gate in Discipline must satisfy the following 12 load-bearing invariant ru
 | `src/docs.rs` | Automated reference docs generator and schema validation sentinel |
 | `src/selftest.rs` | Embedded positive and negative controls compiled into binary |
 | `src/style.rs` | Zero-dependency ANSI terminal styling |
+| `src/forge.rs` | The in-process HTTPS client for forge REST APIs (reads, and the one write: `check --comment`), with the path, https, redirect and `DISCIPLINE_NO_NETWORK` checks |
+| `src/doctor.rs` | `discipline doctor`: workflow, CODEOWNERS and branch-protection checks |
+| `src/override_policy.rs` | `max_overrides` and `require_approval`: whether a run's directive overrides stand |
+| `src/baseline.rs` | Grandfathering baseline read / write and fingerprints |
+| `src/hook.rs` | `discipline hook run` / `install`: the agent-facing check (base policy, no directives) translated into each agent's hook contract |
+| `src/mcp.rs` | `discipline mcp`: the MCP server over stdio (read-only tools) |
+| `src/explain.rs` | `discipline explain`: a gate's rule, state and lifting directive |
+| `src/replay.rs` | `discipline replay`: rebuild merged changes in a throwaway repository and check each |
+| `src/comment.rs` | `check --comment`: the one pull-request comment, found by marker and edited in place |
+
+**Agent-facing surfaces.** The hook, the MCP server and the `agent-prompt` format share one design rule: they tell an agent how to repair a finding and leave out the directive that would waive it, and the check they run is judged by the base ref's configuration and reads no directive, so the change being judged cannot switch off or excuse its own check. Hiding the waiver syntax is a convenience (an agent can run `discipline explain`); the base-side policy and the CI configuration (`policy_from: base`, PR-body directives, `fail_on_overrides`, `require_approval`) are the control.
 
 ---
 
@@ -271,14 +291,32 @@ Discipline exports standard structured formats:
 - **SARIF (`discipline.sarif`):** OASIS Static Analysis Results Interchange Format v2.1.0 schema-compliant report.
 - **Terminal & GitHub Job Summaries:** ANSI-styled summaries and GitHub workflow annotations.
 
-### Pure-Rust SHA-256 Implementation
+### 7.1 Pure-Rust SHA-256 Implementation & Cryptographic Hygiene
 
-GitLab Code Quality requires unique, deterministic 32-byte hex fingerprints for issue tracking:
-- Discipline implements a zero-dependency NIST FIPS 180-4 compliant SHA-256 algorithm in `src/report/gitlab.rs`.
-- Avoids pulling in external cryptographic dependencies (`ring`, `openssl`, `sha2`), preserving zero-dependency static musl compilation.
+GitLab Code Quality issue tracking and Discipline's grandfathering baseline engine require unique, deterministic 32-byte hex fingerprints:
+- Discipline implements a zero-dependency NIST FIPS 180-4 compliant SHA-256 algorithm in `src/report/gitlab.rs` (reused across reporting and `src/baseline.rs`).
+- Avoids pulling in external cryptographic dependencies (`ring`, `openssl`, `sha2`), preserving zero-dependency static musl compilation and strict license purity.
 - Verified directly against NIST CAVP test vectors.
 
+### 7.2 Grandfathering Baseline Architecture
+
+To support brownfield adoption without weakening gates or ignoring violations, Discipline provides a line-number-independent grandfathering baseline:
+- **Fingerprinting Formula:** Each violation is identified by `sha256(gate:rule:path:sha256(trimmed_line))`. Because line numbers are excluded, upstream or downstream line shifts caused by unrelated edits never churn baseline hashes.
+- **Fail-Closed Baseline Storage:** Recorded in a committed `discipline-baseline.toml` file at the repository root.
+- **Non-Blocking Grandfathering:** Pre-existing baselined findings are reported as non-blocking notes across all output formats (terminal, GitHub step summaries, JSON, JUnit, SARIF, GitLab) and reflected in the `baselined` output of `action.yml`.
+- **Ratchet Enforcement:** Covered under the `config-integrity` gate. Adding new entries to `discipline-baseline.toml` is classified as gate weakening and requires an authorized directive: `allow-gate-weakening: baseline <reason>`.
+- **Ratchet-Down Cleanup:** When a previously baselined finding is resolved in source code, the baseline engine reports the stale entry as an informational note, guiding repository maintainers to burn down technical debt.
+
 ---
+
+### 7.3 Pull-Request Comments (the one forge write)
+
+`check --comment` posts the report as one pull-request comment and edits it on every later run (`src/comment.rs`). It is the only write discipline makes to a forge, and it is in the binary rather than in `action.yml` so every runner gets it: GitHub, Gitea and Forgejo job containers that cannot run `uses:` actions, and GitLab.
+
+- **Opt-in:** off unless `--comment` / `DISCIPLINE_COMMENT` / the action's `comment` input; the action passes its token to the binary only then.
+- **One comment:** found by the marker `<!-- discipline:report -->` at the start of its body, paging through the pull request's comments (GitHub and Gitea / Forgejo issue comments, GitLab merge-request notes); edited with `PATCH` (`PUT` on GitLab), created with `POST` when none exists or the marked one belongs to someone the token cannot edit.
+- **Safety:** same path checks, https rule and `DISCIPLINE_NO_NETWORK` as the reads; a write is never replayed against a redirect. Text from the change is escaped (no `@` mention, no HTML, no table break, no forged marker), and the comment carries no directive syntax, since agents read pull-request comments too.
+- **Failure:** a token that cannot write (HTTP 401 / 403 / 404, the fork case) is a named note and the gates' verdict stands; a forge that cannot be identified or reached stops the run (exit 2), because a comment was asked for. The comment never decides the verdict: the check's status does.
 
 ## 8. CI and Release Pipelines
 
@@ -288,7 +326,7 @@ Third-party GitHub Actions are pinned by full commit SHA. Tooling binaries (`act
 
 | Job | Verification Scope |
 |---|---|
-| `lint` | `cargo fmt --check`, `cargo clippy -- -D warnings`, `actionlint` on workflows, `shellcheck`, `lint-action.py` (F11), `docs --check` (G7), and link integrity validator. |
+| `lint` | `cargo fmt --check`, `cargo clippy -- -D warnings`, `actionlint` on workflows, `shellcheck`, `lint-action.py` (F11), `docs --check` (G7), link integrity validator, and `test-check-major-tag.sh`. |
 | `test` (Linux & macOS) | Full test suite execution asserting at least 65 test cases ran, followed by embedded `self-test`. |
 | `msrv` | `cargo check` under the pinned Minimum Supported Rust Version (`1.90`). |
 | `supply-chain` | `cargo-deny` validation of advisories, bans, license allow-list, and sources. |
@@ -303,9 +341,40 @@ Third-party GitHub Actions are pinned by full commit SHA. Tooling binaries (`act
 Releases are triggered exclusively by pushing a `vX.Y.Z` tag:
 1. **Verify:** Asserts tag matches `Cargo.toml` version, tagged commit resides on `main`, and tests/lints/deny pass.
 2. **Build:** Compiles 4 static release targets (`x86_64-musl`, `aarch64-musl`, `x86_64-darwin`, `aarch64-darwin`); executes `self-test` on each.
-3. **Publish:** Generates `SHA256SUMS`, attaches build-provenance attestations, creates GitHub release.
+3. **Publish:** Generates `SHA256SUMS`, the Homebrew formula and the MacPorts `Portfile` (with the tag's source-archive and crate checksums), attaches build-provenance attestations, creates the GitHub release (not yet `latest`), and pushes the container image under its exact tags (`0.7.0`, `v0.7.0`) only, with a provenance attestation stored in the registry. Release binaries are built with the toolchain pinned in `RELEASE_TOOLCHAIN`, and the image from an Alpine base pinned by digest.
 4. **Smoke test:** Action downloads published release assets on Linux and macOS, validates checksums, tests clean and negative fixtures, and verifies GitHub attestations.
-5. **Move major tag:** Advances floating major version tag (`v0`) only after all smoke tests succeed.
+5. **Promote:** Only after every smoke test succeeds: verifies the image's provenance, marks the release `latest`, re-tags the proven image manifest as `v0`, `0`, `v0.7`, `0.7` and `latest` (no rebuild), and updates the Homebrew tap.
+6. **Move major tag:** Advances floating major version tag (`v0`) last. A workflow using `@v0` runs the binary of the version in that tag's `Cargo.toml`, never `latest`, so the action code and the binary always come from the same release.
+7. **Post-release guard:** Verifies via `tests/action/check-major-tag.sh` that the major tag dereferences to the release commit.
+
+### 8.2.1 Documentation Site and Package Repositories (`.github/workflows/pages.yml`)
+
+The site is built from `docs/` and deployed through GitHub Pages' Actions source. The APT and RPM repositories are assembled at deploy time from the latest stable release's `.deb` and `.rpm` assets (checked against its `SHA256SUMS`) and signed with the `REPO_SIGNING_KEY` secret: an APT `InRelease` / `Release.gpg` and an RPM `repomd.xml.asc`, with the public keys published as `apt/discipline-archive-keyring.gpg` and `rpm/RPM-GPG-KEY-discipline`. No package or repository metadata is committed. Without the key the workflow fails rather than publish an unsigned repository. It runs on every docs change and after each release (dispatched by `promote`).
+
+#### Major Tag Floating Pointer Invariant
+Major tags (`v0`, `v1`) provide consumer convenience for action workflows (`uses: orieg/discipline@v0`). The release workflow contract mandates that **major tags are moved exclusively by the release pipeline (`release.yml`) after all smoke tests pass against published release assets**. Moving floating major tags manually or out-of-band bypasses compilation, static linkage verification, attestation generation, and smoke tests, which defeats the security guarantees of the sentinel. To prevent silent tag drift, two automated sentinels enforce this invariant:
+- **Post-release assertion:** In `release.yml`, immediately after pushing the updated major tag, `tests/action/check-major-tag.sh` verifies that the tag dereferences to the release commit.
+- **Scheduled tag drift guard (`tag-guard.yml`):** Runs on schedule to verify that every major tag dereferences to the newest non-prerelease semver tag's commit in that major series, failing immediately if drift is detected.
+
+### 8.3 CodeQL Security Pipeline (`.github/workflows/codeql.yml`)
+
+Static security analysis runs on pull requests, pushes to `main`, and on a scheduled run (`cron: '30 6 * * 1'`) using GitHub CodeQL Advanced setup (`github/codeql-action` pinned by SHA):
+- **Matrix analysis:** Analyzes `rust`, `actions`, and `python`.
+- **Query suite:** Configured with `queries: security-extended` for deep vulnerability scanning.
+- **Toolchain:** Pins `dtolnay/rust-toolchain` stable for Rust AST and macro expansion.
+
+#### CodeQL Rust Build Mode
+- **Mode:** Rust is analysed with `build-mode: none` (source-only extraction), as are `actions` and `python`.
+- **Why not a built mode:** a built mode would be the more precise model, and switching was attempted. CodeQL CLI 2.27.0, the version `github/codeql-action` v4.38.1 installs, rejects it at `database init` with "Rust does not support the autobuild build mode. Please try using one of the following build modes instead: none." (run 35563423549, job `Analyze (rust)`). `manual` is not offered either. Revisit when a CodeQL release adds a built mode for Rust.
+- **Known consequence:** source-only extraction produced alert `rust/cleartext-logging` (CWE-312) on `src/report/mod.rs`. It was triaged as a false positive: no report format echoes a detected secret, and `tests/test_report_redaction.rs` pins redaction across every output format. Expect heuristic alerts of this kind until a built mode exists.
+
+#### Advisory Security Sentinel Contract & Triage Procedures
+- **Advisory, not blocking:** CodeQL is **not** a member of the `ci-gate` rollup's `needs` list and is not counted in its asserted job count. It runs in its own workflow (`codeql.yml`); a job's `needs` can only name jobs of the same workflow, so joining the rollup would mean moving the analysis into `ci.yml`. It stays separate by decision: a query-suite update or a heuristic false positive must not block an unrelated merge, while the gates in `ci-gate` are ones this repository controls and tests.
+- **Who reviews results:** the repository maintainer. Pull-request runs surface new alerts on the pull request itself, and the maintainer reviews them before merging; scheduled runs are triaged in the repository's code-scanning alert list as described below. A true positive is treated as a blocking defect even though the check itself is advisory.
+- **Scheduled Triage Procedures:** Maintainers audit newly surfaced alerts following each scheduled run:
+  1. **Triage:** Review all open alerts in GitHub Advanced Security across `rust`, `actions`, and `python`.
+  2. **True Positives:** Classified as blocking security defects. Remediated immediately via prioritized patches with dedicated unit and end-to-end regression tests.
+  3. **False Positives / Heuristic Flags:** Must be audited against engine behavior. An alert may only be dismissed if accompanied by a documented justification and pinned by executable regression tests (e.g., `tests/test_report_redaction.rs` verifying cross-format secret redaction across all 7 supported report formats).
 
 ---
 
@@ -324,4 +393,5 @@ Every gate implemented in Discipline must satisfy the 4-point testing contract b
 - **Macro opacity:** Tests generated inside macro invocations (`proptest! { ... }`, `quickcheck! { ... }`) are invisible to tree-sitter AST extractors without macro expansion. Configure `extra_assert_macros` and `assert_helper_fns`.
 - **Grammar lag:** Source syntax newer than bundled tree-sitter grammars triggers parse errors, failing closed by design. Use `exempt_paths` until grammars are updated.
 - **Untracked files:** Untracked files are excluded from non-staged git diffs. CI inspects committed history and is unaffected.
-- **Workflow-level edits:** Edits to `.github/workflows/` within a PR are unguarded until the `ci-integrity` gate ships.
+- **Report contents:** `--format agent-prompt` prints violation titles, messages and locations, never override reasons. Gates whose finding could carry text written for an agent (`instruction-smuggling`) report the location and a class only; other gates may quote a source line (`suppression-delta` quotes the annotation), which a consumer feeding reports to an agent should weigh.
+- **Workflow-level edits:** The `ci-integrity` gate reads edits to Actions workflows under `.github/`, `.gitea/` and `.forgejo/workflows/`. It recognises named weakenings (masked failures, dropped rollup `needs`, unpinned actions, the discipline step's `disable` / `advisory` inputs); a workflow rewritten in a form it does not model passes. GitLab pipelines are read for their own weakenings (`allow_failure`, `when: manual`, masked script lines), except what arrives through `include:`. Protect workflow files with CODEOWNERS and a required check (`discipline doctor`).

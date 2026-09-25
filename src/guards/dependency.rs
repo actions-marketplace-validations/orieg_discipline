@@ -8,8 +8,8 @@
 //! - Configured `allow_dependencies` and `deny_dependencies`
 //! - Scoped `allow-dependency` escape hatches
 
-use crate::config::GateSettings;
-use crate::guards::{Context, GateOutcome};
+use crate::config::{GateSettings, Severity};
+use crate::guards::{lockfile, Context, GateOutcome};
 use crate::tokens;
 use anyhow::{Context as _, Result};
 use globset::{Glob, GlobSetBuilder};
@@ -491,6 +491,23 @@ pub fn parse_requirements_txt(content: &str, path: &str) -> Vec<DependencyRecord
     records
 }
 
+/// Modules a `go.mod` marks `// indirect`: required only because a direct dependency
+/// needs them, written by `go mod tidy`, not chosen by the change.
+pub fn go_mod_indirect(content: &str) -> HashSet<String> {
+    content
+        .lines()
+        .filter_map(|l| {
+            let (req, comment) = l.split_once("//")?;
+            if comment.trim() != "indirect" {
+                return None;
+            }
+            let req = req.trim();
+            let req = req.strip_prefix("require ").unwrap_or(req).trim();
+            req.split_whitespace().next().map(str::to_string)
+        })
+        .collect()
+}
+
 /// Parses dependencies from `go.mod`.
 pub fn parse_go_mod(content: &str, path: &str) -> Vec<DependencyRecord> {
     let mut records = Vec::new();
@@ -703,6 +720,32 @@ pub fn parse_manifest(content: &str, path: &str) -> Vec<DependencyRecord> {
     }
 }
 
+/// Record a lockfile finding unless an `allow-dependency:` override names `subject`.
+fn lock_violation(
+    ctx: &Context,
+    outcome: &mut GateOutcome,
+    severity: Severity,
+    title: &str,
+    file: &str,
+    subject: &str,
+    message: String,
+) {
+    if let Some(rec) = ctx.find_override(GATE, tokens::ALLOW_DEPENDENCY, subject) {
+        outcome.overrides.push(rec);
+        return;
+    }
+    outcome.push(
+        ctx.overridable(severity),
+        title,
+        Some(file),
+        None,
+        message,
+        &format!(
+            "Regenerate the lockfile from the manifest, or justify it: `allow-dependency: {subject} <reason>`."
+        ),
+    );
+}
+
 fn count_lockfile_entries(content: &str, file_name: &str) -> usize {
     if file_name == "Cargo.lock" || file_name == "poetry.lock" {
         content
@@ -852,8 +895,25 @@ pub fn evaluate_dependency_delta(ctx: &Context) -> Result<GateOutcome> {
         }
     }
 
-    // Track lockfile growth
+    // Lockfiles: growth is a note; a deleted lockfile, an entry from a new source, and a
+    // dropped integrity hash are findings (`lockfile.rs`).
     for (f, fname) in &lock_files {
+        outcome.examined += 1;
+        if f.kind == crate::gitctx::ChangeKind::Deleted {
+            lock_violation(
+                ctx,
+                &mut outcome,
+                gate.severity(),
+                "Lockfile Deleted",
+                &f.path,
+                &f.path,
+                format!(
+                    "Lockfile `{}` was deleted; dependency versions are no longer pinned.",
+                    f.path
+                ),
+            );
+            continue;
+        }
         let head_raw = ctx.git.head_content(&f.path)?;
         let base_raw = ctx.git.base_content(&f.old_path)?;
         let head_count = head_raw
@@ -869,6 +929,33 @@ pub fn evaluate_dependency_delta(ctx: &Context) -> Result<GateOutcome> {
             "lockfile `{}` package count: base {}, head {} ({:+})",
             f.path, base_count, head_count, diff
         ));
+
+        let Some(head_entries) = head_raw
+            .as_deref()
+            .and_then(|c| lockfile::parse_lock(fname, c))
+        else {
+            outcome.notes.push(format!(
+                "lockfile `{}`: entry sources and integrity hashes not analysed (format not read, or it does not parse)",
+                f.path
+            ));
+            continue;
+        };
+        // No base side (a new lockfile): every entry is judged against the default hosts.
+        let base_entries = base_raw
+            .as_deref()
+            .and_then(|c| lockfile::parse_lock(fname, c))
+            .unwrap_or_default();
+        for finding in lockfile::diff_lock(&base_entries, &head_entries) {
+            lock_violation(
+                ctx,
+                &mut outcome,
+                gate.severity(),
+                finding.title,
+                &f.path,
+                &finding.package,
+                format!("{} in `{}`.", finding.message, f.path),
+            );
+        }
     }
 
     if manifest_files.is_empty() && lock_files.is_empty() {
@@ -878,6 +965,8 @@ pub fn evaluate_dependency_delta(ctx: &Context) -> Result<GateOutcome> {
         return Ok(outcome);
     }
 
+    let tracked: std::collections::BTreeSet<String> =
+        ctx.git.tracked_files()?.into_iter().collect();
     for f in manifest_files {
         let head_raw = ctx.git.head_content(&f.path)?;
         let Some(head_content) = head_raw else {
@@ -889,6 +978,45 @@ pub fn evaluate_dependency_delta(ctx: &Context) -> Result<GateOutcome> {
         let base_deps = match base_raw {
             Some(ref b) => parse_manifest(b, &f.old_path),
             None => Vec::new(),
+        };
+
+        // A manifest whose dependency set changed while its tracked lockfile did not.
+        let dep_key = |d: &DependencyRecord| {
+            (
+                d.name.clone(),
+                d.version.clone(),
+                d.git_url.clone(),
+                d.git_pin.clone(),
+                d.is_path,
+            )
+        };
+        let base_set: std::collections::BTreeSet<_> = base_deps.iter().map(dep_key).collect();
+        let head_set: std::collections::BTreeSet<_> = head_deps.iter().map(dep_key).collect();
+        if base_raw.is_some() && base_set != head_set {
+            if let Some(lock) = lockfile::governing_lockfile(&f.path, &tracked) {
+                if !changed.iter().any(|c| c.path == lock) {
+                    lock_violation(
+                        ctx,
+                        &mut outcome,
+                        gate.severity(),
+                        "Manifest Changed Without Lockfile",
+                        &f.path,
+                        &lock,
+                        format!(
+                            "Dependencies in `{}` changed and the lockfile that pins them, `{lock}`, did not.",
+                            f.path
+                        ),
+                    );
+                }
+            }
+        }
+
+        // A Go module marked `// indirect` arrives with a direct dependency's update; it is
+        // not a new direct dependency (bans, wildcards and source changes still apply).
+        let indirect = if f.path.rsplit('/').next() == Some("go.mod") {
+            go_mod_indirect(&head_content)
+        } else {
+            HashSet::new()
         };
 
         // Find deltas: new dependencies or modified existing dependencies
@@ -913,7 +1041,7 @@ pub fn evaluate_dependency_delta(ctx: &Context) -> Result<GateOutcome> {
             let mut dep_violations = Vec::new();
 
             // 0. Core rule: New direct dependency check
-            if matching_base.is_none() {
+            if matching_base.is_none() && !indirect.contains(&h.name) {
                 let allowed = gate.allow_dependencies.contains(&h.name)
                     || deny_policy.allow_bans.contains(&h.name);
                 if !allowed {
@@ -1175,6 +1303,11 @@ require (
 "#;
         let deps = parse_go_mod(sample, "go.mod");
         assert_eq!(deps.len(), 2);
+        assert!(go_mod_indirect(sample).is_empty());
+        let tidy = "require github.com/a/direct v1.0.0\nrequire github.com/b/one v1.0.0 // indirect\nrequire (\n\tgithub.com/c/two v2.0.0 // indirect\n\tgithub.com/d/kept v1.0.0 // pinned by hand\n)\n";
+        let names = go_mod_indirect(tidy);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains("github.com/b/one") && names.contains("github.com/c/two"));
 
         let gin = deps
             .iter()
