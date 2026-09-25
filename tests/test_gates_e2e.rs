@@ -331,6 +331,28 @@ fn vacuous_tests_are_lifted_per_test_by_allow_vacuous_test() {
 }
 
 #[test]
+fn extra_assert_macros_accept_the_name_with_or_without_its_bang() {
+    let repo = Repo::new();
+    repo.write(
+        "tests/b.rs",
+        "#[test]\nfn via_macro() { check_sorted!(vec![1, 2]); }\n",
+    );
+    repo.commit("test: add");
+    assert_eq!(repo.check(&[]).titles("vacuous-tests").len(), 1);
+    for name in ["check_sorted", "check_sorted!"] {
+        let run = repo.check(&[
+            "--config-override",
+            &format!("[gates.vacuous-tests]\nextra_assert_macros = [\"{name}\"]"),
+        ]);
+        assert!(
+            run.titles("vacuous-tests").is_empty(),
+            "`{name}`: {}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
 fn vacuous_tests_honor_configured_assert_helpers() {
     let repo = Repo::new();
     repo.write(
@@ -2170,6 +2192,36 @@ fn suppression_delta_is_a_delta_read_from_the_syntax_tree() {
     repo.commit("chore: explain\n\nallow-suppression: unchecked raw generics from the vendor SDK");
     let lifted = repo.check(SUPPRESSION_BLOCKING);
     assert_eq!(lifted.violations("suppression-delta").len(), 2);
+}
+
+#[test]
+fn java_suppress_warnings_counts_only_as_an_annotation() {
+    let repo = Repo::new();
+    repo.write(
+        "src/main/java/A.java",
+        "public class A {\n  // Do not add @SuppressWarnings(\"unchecked\") here: fix the generics.\n  /* @SuppressWarnings(\"rawtypes\") was removed in 2.0 */\n  /** Callers may need {@code @SuppressWarnings(\"deprecation\")}. */\n  void f() {}\n}\n",
+    );
+    repo.commit("docs: mention the annotation");
+    let run = repo.check(SUPPRESSION_BLOCKING);
+    assert!(
+        run.titles("suppression-delta").is_empty(),
+        "{:?}",
+        run.violations("suppression-delta")
+    );
+
+    // Control: the annotation itself is still a new suppression.
+    repo.write(
+        "src/main/java/B.java",
+        "public class B {\n  @SuppressWarnings(\"unchecked\")\n  void g() {}\n}\n",
+    );
+    repo.commit("chore: suppress");
+    let run = repo.check(SUPPRESSION_BLOCKING);
+    let files: Vec<String> = run
+        .violations("suppression-delta")
+        .iter()
+        .map(|v| v["file"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(files, ["src/main/java/B.java"], "{}", run.stdout);
 }
 
 // ---- stub-bodies -----------------------------------------------------------
@@ -10218,6 +10270,48 @@ enabled = true
     );
     let run_ov = repo.check(&[]);
     assert_eq!(run_ov.code, 0, "{}{}", run_ov.stdout, run_ov.stderr);
+}
+
+#[test]
+fn msrv_command_exit_codes_follow_the_contract() {
+    let repo = Repo::new();
+    repo.write(
+        "Cargo.toml",
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\nrust-version = \"1.90\"\n",
+    );
+    repo.commit("chore: crate");
+    let with = |command: &str| {
+        repo.check(&[
+            "--config-override",
+            &format!("[gates.msrv]\nenabled = true\ncommand = \"{command}\""),
+        ])
+    };
+
+    // 0: the command ran and passed.
+    let pass = with("true");
+    assert_eq!(pass.code, 0, "{}{}", pass.stdout, pass.stderr);
+    assert!(
+        notes_of(&pass, "msrv")
+            .iter()
+            .any(|n| n.contains("`true` passed under Rust 1.90")),
+        "{:?}",
+        notes_of(&pass, "msrv")
+    );
+
+    // 1: the command ran and failed; that is a finding.
+    let fail = with("false");
+    assert_eq!(fail.code, 1, "{}{}", fail.stdout, fail.stderr);
+    assert!(!fail.titles("msrv").is_empty());
+
+    // 2: the command could not run, so nothing was verified.
+    let missing = with("no-such-msrv-tool-4242");
+    assert_eq!(missing.code, 2, "{}{}", missing.stdout, missing.stderr);
+    assert!(
+        missing.stderr.contains("gate `msrv` could not run")
+            && missing.stderr.contains("no-such-msrv-tool-4242"),
+        "{}",
+        missing.stderr
+    );
 }
 
 // ---- miri ------------------------------------------------------------------
