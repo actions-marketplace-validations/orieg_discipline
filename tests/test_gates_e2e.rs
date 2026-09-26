@@ -3835,6 +3835,45 @@ fn uv_composer_and_gemfile_lockfiles_are_read_entry_by_entry() {
 }
 
 #[test]
+fn agent_prompt_repair_matches_the_kind_of_finding() {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-q", "main"]);
+    repo.write(
+        "web/pnpm-lock.yaml",
+        "lockfileVersion: '9.0'\npackages:\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-abc}\n",
+    );
+    repo.commit("chore: lockfile");
+    repo.git(&["checkout", "-q", "-B", "work"]);
+    // The same package from the same registry, its integrity hash dropped.
+    repo.write(
+        "web/pnpm-lock.yaml",
+        "lockfileVersion: '9.0'\npackages:\n  left-pad@1.3.0:\n    resolution: {}\n",
+    );
+    repo.commit("chore: drop the hash");
+    let run = repo.run(
+        &["check", "--format", "agent-prompt", "--base", "main"],
+        &[],
+    );
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    assert!(
+        run.stdout
+            .contains("[dependency-delta/lockfile-integrity-hash-removed]"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("keeps its integrity hash"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("Remove the added dependency"),
+        "{}",
+        run.stdout
+    );
+}
+
+#[test]
 fn pnpm_and_poetry_lockfiles_are_read_entry_by_entry() {
     let repo = Repo::new();
     repo.git(&["checkout", "-q", "main"]);
@@ -10353,17 +10392,35 @@ enabled = true
         ),
     }
 
-    // 2. With waiver directive, execution or missing cargo-miri is waived
+    // 2. A waiver lifts a Miri finding, never a run that could not start.
     repo.commit(
         "chore: run miri with waiver\n\ndiscipline:allow(miri): host lacks cargo-miri toolchain",
     );
     let run_ov = repo.check(&[]);
-    assert_eq!(run_ov.code, 0, "{}{}", run_ov.stdout, run_ov.stderr);
-    assert!(run_ov.outcome("miri")["notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|n| n.as_str().unwrap().contains("override applied")));
+    if run_bad.code == 1 {
+        assert_eq!(run_ov.code, 0, "{}{}", run_ov.stdout, run_ov.stderr);
+        assert!(run_ov.outcome("miri")["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("override applied")));
+    } else {
+        assert_eq!(run_ov.code, 2, "{}{}", run_ov.stdout, run_ov.stderr);
+    }
+
+    // 3. With no toolchain on PATH the run cannot start: exit 2 despite the waiver.
+    let empty = repo.file("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let no_tool = repo.run(
+        &["check", "--format", "json", "--base", "main"],
+        &[("PATH", empty.to_str().unwrap())],
+    );
+    assert_eq!(no_tool.code, 2, "{}{}", no_tool.stdout, no_tool.stderr);
+    assert!(
+        no_tool.stderr.contains("miri could not run"),
+        "{}",
+        no_tool.stderr
+    );
 }
 
 // ---- sanitizers ------------------------------------------------------------
@@ -10405,15 +10462,33 @@ canary = false
         ),
     }
 
-    // 2. With waiver directive, execution on non-nightly host is waived
+    // 2. A waiver lifts a sanitizer finding, never a run that could not start.
     repo.commit("chore: run sanitizers with waiver\n\ndiscipline:allow(sanitizers): nightly toolchain unavailable");
     let run_ov = repo.check(&[]);
-    assert_eq!(run_ov.code, 0, "{}{}", run_ov.stdout, run_ov.stderr);
-    assert!(run_ov.outcome("sanitizers")["notes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|n| n.as_str().unwrap().contains("override applied")));
+    if run_bad.code == 1 {
+        assert_eq!(run_ov.code, 0, "{}{}", run_ov.stdout, run_ov.stderr);
+        assert!(run_ov.outcome("sanitizers")["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("override applied")));
+    } else {
+        assert_eq!(run_ov.code, 2, "{}{}", run_ov.stdout, run_ov.stderr);
+    }
+
+    // 3. With no toolchain on PATH the run cannot start: exit 2 despite the waiver.
+    let empty = repo.file("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let no_tool = repo.run(
+        &["check", "--format", "json", "--base", "main"],
+        &[("PATH", empty.to_str().unwrap())],
+    );
+    assert_eq!(no_tool.code, 2, "{}{}", no_tool.stdout, no_tool.stderr);
+    assert!(
+        no_tool.stderr.contains("sanitizer could not run"),
+        "{}",
+        no_tool.stderr
+    );
 }
 
 // ---- Q1: suppression-delta scoped override ---------------------------------
