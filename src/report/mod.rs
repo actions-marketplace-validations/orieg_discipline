@@ -475,12 +475,18 @@ pub fn format_agent_prompt(summary: &CheckSummary) -> String {
 
 /// Provides direct, actionable repair guidance for a violation without mentioning escape hatches.
 pub fn repair_action_for_violation(v: &Violation) -> String {
-    let raw = repair_for_code(&v.code)
-        .or_else(|| repair_for_gate(v.gate))
+    repair_for(&v.code, v.gate, v.remediation.as_deref())
+}
+
+/// The repair for a finding of `code` from `gate`, as [`repair_action_for_violation`]
+/// gives it; for a finding read back from a JSON report.
+pub fn repair_for(code: &str, gate: &str, remediation: Option<&str>) -> String {
+    let raw = repair_for_code(code)
+        .or_else(|| repair_for_gate(gate))
         .map(str::to_string)
         .unwrap_or_else(|| {
             // A gate without a written repair: its remediation up to the waiver clause.
-            match v.remediation.as_deref() {
+            match remediation {
                 Some(rem) => match rem
                     .find(", or justify")
                     .or_else(|| rem.find(", or document"))
@@ -688,6 +694,8 @@ mod tests {
         });
 
         let summary = CheckSummary {
+            schema_version: crate::output_schema::REPORT_SCHEMA_VERSION,
+            could_not_check: None,
             base: "main".to_string(),
             errors: 5,
             warnings: 0,
@@ -750,6 +758,8 @@ mod tests {
         o3.enabled = false;
 
         let summary = CheckSummary {
+            schema_version: crate::output_schema::REPORT_SCHEMA_VERSION,
+            could_not_check: None,
             base: "main".to_string(),
             errors: 0,
             warnings: 0,
@@ -846,6 +856,8 @@ mod tests {
     #[test]
     fn deprecations_are_reported_and_never_fail_the_run() {
         let summary = CheckSummary {
+            schema_version: crate::output_schema::REPORT_SCHEMA_VERSION,
+            could_not_check: None,
             base: "main".to_string(),
             errors: 0,
             warnings: 0,
@@ -896,6 +908,8 @@ mod tests {
         });
 
         let summary = CheckSummary {
+            schema_version: crate::output_schema::REPORT_SCHEMA_VERSION,
+            could_not_check: None,
             base: "main".to_string(),
             errors: 1,
             warnings: 0,
@@ -928,6 +942,8 @@ mod tests {
         o2.examined = 50;
 
         let summary = CheckSummary {
+            schema_version: crate::output_schema::REPORT_SCHEMA_VERSION,
+            could_not_check: None,
             base: "main".to_string(),
             errors: 0,
             warnings: 0,
@@ -965,6 +981,8 @@ mod tests {
         });
 
         let summary = CheckSummary {
+            schema_version: crate::output_schema::REPORT_SCHEMA_VERSION,
+            could_not_check: None,
             base: "main".to_string(),
             errors: 1,
             warnings: 0,

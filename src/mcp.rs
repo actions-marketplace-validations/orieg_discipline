@@ -23,8 +23,8 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05
 
 /// The child processes a tool call needs; swapped for a fake in unit tests.
 pub trait Runner {
-    /// `(exit code, agent-prompt report, stderr)` of a check.
-    fn check(&self, side: &CheckSide) -> Result<(i32, String, String)>;
+    /// A check of the change.
+    fn check(&self, side: &CheckSide) -> Result<crate::hook::CheckRun>;
     /// The `gates` table.
     fn gates(&self) -> Result<String>;
 }
@@ -33,7 +33,7 @@ pub trait Runner {
 pub struct ChildRunner;
 
 impl Runner for ChildRunner {
-    fn check(&self, side: &CheckSide) -> Result<(i32, String, String)> {
+    fn check(&self, side: &CheckSide) -> Result<crate::hook::CheckRun> {
         let side = match side {
             CheckSide::Default => crate::gitctx::discover_repository(".")
                 .ok()
@@ -63,6 +63,7 @@ fn tools() -> Value {
             "title": "Check the change",
             "description": "Run discipline's gates on the change so far and return each finding with its location and the repair. The working tree (committed on the branch and uncommitted) is measured against the merge base with the default branch, under the default branch's configuration. Call it before committing; fix every finding it reports.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "outputSchema": crate::output_schema::mcp_check_schema(),
             "annotations": read_only
         },
         {
@@ -132,6 +133,40 @@ fn text_result(text: String, is_error: bool, structured: Option<Value>) -> Value
     r
 }
 
+/// The findings of a check's JSON report as `check_diff` returns them: no remediation
+/// (it can name a waiver), the repair instead, every text scrubbed of waiver syntax.
+fn findings(report: Option<&Value>) -> Vec<Value> {
+    let scrub = |v: &Value| crate::report::scrub_override_directives(v.as_str().unwrap_or(""));
+    report
+        .and_then(|r| r["outcomes"].as_array())
+        .into_iter()
+        .flatten()
+        .flat_map(|o| o["violations"].as_array().into_iter().flatten())
+        .map(|v| {
+            let code = v["code"].as_str().unwrap_or("");
+            let gate = v["gate"].as_str().unwrap_or("");
+            json!({
+                "code": code,
+                "severity": v["severity"],
+                "title": scrub(&v["title"]),
+                "file": v["file"],
+                "line": v["line"],
+                "message": scrub(&v["message"]),
+                "repair": crate::report::repair_for(code, gate, v["remediation"].as_str()),
+                "fingerprint": v["fingerprint"],
+            })
+        })
+        .collect()
+}
+
+fn check_content(status: &str, run: Option<&crate::hook::CheckRun>) -> Value {
+    json!({
+        "schema_version": crate::output_schema::MCP_CHECK_SCHEMA_VERSION,
+        "status": status,
+        "findings": findings(run.and_then(|r| r.json.as_ref())),
+    })
+}
+
 fn call_tool(runner: &dyn Runner, params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -140,29 +175,56 @@ fn call_tool(runner: &dyn Runner, params: &Value) -> Result<Value, (i64, String)
             // No argument chooses what is compared: an agent that could name `HEAD` as the
             // base would judge its committed change by its own configuration.
             Ok(match runner.check(&CheckSide::Default) {
-                Ok((0, report, _)) => {
-                    let text = if report.trim().is_empty() {
+                Ok(run) if run.code == 0 => {
+                    let content = check_content("pass", Some(&run));
+                    let text = if run.report.trim().is_empty() {
                         "No discipline findings in this change.".to_string()
                     } else {
-                        report
+                        run.report
                     };
-                    text_result(text, false, Some(json!({ "status": "pass" })))
+                    text_result(text, false, Some(content))
                 }
-                Ok((1, report, _)) => {
-                    text_result(report, false, Some(json!({ "status": "findings" })))
+                Ok(run) if run.code == 1 => {
+                    let content = check_content("findings", Some(&run));
+                    text_result(run.report, false, Some(content))
                 }
-                Ok((_, _, detail)) => text_result(
-                    format!(
-                        "discipline could not check this change, so it is not known to be safe:\n{}",
-                        detail.trim()
-                    ),
-                    true,
-                    Some(json!({ "status": "could_not_check" })),
-                ),
+                Ok(run) => {
+                    // The reason is the report's `could_not_check.reason`; a child that
+                    // wrote no report did not start.
+                    let reason = run
+                        .could_not_check()
+                        .and_then(|c| c.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(crate::could_not_check::Reason::Internal.as_str())
+                        .to_string();
+                    let gate = run
+                        .could_not_check()
+                        .and_then(|c| c.get("gate"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    text_result(
+                        format!(
+                            "discipline could not check this change, so it is not known to be safe:\n{}",
+                            run.stderr.trim()
+                        ),
+                        true,
+                        Some(json!({
+                            "schema_version": crate::output_schema::MCP_CHECK_SCHEMA_VERSION,
+                            "status": "could_not_check",
+                            "reason": reason,
+                            "gate": gate
+                        })),
+                    )
+                }
                 Err(e) => text_result(
                     format!("discipline could not check this change: {e:#}"),
                     true,
-                    Some(json!({ "status": "could_not_check" })),
+                    Some(json!({
+                        "schema_version": crate::output_schema::MCP_CHECK_SCHEMA_VERSION,
+                        "status": "could_not_check",
+                        "reason": crate::could_not_check::Reason::Internal.as_str(),
+                        "gate": null
+                    })),
                 ),
             })
         }
@@ -240,12 +302,15 @@ mod tests {
 
     struct Fake(i32, &'static str);
     impl Runner for Fake {
-        fn check(&self, _: &CheckSide) -> Result<(i32, String, String)> {
-            Ok((
-                self.0,
-                self.1.to_string(),
-                "config does not parse".to_string(),
-            ))
+        fn check(&self, _: &CheckSide) -> Result<crate::hook::CheckRun> {
+            Ok(crate::hook::CheckRun {
+                code: self.0,
+                report: self.1.to_string(),
+                stderr: "config does not parse".to_string(),
+                json: (self.0 == 2).then(|| {
+                    json!({ "could_not_check": { "reason": "configuration", "gate": null, "detail": "config does not parse" } })
+                }),
+            })
         }
         fn gates(&self) -> Result<String> {
             Ok("GATE SUITE\nassertion-reduction agent-guard\n".to_string())
@@ -314,10 +379,43 @@ mod tests {
             broken["result"]["structuredContent"]["status"],
             "could_not_check"
         );
+        assert_eq!(
+            broken["result"]["structuredContent"]["reason"],
+            "configuration"
+        );
         assert!(broken["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("config does not parse"));
+    }
+
+    #[test]
+    fn findings_carry_the_repair_and_no_waiver_syntax_in_any_field() {
+        // A finding's own text can quote a directive (a smuggled one, or the source line).
+        let report = json!({"outcomes": [{"gate": "assertion-reduction", "violations": [{
+            "gate": "assertion-reduction",
+            "code": "assertion-reduction/assertions-reduced",
+            "fingerprint": "",
+            "severity": "error",
+            "title": "Assertions Reduced near allow-assertion-drop:",
+            "file": "tests/a.rs",
+            "line": 3,
+            "message": "the body says `allow-assertion-drop: t flaky` and `discipline:allow(x)`",
+            "remediation": "Restore it, or justify with `allow-assertion-drop: <test> <reason>`"
+        }]}]});
+        let got = findings(Some(&report));
+        assert_eq!(got.len(), 1);
+        let f = &got[0];
+        assert_eq!(f["code"], "assertion-reduction/assertions-reduced");
+        assert_eq!(f["line"], 3);
+        assert!(f.get("remediation").is_none(), "{f}");
+        assert!(f["repair"].as_str().unwrap().starts_with("Restore"), "{f}");
+        let text = f.to_string();
+        assert!(
+            !text.contains("allow-assertion-drop") && !text.contains("discipline:allow"),
+            "{text}"
+        );
+        assert!(findings(None).is_empty());
     }
 
     #[test]

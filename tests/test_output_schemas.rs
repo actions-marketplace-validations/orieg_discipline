@@ -10,7 +10,7 @@
 mod common;
 
 use common::{FakeForge, Repo};
-use discipline::output_schema::{replay_schema, report_schema};
+use discipline::output_schema::{mcp_check_schema, replay_schema, report_schema};
 use serde_json::Value;
 
 /// `path: type`, `?` marking a field that may be absent. `[]` is an array element,
@@ -18,6 +18,10 @@ use serde_json::Value;
 const REPORT_FIELDS: &[&str] = &[
     "base: string",
     "baselined: integer",
+    "could_not_check?: object",
+    "could_not_check.detail: string",
+    "could_not_check.gate: string|null",
+    "could_not_check.reason: enum(configuration|baseline|repository|tool-missing|tool-timeout|toolchain-unavailable|forge|gate|internal)",
     "deprecations?: array",
     "deprecations[]: string",
     "errors: integer",
@@ -69,6 +73,7 @@ const REPORT_FIELDS: &[&str] = &[
     "planned_gates[]: string",
     "policy_failures?: array",
     "policy_failures[]: string",
+    "schema_version: const(1)",
     "warnings: integer",
 ];
 
@@ -83,6 +88,7 @@ const REPLAY_FIELDS: &[&str] = &[
     "cases_detail[].detail?: string",
     "cases_detail[].directives_from: string",
     "cases_detail[].pr: integer|null",
+    "cases_detail[].reason?: enum(configuration|baseline|repository|tool-missing|tool-timeout|toolchain-unavailable|forge|gate|internal)",
     "cases_detail[].refused_overrides: array",
     "cases_detail[].refused_overrides[]: string",
     "cases_detail[].sha: string",
@@ -101,8 +107,26 @@ const REPLAY_FIELDS: &[&str] = &[
     "refused_overrides_by_gate: object",
     "refused_overrides_by_gate{*}: array",
     "refused_overrides_by_gate{*}[]: string",
+    "schema_version: const(1)",
     "warnings_by_gate: object",
     "warnings_by_gate{*}: integer",
+];
+
+const MCP_CHECK_FIELDS: &[&str] = &[
+    "findings?: array",
+    "findings[]: object",
+    "findings[].code: string",
+    "findings[].file: string|null",
+    "findings[].fingerprint: string",
+    "findings[].line: integer|null",
+    "findings[].message: string",
+    "findings[].repair: string",
+    "findings[].severity: enum(error|warning|note)",
+    "findings[].title: string",
+    "gate?: string|null",
+    "reason?: enum(configuration|baseline|repository|tool-missing|tool-timeout|toolchain-unavailable|forge|gate|internal)",
+    "schema_version: const(1)",
+    "status: enum(pass|findings|could_not_check)",
 ];
 
 fn resolve<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
@@ -126,7 +150,10 @@ fn type_of(node: &Value) -> String {
         return format!("enum({})", vals.join("|"));
     }
     if let Some(c) = node.get("const") {
-        return format!("const({})", c.as_str().unwrap());
+        return match c {
+            Value::String(s) => format!("const({s})"),
+            other => format!("const({other})"),
+        };
     }
     if node.get("oneOf").is_some() {
         return "oneOf".into();
@@ -207,6 +234,52 @@ fn report_schema_fields_match_snapshot() {
 #[test]
 fn replay_schema_fields_match_snapshot() {
     assert_snapshot("replay", &replay_schema(), REPLAY_FIELDS);
+}
+
+#[test]
+fn mcp_check_schema_fields_match_snapshot() {
+    assert_snapshot("mcp check_diff", &mcp_check_schema(), MCP_CHECK_FIELDS);
+}
+
+/// `check_diff`'s `structuredContent` from a real `discipline mcp`, for each status.
+#[test]
+fn mcp_check_diff_conforms_to_its_output_schema() {
+    use std::io::Write;
+    let call = |repo: &Repo| -> Value {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_discipline"))
+            .arg("mcp")
+            .current_dir(repo.path())
+            .env("DISCIPLINE_NO_NETWORK", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"check_diff","arguments":{{}}}}}}"#
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+        reply["result"]["structuredContent"].clone()
+    };
+    let repo = Repo::new();
+    let pass = call(&repo);
+    assert_eq!(pass["status"], "pass", "{pass:#}");
+    assert_valid(&mcp_check_schema(), &pass);
+    repo.write(
+        "tests/a.rs",
+        "#[test]\nfn adds() {\n    let x = 1;\n    let _ = x + 1;\n}\n",
+    );
+    let found = call(&repo);
+    assert_eq!(found["status"], "findings", "{found:#}");
+    assert!(!found["findings"].as_array().unwrap().is_empty());
+    assert_valid(&mcp_check_schema(), &found);
+    repo.write("discipline.toml", "[meta\n");
+    let broken = call(&repo);
+    assert_eq!(broken["status"], "could_not_check", "{broken:#}");
+    assert_eq!(broken["reason"], "configuration", "{broken:#}");
+    assert_valid(&mcp_check_schema(), &broken);
 }
 
 #[test]
@@ -349,7 +422,7 @@ fn check_output_conforms_to_the_report_schema() {
         &serde_json::from_str(&blocked.stdout).unwrap(),
     );
 
-    // Exit 2: `--json-out` gets the report with one `engine` outcome.
+    // Exit 2: stdout and `--json-out` get the same report, with no outcomes and the reason.
     repo.write(
         "discipline.toml",
         "[meta]\nversion = 1\nname = \"t\"\n[gates.no-such-gate]\nenabled = true\n",
@@ -369,7 +442,26 @@ fn check_output_conforms_to_the_report_schema() {
     );
     assert_eq!(fatal.code, 2, "{}", fatal.stderr);
     let report: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(report["outcomes"][0]["gate"], "engine", "{report:#}");
+    assert_eq!(report["outcomes"], serde_json::json!([]), "{report:#}");
+    assert_eq!(
+        report["could_not_check"]["reason"], "configuration",
+        "{report:#}"
+    );
+    assert!(
+        fatal.stderr.contains(
+            report["could_not_check"]["detail"]
+                .as_str()
+                .unwrap()
+                .trim_end()
+        ),
+        "the detail is the error on stderr: {report:#}\n{}",
+        fatal.stderr
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&fatal.stdout).unwrap(),
+        report,
+        "stdout carries the report --json-out writes"
+    );
     assert_valid(&report_schema(), &report);
 }
 
@@ -513,9 +605,18 @@ fn stdout_carries_only_the_requested_format() {
             run.stdout
         );
     }
-    // A run that cannot start prints nothing on stdout (the error is on stderr).
+    // A run that cannot start prints one JSON document saying why (the error is also
+    // on stderr), and nothing on stdout in a format with no such field.
     repo.write("discipline.toml", "not = [valid\n");
     let broken = repo.run(&["check", "--format", "json", "--base", "main"], &[]);
     assert_eq!(broken.code, 2, "{}", broken.stderr);
-    assert_eq!(broken.stdout, "", "exit 2 must not print a partial report");
+    let report: Value = serde_json::from_str(&broken.stdout)
+        .unwrap_or_else(|e| panic!("exit 2 prints one JSON document: {e}\n{}", broken.stdout));
+    assert_eq!(report["could_not_check"]["reason"], "configuration");
+    assert_eq!(report["outcomes"], serde_json::json!([]));
+    for format in ["terminal", "sarif", "agent-prompt"] {
+        let run = repo.run(&["check", "--format", format, "--base", "main"], &[]);
+        assert_eq!(run.code, 2, "{format}: {}", run.stderr);
+        assert_eq!(run.stdout, "", "{format}: exit 2 prints no partial report");
+    }
 }
