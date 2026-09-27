@@ -542,6 +542,7 @@ Every option of every subcommand, generated from the binary's own definitions (`
 | `--user` |  |  | Write the user-level hook instead (copilot: ~/.copilot/hooks/discipline.json, or under COPILOT_HOME), which runs in every folder but checks only repositories with a discipline.toml |
 | `--observe` |  |  | Write the hook commands in observe mode (hook run --observe): the agent is never blocked while a hook is rolled out |
 | `--cloud-agent` |  |  | Also write .github/workflows/copilot-setup-steps.yml, which installs discipline for Copilot cloud agent (copilot only) |
+| `--upgrade` |  |  | Rewrite a file an earlier discipline release generated (it carries the `Written by \`discipline hook install\`` header: the Claude Code bootstrap, the Copilot setup step, the OpenCode plugin) to this release; a file without that header is never rewritten |
 
 **`discipline explain`**
 
@@ -581,6 +582,19 @@ Every option of every subcommand, generated from the binary's own definitions (`
 | `--strict` |  |  | Treat warnings as failures |
 | `-f`, `--format` |  | `text` | Output format |
 <!-- /generated -->
+
+`doctor` reads branch rules through the forge's API. Without a token, a shared IP (a CI runner, an office network) soon reaches GitHub's unauthenticated rate limit, and the platform checks come back `could not check` (exit 2); set `DISCIPLINE_FORGE_TOKEN` (or `GH_TOKEN`) to a token that can read the repository.
+
+**A deliberate advisory step.** `doctor` reports a `non-blocking` FAIL for a job that runs discipline but cannot fail: `continue-on-error: true`, a masked `discipline check`, or an action step with `advisory: true`. A shadow step, run with `advisory: true` next to the real gate and compared with it on live runs before it replaces a script, is advisory on purpose. Mark it in the workflow file with a comment that begins `discipline:advisory` and gives a reason, on the line directly above the step (or in the comment block directly above it, with no blank line between) or on its `uses:` line:
+
+```yaml
+      # discipline:advisory shadow of scripts/lint.sh until the script is retired
+      - uses: orieg/discipline@v0
+        with:
+          advisory: true
+```
+
+The step is then reported as `info`, naming the reason. A marker with no reason, or a placeholder reason (`<reason>`, `TODO`, `n/a`, ...), is ignored and the FAIL stays. The marker changes only `doctor`'s report: the step still enforces nothing, and a job whose only discipline steps are marked advisory still does not count as a blocking check, so branch protection that requires only that job is still reported as not enforcing discipline. It excuses `advisory: true` only, never `continue-on-error` or a masked exit status.
 
 ### Exit Codes
 
@@ -965,6 +979,12 @@ A check that cannot run (configuration that does not parse, a base that does not
 
 **Observe mode, for rolling a hook out.** `discipline hook install --agent <name> --observe` writes every check command as `discipline hook run --agent <name> --observe`. The check runs as usual but never blocks: the agent gets its pass, and what would have blocked (the codes of the blocking findings, not the warnings beside them, or the reason a check could not run) is said on stderr, marked "observe mode, not enforced", and appended to `<git dir>/discipline/hook-observe.log`, one JSON line per event (`time`, `agent`, `event`, `verdict`, `reason`, `codes`). Read the log to see what enforcing would have stopped, then drop `--observe` from the hook file. Observe mode is never enforcement: CI still gates the change.
 
+**A hook on the branch that adds it.** A hook's check reads no PR body, so it cannot see the `allow-agent-instructions:` lines that record its own files. In a hook's check only, a hook file identical to what `hook install` of this release writes (for any agent, observe or enforcing, or the Claude Code bootstrap) is a note, not a finding; CI still reports it until the directive is in the PR body. A hook file edited by hand is reported by the hook as well, so a hook cannot be switched off unnoticed.
+
+**Upgrading generated files.** `hook install` never rewrites an existing file. A file it generated carries a `Written by \`discipline hook install\`` header; when such a file differs from what the running release writes (the Claude Code bootstrap and the Copilot setup step pin a release), `hook install` says so, and the same command with `--upgrade` rewrites it. A file without that header, one written or merged by hand, is never rewritten. After a release, run `hook install --agent <name> [--observe] [--cloud-agent] --upgrade` for each agent, and commit the result with its `allow-agent-instructions:` lines.
+
+**Several agents on one machine.** A Homebrew upgrade removes the old binary before it links the new one, so an agent session that upgrades while another is running can leave the other with no `discipline` on `PATH` for a moment. On a machine where several sessions run, install or upgrade once before starting them, or have each session use the checksum-verified release tarball in its own scratch directory.
+
 ### Pull-Request Comments
 
 ```yaml
@@ -994,7 +1014,7 @@ The directives each change carried are read from the body of the pull request it
 
 Each change is checked with its pull request's author as the actor (`--actor`), the login the action judges against `directives.allowed_override_actors` by default; an actor set in the replaying shell (`DISCIPLINE_ACTOR`, `GITHUB_ACTOR`, `GITEA_ACTOR`, ...) is ignored, and a change with no merged pull request has no actor. Under `fail_on_overrides = true`, every override applied by an author outside `allowed_override_actors` is refused and blocks the change: the case lists those gates in `refused_overrides` and the login in `actor`, while `blocking_gates` keeps only the gates with an `error` finding.
 
-The configuration under test is usually newer than the history it replays. A file it names for `version-lockstep` or `manifest-sync` that neither side of a replayed change has yet skips that group or rule with a note, rather than failing the whole change; outside replay, the same missing file is a configuration error (exit 2). Replay marks its cases with `DISCIPLINE_REPLAY_CASE`, which is honoured only when the base is the parentless commit replay builds for the case; set on any other `check`, it changes nothing.
+The configuration under test is usually newer than the history it replays. A file it names for `version-lockstep` or `manifest-sync` that neither side of a replayed change has yet skips that group or rule with a note, rather than failing the whole change, and the summary counts it: the text output says how many changes skipped a check whose configuration is newer than the change and names the gate and group or manifest, and `--json` lists the changes per gate in `skipped_by_gate` and each change's skips in its `skipped_checks`; outside replay, the same missing file is a configuration error (exit 2). Replay marks its cases with `DISCIPLINE_REPLAY_CASE`, which is honoured only when the base is the parentless commit replay builds for the case; set on any other `check`, it changes nothing.
 
 `--json` prints the per-change verdicts and the per-gate counts (`errors_by_gate` names the changes each gate blocked with an error finding; `refused_overrides_by_gate` the changes whose override of a gate was refused; `could_not_check_by_reason` groups the changes that could not be checked by the reason their check gave, the report's `could_not_check.reason`, with `forge` for a change whose merged pull request could not be read; each case carries its `reason` and the error in `detail`). The command exits 0 when the replay ran, whatever it found; 2 when it could not run. The shape is defined by `discipline.replay.schema.json`, and the `check --format json` report's by `discipline.report.schema.json`, both at the repository root.
 
@@ -1273,7 +1293,7 @@ Discipline produces multi-target reports from a single execution run:
 When an authorized directive is parsed and applied:
 1. **Audit Record:** The gate outcome records the override in its result structure, naming the gate, subject, and reason.
 2. **Action Outputs:** Outputs `overrides` (total count of applied overrides) and `overridden_gates` (comma-separated list of gate ids) are populated.
-3. **Machine Report:** The JSON report carries the total as top-level `overrides` and each record under `outcomes[].overrides[]` (`gate`, `subject`, `directive`, `reason`, `source`, `hidden`) for compliance logging.
+3. **Machine Report:** The JSON report carries the total as top-level `overrides` and each record under `outcomes[].overrides[]` (`gate`, `subject`, `directive`, `reason`, `source`, `hidden`) for compliance logging. `subject` is what the override lifted (a path, a test, a gate); `reason` is the directive's whole argument as written, so for a directive that names its subject (`allow-agent-instructions: AGENTS.md reviewed the new line`) it starts with that subject (`AGENTS.md reviewed the new line`), and for one that does not (`no-issue: trivial fix`) it is the text alone.
 4. **Enforced Sign-off:** Setting `directives.fail_on_overrides = true` (or passing `--fail-on-overrides`) causes Discipline to exit `1` whenever any override is present. This blocks automated merge and mandates human sign-off while preserving the audit trail.
 
 ---
