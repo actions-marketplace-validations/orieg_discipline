@@ -57,7 +57,7 @@ bench\t''"
 complete -c discipline -n "__fish_discipline_using_subcommand check" -s b -l base -d 'Base branch or commit to measure the change against (auto-detected in CI if omitted)' -r
 complete -c discipline -n "__fish_discipline_using_subcommand check" -l commit -d 'Specific commit to inspect, against its parent <sha>~1; it must be the commit checked out (exit 2 otherwise)' -r
 complete -c discipline -n "__fish_discipline_using_subcommand check" -l commit-range -d 'Commit range to inspect (<before>..<after> or <before>...<after>); <after>, when given, must be the commit checked out (exit 2 otherwise)' -r
-complete -c discipline -n "__fish_discipline_using_subcommand check" -l pr-body-file -l commit-msg-file -d 'File holding the PR body or commit message (override directives, hygiene scanning). Falls back to the PR_BODY environment variable' -r -F
+complete -c discipline -n "__fish_discipline_using_subcommand check" -l pr-body-file -l commit-msg-file -d 'File holding the PR body or commit message (override directives, hygiene scanning). With neither this flag nor DISCIPLINE_PR_BODY_FILE, the body is read from the PR_BODY environment variable' -r -F
 complete -c discipline -n "__fish_discipline_using_subcommand check" -l pr-title -d 'PR title for PR-level hygiene checks (e.g. issue-link). Falls back to the PR_TITLE environment variable' -r
 complete -c discipline -n "__fish_discipline_using_subcommand check" -l policy-from -d 'Which side\'s discipline.toml judges the change. `base` reads it from the base ref, so a policy edit takes effect once merged; `config-integrity` still reports it' -r -f -a "head\t'The configuration in the working tree (the change\'s own copy)'
 base\t'The configuration on the base ref'"
@@ -132,7 +132,7 @@ quality\t''
 verification\t''
 bench\t''"
 complete -c discipline -n "__fish_discipline_using_subcommand baseline" -l write -d 'Record current findings to the baseline file'
-complete -c discipline -n "__fish_discipline_using_subcommand baseline" -l migrate -d 'Rewrite a fingerprint-version-1 baseline to version 2: every entry a current finding still matches is kept under its finding code, and stale entries are dropped. Commit the result in a change of its own, which `config-integrity` accepts without a directive'
+complete -c discipline -n "__fish_discipline_using_subcommand baseline" -l migrate -d 'Rewrite a fingerprint-version-1 baseline to version 2: every entry a current finding still matches is kept under its finding code, and stale entries are dropped. Commit the result in a change of its own, which `config-integrity` accepts without a directive. With no baseline file there is nothing to migrate: it says so and exits 0; a file that cannot be read exits 2'
 complete -c discipline -n "__fish_discipline_using_subcommand baseline" -l whole-tree -d 'Record every pre-existing finding in the tree, not just the diff. Use when adopting discipline on an existing repository; conflicts with --base'
 complete -c discipline -n "__fish_discipline_using_subcommand baseline" -l all-severities -d 'Also record warnings and notes. By default only findings that would block under the current configuration are recorded: `error`, plus `warning` under --fail-on-warnings'
 complete -c discipline -n "__fish_discipline_using_subcommand baseline" -l fail-on-warnings -d 'Treat warnings as blocking when choosing what to record (same switch as `check --fail-on-warnings`)'

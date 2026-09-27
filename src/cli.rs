@@ -261,8 +261,13 @@ pub struct CheckArgs {
     pub staged: bool,
 
     /// File holding the PR body or commit message (override directives, hygiene scanning).
-    /// Falls back to the PR_BODY environment variable
-    #[arg(long, visible_alias = "commit-msg-file")]
+    /// With neither this flag nor DISCIPLINE_PR_BODY_FILE, the body is read from the PR_BODY
+    /// environment variable
+    #[arg(
+        long,
+        visible_alias = "commit-msg-file",
+        env = "DISCIPLINE_PR_BODY_FILE"
+    )]
     pub pr_body_file: Option<PathBuf>,
 
     /// PR title for PR-level hygiene checks (e.g. issue-link).
@@ -431,7 +436,8 @@ pub struct BaselineArgs {
     /// Rewrite a fingerprint-version-1 baseline to version 2: every entry a current
     /// finding still matches is kept under its finding code, and stale entries are
     /// dropped. Commit the result in a change of its own, which `config-integrity`
-    /// accepts without a directive.
+    /// accepts without a directive. With no baseline file there is nothing to migrate:
+    /// it says so and exits 0; a file that cannot be read exits 2.
     #[arg(long, conflicts_with_all = ["write", "base", "whole_tree"])]
     pub migrate: bool,
 

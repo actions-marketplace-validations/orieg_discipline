@@ -3571,6 +3571,41 @@ fn unreachable_assertions_do_not_count() {
 }
 
 #[test]
+fn the_pr_body_file_can_be_named_by_discipline_pr_body_file() {
+    let repo = Repo::new();
+    repo.commit_base("AGENTS.md", "# Rules\n\nRun the tests.\n", "docs: rules");
+    repo.write(
+        "AGENTS.md",
+        "# Rules\n\nRun the tests.\n\nNever skip a failing test.\n",
+    );
+    repo.commit("docs: rules");
+    // Outside the work tree, so the file is not part of the change.
+    let body = repo.path().join(".git").join("pr-body.txt");
+    std::fs::write(&body, "allow-agent-instructions: AGENTS.md reviewed\n").unwrap();
+    let args = ["check", "--base", "main", "--format", "json"];
+
+    let without = repo.run(&args, &[]);
+    assert_eq!(without.code, 1, "{}", without.stdout);
+    assert_eq!(
+        without.violations("instruction-smuggling").len(),
+        1,
+        "{}",
+        without.stdout
+    );
+
+    let with = repo.run(
+        &args,
+        &[("DISCIPLINE_PR_BODY_FILE", body.to_str().unwrap())],
+    );
+    assert_eq!(with.code, 0, "{}\n{}", with.stdout, with.stderr);
+    assert!(
+        with.violations("instruction-smuggling").is_empty(),
+        "{}",
+        with.stdout
+    );
+}
+
+#[test]
 fn a_push_run_says_why_a_pr_body_waiver_is_out_of_scope() {
     let repo = Repo::new();
     repo.git(&["checkout", "-q", "main"]);
@@ -13026,4 +13061,277 @@ fn a_parse_error_blocks_only_where_it_could_hide_a_test() {
         "{blocking:?}"
     );
     assert!(!blocking.iter().any(|f| f.ends_with(".m")), "{blocking:?}");
+}
+
+/// `ci-integrity` codes a change reports, from a base set of workflow files to a head
+/// set (`None` deletes the file).
+fn ci_integrity_codes(base: &[(&str, &str)], head: &[(&str, Option<&str>)]) -> Vec<String> {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-q", "main"]);
+    for (path, src) in base {
+        repo.write(path, src);
+    }
+    repo.commit("ci: base");
+    repo.git(&["checkout", "-q", "-B", "work"]);
+    for (path, src) in head {
+        match src {
+            Some(src) => repo.write(path, src),
+            None => {
+                repo.git(&["rm", "-q", path]);
+            }
+        }
+    }
+    repo.commit("ci: change");
+    let mut codes: Vec<String> = repo
+        .check(&[])
+        .violations("ci-integrity")
+        .iter()
+        .map(|v| v["code"].as_str().unwrap().to_string())
+        .collect();
+    codes.sort();
+    codes
+}
+
+const CI_HEAD: &str = "name: CI\npermissions: read-all\non: [pull_request]\njobs:\n";
+
+#[test]
+fn ci_integrity_a_rollup_that_reads_its_needs_is_not_masking() {
+    const WF: &str = ".github/workflows/ci.yml";
+    let jobs = "  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Run tests\n        run: cargo test\n";
+    let base = format!("{CI_HEAD}{jobs}  ci-gate:\n    needs: [test]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n");
+    let reads = format!("{CI_HEAD}{jobs}  ci-gate:\n    if: always()\n    needs: [test]\n    runs-on: ubuntu-latest\n    steps:\n      - env:\n          NEEDS: ${{{{ toJson(needs) }}}}\n        run: echo \"$NEEDS\" | jq -e 'all(.[]; .result == \"success\")'\n");
+    assert!(ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&reads))]).is_empty());
+    // Control: runs always and never reads the results, so it passes over a failure.
+    let ignores = format!("{CI_HEAD}{jobs}  ci-gate:\n    if: always()\n    needs: [test]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n");
+    assert_eq!(
+        ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&ignores))]),
+        vec!["ci-integrity/verification-job-masked-by-condition"]
+    );
+}
+
+#[test]
+fn ci_integrity_a_checked_set_plus_e_is_not_a_masked_exit_code() {
+    const WF: &str = ".github/workflows/ci.yml";
+    let wf = |run: &str| {
+        format!("{CI_HEAD}  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Negative control\n        run: |\n{run}")
+    };
+    let base = wf("          ./smoke.sh\n");
+    let checked = wf("          set +e\n          ./smoke.sh --plant-bug\n          rc=$?\n          set -e\n          if [ \"$rc\" -eq 0 ]; then echo 'planted bug not caught'; exit 1; fi\n");
+    assert!(ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&checked))]).is_empty());
+    // Controls: the status is dropped, or saved and never tested.
+    for masked in [
+        wf("          set +e\n          ./smoke.sh\n          set -e\n"),
+        wf("          set +e\n          ./smoke.sh\n          rc=$?\n          echo done\n"),
+    ] {
+        assert_eq!(
+            ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&masked))]),
+            vec!["ci-integrity/exit-code-masked"],
+            "{masked}"
+        );
+    }
+}
+
+#[test]
+fn ci_integrity_a_failure_only_step_masks_only_when_it_was_a_check() {
+    const WF: &str = ".github/workflows/ci.yml";
+    let test = "      - name: Run tests\n        run: cargo test\n";
+    let base = format!("{CI_HEAD}  test:\n    runs-on: ubuntu-latest\n    steps:\n{test}");
+    // A new diagnostic that runs after a failure replaces nothing.
+    let diag = format!("{base}      - name: Show the diff for any failing test\n        if: failure()\n        run: cat tests/*.diff\n");
+    assert!(ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&diag))]).is_empty());
+    // Control: the existing check now runs only after a failure.
+    let gated = base.replace(
+        "        run: cargo test\n",
+        "        if: failure()\n        run: cargo test\n",
+    );
+    assert_eq!(
+        ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&gated))]),
+        vec!["ci-integrity/verification-step-masked-by-condition"]
+    );
+    // `always()` runs the step more often; with a narrowing condition it is a narrowing.
+    let always = base.replace(
+        "        run: cargo test\n",
+        "        if: always()\n        run: cargo test\n",
+    );
+    assert!(ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&always))]).is_empty());
+    let narrowed = base.replace(
+        "        run: cargo test\n",
+        "        if: always() && github.event_name == 'push'\n        run: cargo test\n",
+    );
+    assert_eq!(
+        ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&narrowed))]),
+        vec!["ci-integrity/verification-step-narrowed"]
+    );
+}
+
+#[test]
+fn ci_integrity_a_renamed_split_or_moved_job_is_not_removed() {
+    const WF: &str = ".github/workflows/ci.yml";
+    const MOVED: &str = ".github/workflows/test-action.yml";
+    let build = "  build-research:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Build harnesses\n        run: make -C research harness && ./research/run-smoke --all --strict\n      - name: Test harnesses\n        run: cargo test --manifest-path research/Cargo.toml --all-features\n";
+    let base = format!("{CI_HEAD}{build}");
+    // Renamed, with the paths updated.
+    let renamed = format!(
+        "{CI_HEAD}{}",
+        build
+            .replace("build-research", "build-harnesses")
+            .replace("research", "tools")
+    );
+    assert!(ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&renamed))]).is_empty());
+    // Split into two jobs.
+    let split = format!("{CI_HEAD}  build:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Build harnesses\n        run: make -C research harness && ./research/run-smoke --all --strict\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Test harnesses\n        run: cargo test --manifest-path research/Cargo.toml --all-features\n");
+    assert!(ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&split))]).is_empty());
+    // A workflow folded into another file.
+    let other = format!("{CI_HEAD}  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Lint\n        run: cargo clippy -- -D warnings\n");
+    let folded = format!("{other}{}", build.replace("build-research", "test-action"));
+    assert!(ci_integrity_codes(
+        &[(WF, &other), (MOVED, &base)],
+        &[(WF, Some(&folded)), (MOVED, None)]
+    )
+    .is_empty());
+
+    // Controls. The same steps survive only in a job that was already there.
+    let twin = format!(
+        "{CI_HEAD}{build}{}",
+        build.replace("build-research", "build-windows")
+    );
+    assert_eq!(
+        ci_integrity_codes(&[(WF, &twin)], &[(WF, Some(&base))]),
+        vec!["ci-integrity/verification-job-removed"]
+    );
+    // An added job reuses the step names over emptied bodies.
+    let gutted = format!("{CI_HEAD}  build-harnesses:\n    runs-on: ubuntu-latest\n    steps:\n      - name: Build harnesses\n        run: echo ok\n      - name: Test harnesses\n        run: echo ok\n");
+    assert_eq!(
+        ci_integrity_codes(&[(WF, &base)], &[(WF, Some(&gutted))]),
+        vec!["ci-integrity/verification-job-removed"]
+    );
+    // A workflow deleted with nothing added.
+    assert_eq!(
+        ci_integrity_codes(&[(WF, &other), (MOVED, &base)], &[(MOVED, None)]),
+        vec!["ci-integrity/verification-workflow-deleted"]
+    );
+}
+
+#[test]
+fn version_lockstep_does_not_blame_a_change_for_drift_the_base_already_had() {
+    let config = r#"
+[meta]
+version = 1
+name = "test-repo"
+
+[gates.version-lockstep]
+enabled = true
+
+[[gates.version-lockstep.groups]]
+name = "release"
+sources = [
+  { path = "Makefile", regex = 'VERSION := (\S+)' },
+  { path = "plugin.json", regex = '"version": "([^"]+)"' },
+]
+"#;
+    let repo = Repo::new();
+    repo.commit_base_files(
+        &[
+            ("discipline.toml", config),
+            ("Makefile", "VERSION := 0.1.0\n"),
+            ("plugin.json", "{\"version\": \"0.3.5\"}\n"),
+            ("README.md", "hello\n"),
+        ],
+        "base: already drifted",
+    );
+    // A change to an unrelated file inherits the drift: a note, not a finding.
+    repo.write("README.md", "hello, world\n");
+    repo.commit("docs: readme");
+    let run = repo.check(&[]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    assert!(run.titles("version-lockstep").is_empty());
+    assert!(run.outcome("version-lockstep")["notes"]
+        .to_string()
+        .contains("the base already declared these versions"));
+    // Control: a change that edits a source must resolve the drift, even one that
+    // leaves its version alone.
+    repo.write("plugin.json", "{\"version\": \"0.3.5\", \"name\": \"x\"}\n");
+    repo.commit("chore: name the plugin");
+    assert_eq!(
+        repo.check(&[]).titles("version-lockstep"),
+        vec!["Version Declaration Lockstep Mismatch"]
+    );
+    repo.write("plugin.json", "{\"version\": \"0.3.6\"}\n");
+    repo.commit("chore: bump plugin");
+    assert_eq!(
+        repo.check(&[]).titles("version-lockstep"),
+        vec!["Version Declaration Lockstep Mismatch"]
+    );
+
+    // Control: drift this change introduced is reported.
+    let repo = Repo::new();
+    repo.commit_base_files(
+        &[
+            ("discipline.toml", config),
+            ("Makefile", "VERSION := 0.3.5\n"),
+            ("plugin.json", "{\"version\": \"0.3.5\"}\n"),
+        ],
+        "base: in sync",
+    );
+    repo.write("plugin.json", "{\"version\": \"0.3.6\"}\n");
+    repo.commit("chore: bump plugin only");
+    assert_eq!(repo.check(&[]).code, 1);
+}
+
+#[test]
+fn dependency_delta_ignores_a_requirement_on_the_projects_own_extras() {
+    let base = "[project]\nname = \"yaml-workflow\"\nversion = \"1.0\"\ndependencies = [\"pyyaml>=6,<7\"]\n\n[project.optional-dependencies]\nserve = [\"flask>=3,<4\"]\n";
+    let repo = Repo::new();
+    repo.commit_base_files(&[("pyproject.toml", base)], "base");
+    repo.write(
+        "pyproject.toml",
+        &format!("{base}all = [\"yaml-workflow[serve]\"]\n"),
+    );
+    repo.commit("build: an all extra");
+    let run = repo.check(&[]);
+    assert!(
+        run.violations("dependency-delta").is_empty(),
+        "{:?}",
+        run.violations("dependency-delta")
+    );
+    // Control: another package in the same extra is a new dependency.
+    repo.write(
+        "pyproject.toml",
+        &format!("{base}all = [\"yaml-workflow[serve]\", \"jsonschema\"]\n"),
+    );
+    repo.commit("build: jsonschema");
+    let codes: Vec<String> = repo
+        .check(&[])
+        .violations("dependency-delta")
+        .iter()
+        .map(|v| v["code"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        codes.contains(&"dependency-delta/direct-dependency-added".to_string()),
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn time_estimates_skips_periods_of_data_and_keeps_estimates() {
+    let repo = Repo::new();
+    repo.commit_base_files(&[("README.md", "# Tool\n")], "base");
+    repo.write(
+        "README.md",
+        "# Tool\n\n\
+         One-time setup (~5 minutes).\n\n\
+         - **Summarize my inbox** — \"Summarize the unread emails from the last\n  \
+         24 hours across all accounts, grouped by account.\"\n\
+         - **Draft a reply** — \"Find the thread with Acme about the Q3 invoice.\"\n\
+         - `duplicate_tab` copies a tab, e.g. last month's invoice tab → this month's.\n",
+    );
+    repo.commit("docs: examples");
+    let hits: Vec<String> = repo
+        .check(&[])
+        .violations("time-estimates")
+        .iter()
+        .map(|v| v["message"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].contains("5 minutes"), "{hits:?}");
 }
