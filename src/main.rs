@@ -1073,10 +1073,13 @@ fn baseline(mut args: BaselineArgs) -> Result<bool> {
     };
     if args.migrate {
         let Some(old) = existing_baseline.as_ref() else {
-            bail!(
-                "no baseline at `{}` to migrate",
+            // No file is nothing to migrate, not an error: adoption scripts run this unconditionally.
+            println!(
+                "{} no baseline at `{}`; nothing to migrate.",
+                style::yellow("note:"),
                 args.baseline_file.display()
             );
+            return Ok(true);
         };
         if old.version >= discipline::baseline::FINGERPRINT_VERSION {
             println!(
@@ -1422,6 +1425,9 @@ fn hook(args: discipline::cli::HookArgs) -> Result<bool> {
                 match installed {
                     Installed::Written(p) => {
                         println!("{} wrote {}", style::green("ok:"), p.display());
+                        if let Some(why) = discipline::hook::ignored_by_git(&p) {
+                            println!("{} {why}", style::yellow("warning:"));
+                        }
                     }
                     Installed::AlreadyPresent(p) => {
                         println!(
@@ -1430,6 +1436,9 @@ fn hook(args: discipline::cli::HookArgs) -> Result<bool> {
                             p.display(),
                             a.agent.id()
                         );
+                        if let Some(why) = discipline::hook::ignored_by_git(&p) {
+                            println!("{} {why}", style::yellow("warning:"));
+                        }
                     }
                     Installed::Refused(p, snippet) => {
                         println!(
