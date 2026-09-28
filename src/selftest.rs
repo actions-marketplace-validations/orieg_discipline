@@ -320,6 +320,34 @@ const CASES: &[Case] = &[
         },
     ),
     (
+        "review-threads: a Gitea conversation is resolved by its first comment, not its replies",
+        || {
+            use crate::forge::{CannedApi, Forge, ForgeKind};
+            use crate::review_threads::review_threads;
+            let forge = Forge {
+                kind: ForgeKind::Gitea,
+                url: "https://git.example.com".into(),
+                repo: "o/r".into(),
+            };
+            let mut api = CannedApi::default();
+            api.responses.insert(
+                "gitea:repos/o/r/pulls/2/reviews?limit=50&page=1".into(),
+                serde_json::json!({"__status": 200, "__headers": {"X-Total-Count": "2"},
+                    "__body": [{"id": 1, "state": "COMMENT"}, {"id": 2, "state": "COMMENT"}]}),
+            );
+            api.responses.insert(
+                "gitea:repos/o/r/pulls/2/reviews/1/comments".into(),
+                serde_json::json!([{"id": 58, "path": "a.py", "position": 1, "original_position": 0, "resolver": {"login": "owner"}}]),
+            );
+            api.responses.insert(
+                "gitea:repos/o/r/pulls/2/reviews/2/comments".into(),
+                serde_json::json!([{"id": 61, "path": "a.py", "position": 1, "original_position": 0, "resolver": null}]),
+            );
+            let t = review_threads(&api, &forge, 2).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(t.len() == 1 && t[0].resolved)
+        },
+    ),
+    (
         "overrides: the budget refuses the override past it, not the one at it",
         || {
             use crate::config::DirectivesConfig;
@@ -2554,6 +2582,28 @@ jobs:
             let clean = !continue_err_re.is_match("continue-on-error: false");
 
             Ok(missing_test && is_sha(pinned) && !is_sha(unpinned) && masks && clean)
+        },
+    ),
+    (
+        "ci-integrity: reusable workflows need a commit SHA, container images a digest",
+        || {
+            use crate::guards::ci_integrity::{pin_verdict, workflow_pin_refs, PinKind, PinVerdict};
+            let fp = vec!["actions/".to_string()];
+            let digest = "0123456789abcdef".repeat(4);
+            let wf = "jobs:\n  r:\n    uses: evil/reusable/.github/workflows/x.yml@main\n  b:\n    container: node:latest\n    steps:\n      - uses: docker://alpine:latest\n";
+            let doc: serde_yaml::Value = serde_yaml::from_str(wf)?;
+            let kinds: Vec<PinKind> = workflow_pin_refs(&doc, wf).iter().map(|r| r.kind).collect();
+            let found = kinds == vec![PinKind::ReusableWorkflow, PinKind::Image, PinKind::Image];
+            let reusable = pin_verdict(PinKind::ReusableWorkflow, "evil/r/.github/workflows/x.yml@main", &fp)
+                == PinVerdict::Unpinned
+                && pin_verdict(PinKind::ReusableWorkflow, "./.github/workflows/x.yml", &fp)
+                    == PinVerdict::Pinned;
+            let image = pin_verdict(PinKind::Image, "node:latest", &fp) == PinVerdict::Unpinned
+                && pin_verdict(PinKind::Image, &format!("node@sha256:{digest}"), &fp)
+                    == PinVerdict::Pinned
+                && pin_verdict(PinKind::Image, "${{ matrix.image }}", &fp)
+                    == PinVerdict::Expression;
+            Ok(found && reusable && image)
         },
     ),
     (

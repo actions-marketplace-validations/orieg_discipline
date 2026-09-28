@@ -28,6 +28,7 @@ This document establishes the normative enforcement rules, detection capabilitie
 | [`agent-scratch`](#agent-scratch) | hygiene | **shipped** | any | agent scratch state is never tracked |
 | [`shell-secrets`](#shell-secrets) | hygiene | **shipped** | shell, docker, workflows | no command-line secrets or unverified piped scripts in shell, docker, or CI |
 | [`issue-link`](#issue-link) | hygiene | **shipped** | any | PR title or description links a tracking issue (#123, Fixes #123) |
+| [`review-threads`](#review-threads) | hygiene | **shipped** | any | the pull request has no unresolved review thread |
 | [`ratified-paths`](#ratified-paths) | agent-guard | **shipped** | any | edits to protected paths carry an owner's ratification on an issue the pull request closes |
 | [`citation-metadata`](#citation-metadata) | hygiene | **shipped** | any | CITATION.cff and .zenodo.json are valid, agree with each other, and cite the concept DOI |
 | [`commit-provenance`](#commit-provenance) | hygiene | **shipped** | any | commits carry the required trailers; an agent-produced commit carries a review by someone else |
@@ -113,6 +114,7 @@ Every finding carries a code, `gate/code` (`ci-integrity/unpinned-action`, `vacu
 | `issue-link/issue-link-missing` | Tracking Issue Link Missing |
 | `issue-link/issue-reference-not-found` | Tracking Issue Reference Not Found |
 | `issue-link/issue-reference-closed` | Tracking Issue Reference Closed |
+| `review-threads/unresolved-review-thread` | Unresolved Review Thread |
 | `ratified-paths/protected-path-unratified` | Protected Path Edited Without Ratification |
 | `ratified-paths/never-ratifiable-path-changed` | Never-Ratifiable Path Edited |
 | `ratified-paths/ratification-entry-malformed` | Ratification Entry Refused |
@@ -183,6 +185,7 @@ Every finding carries a code, `gate/code` (`ci-integrity/unpinned-action`, `vacu
 | `ci-integrity/step-failure-masked-continue-on-error` | Verification Step Failure Masked (continue-on-error) |
 | `ci-integrity/verification-job-masked-by-condition` | Verification Job Masked By Condition |
 | `ci-integrity/unpinned-action` | Unpinned Third-Party Action |
+| `ci-integrity/unpinned-container-image` | Unpinned Container Image |
 | `ci-integrity/discipline-action-policy-from-weakened` | Discipline Action Weakened (policy_from) |
 | `ci-integrity/discipline-version-changed` | Discipline Version Chosen By The Change |
 | `ci-integrity/discipline-action-disable-input` | Discipline Action Weakened (disable input) |
@@ -900,6 +903,16 @@ Certain gates distinguish high-confidence rules from heuristic indicators within
 - **Lifting directive:** `no-issue: <reason>` on its own line in the PR description; `waiver = "none"` refuses it.
 - **Config keys:** `enabled`, `severity`, `exempt_paths`, `pattern`, `require_in_commit_if_no_pr`, `verify_references`, `require_open_issue`, `reference_repos`, `accept_pull_references`, `waiver`.
 
+#### `review-threads`
+- **Rule:** the pull request being checked has no unresolved review thread.
+- **Default:** `enabled = false` (opt-in). Where the forge can enforce the same at merge (GitHub: a ruleset's `required_review_thread_resolution` or classic `required_conversation_resolution`; GitLab: "All threads must be resolved"), that rule is the stronger control: `discipline doctor` reports it as `thread-resolution`. Gitea and Forgejo have no such rule, and this gate is the check there.
+- **How each forge is read:** GitHub, GraphQL `reviewThreads { isResolved isOutdated }` (the REST API does not expose it); GitLab, the merge request's discussions whose notes are `resolvable`, resolved when every resolvable note is; Gitea and Forgejo, the code comments of every review that is not `PENDING`, grouped into conversations by path and line (`position`, or `original_position` for an old-side line) across reviews. A conversation is resolved when its **first** comment carries `resolver`: resolving sets it there only, and replies keep `resolver: null` (RUN on Gitea 1.24.7 and Forgejo 12.0.4: a reply posted in a second review joined the conversation; resolve and unresolve set and cleared the first comment's `resolver`).
+- **When it runs:** the state changes without a push, and resolving a thread starts no workflow, so the verdict is that of the run. Trigger the workflow on review events (`pull_request_review`, `pull_request_review_comment`) and re-run it after resolving. A local run or a push has no pull request and examines nothing; a pull-request run in CI without the event payload is exit `2`.
+- **What it catches:** `Unresolved Review Thread`, one per thread, on its file. Threads on `exempt_paths` are not counted.
+- **Could not check (exit 2):** a forge that cannot be reached or identified, a list of reviews, comments or threads that cannot be read to its end.
+- **Lifting directive:** none: a thread is resolved, not waived by the change's author.
+- **Config keys:** `enabled`, `severity`, `exempt_paths`.
+
 #### `ratified-paths`
 - **Rule:** A pull request that edits a path matching `protected_paths` passes only when an issue it **closes** carries a comment, by a login in `ratifiers` and not in `agent_logins`, that names the path exactly:
   ```text
@@ -1157,10 +1170,12 @@ Certain gates distinguish high-confidence rules from heuristic indicators within
 
 #### `ci-integrity`
 - **Rule:** CI/CD workflow integrity and rollup sentinel. Enforces complete rollup jobs (`ci-gate` must `needs:` all verification jobs), pins third-party actions by 40-character commit SHA, bans masked failures (`continue-on-error: true`), and bans exit-code suppression (`|| true`, `set +e`).
-- **Languages:** Actions workflow files (`*.yml` / `*.yaml` under `.github/workflows/`, `.gitea/workflows/`, `.forgejo/workflows/`) and GitLab pipelines (`.gitlab-ci.yml`, `.gitlab/ci/*.yml`).
+- **Languages:** Actions workflow files (`*.yml` / `*.yaml` under `.github/workflows/`, `.gitea/workflows/`, `.forgejo/workflows/`), composite action metadata (`.github/actions/**/action.yml`, a root `action.yml`; `.yaml` too) and GitLab pipelines (`.gitlab-ci.yml`, `.gitlab/ci/*.yml`).
 - **What it catches:**
   - Rollup job missing a dependency on verification jobs defined in the workflow (`Rollup Job Needs Incomplete`).
-  - Third-party GitHub actions unpinned or pinned to mutable tags/branches (`@v4`, `@main`) instead of 40-character commit SHA. Only a `uses:` new relative to the base side is checked; `first_party_action_prefixes` (default `actions/`, `github/`) are exempt.
+  - `Unpinned Third-Party Action` (`ci-integrity/unpinned-action`): a step `uses:` or a job-level `uses:` calling a remote reusable workflow (`owner/repo/.github/workflows/x.yml@main`) at a mutable tag or branch (`@v4`, `@main`) instead of a 40-character commit SHA. The nested `runs.steps[*].uses` of a composite action's `action.yml` / `action.yaml` are held to the same rule; such a file gets no rollup, job or step-weakening checks, only this one. `first_party_action_prefixes` (default `actions/`, `github/`) and local references (`./...`) are exempt.
+  - `Unpinned Container Image` (`ci-integrity/unpinned-container-image`): a job `container:` (string or `image:`), a `services.<name>.image`, or a `uses: docker://...` step without an `@sha256:<64 hex>` digest. First-party prefixes do not exempt an image. An image written as an expression (`${{ matrix.image }}`) cannot be resolved: it is a gate note naming the file and line, neither a pass nor a finding.
+  - Which references are judged: with `diff_only = true` (the default) only one new relative to the base side (a tag ref already in the base file is not reported, so adoption does not block). With `diff_only = false` every reference in every scanned file is, and the message says whether it was `added by this change` or is `pre-existing`; record today's pre-existing ones with `discipline baseline --write --base <ref>` (a `--whole-tree` baseline does not evaluate this gate) so the list only shrinks. All of these respect `pin_actions`, `exempt_paths`, an inline `discipline:allow(ci-integrity)` on the reference or on its step's line, and `allow-ci-weakening: <ref or action> <reason>` / `allow-gate-weakening: ci-integrity <reason>`.
   - Steps carrying `continue-on-error: true`. In a job that verifies nothing (no verification step, and an id that names no check: a summary or report job) it is a warning, since no check is masked.
   - **Verification steps** are those whose body runs a check (`cargo test`, a linter, ...), or whose name says it checks (`test`, `lint`, `gate`, `check`, ...) unless the step reports: a reporting action (`actions/upload-artifact`, `actions/download-artifact`, PR-comment actions, `actions/github-script` whose script has no `setFailed` or `throw`), or a name that starts with a reporting verb (`Comment`, `Upload`, `Show`, `Summarize`, ...). `Comment the gate result on the PR` is not a check.
   - Commands masking exit codes (`|| true`, `set +e`). A `set +e` whose `$?` is saved and later tested or exited with (`set +e; cmd; rc=$?; set -e; if [ "$rc" -eq 0 ]; then exit 1; fi`), or tested directly, is a checked negative control and is not reported.
@@ -1181,7 +1196,9 @@ Certain gates distinguish high-confidence rules from heuristic indicators within
   allow-ci-weakening: ci-gate temporary rollup relaxation during migration
   ```
 - **What it does NOT catch:**
-  - Local actions (`./...`) and docker actions (`docker://...`).
+  - Local actions and local reusable workflows (`./...`); what a local action pulls in is checked only when its `action.yml` matches the `workflows` globs.
+  - The `runs.image` of a Docker container action (`using: docker`), a `Dockerfile`'s `FROM`, and images a `run:` script pulls (`docker run`, `docker pull`).
+  - A reference whose tag was re-pointed while the ref text stayed the same, in default diff mode: that needs `diff_only = false`.
   - A job listed in `excluded_jobs` (default `detect-changes`) missing from the rollup's `needs`.
 - **Lifting directive:** `allow-ci-weakening: <subject> <reason>`.
 - **Config keys:** `enabled`, `severity`, `exempt_paths`, `workflows`, `rollup_job`, `excluded_jobs`, `pin_actions`, `forbid_continue_on_error`, `forbid_or_true`, `diff_only`, `documented_job_count_path`, `documented_job_count_pattern`, `first_party_action_prefixes`.
@@ -1785,7 +1802,7 @@ severity = "error"
 
 ## Forge Access
 
-`require_open_pending_issues`, `issue-link`'s `verify_references`, `ratified-paths`, bench-regression citation freshness, `directives.require_approval` (pull-request reviews), the `merged-pr-body` directive source on a push event, `discipline replay` (each replayed change's merged pull-request body) and `discipline doctor` read from the forge that hosts the repository; `check --comment` (opt-in) writes one pull-request comment. No gate needs the network otherwise. Requests are made by the binary itself over HTTPS (rustls; no OpenSSL, no `gh`, no `curl`), so they work the same in the static binary and the container.
+`require_open_pending_issues`, `issue-link`'s `verify_references`, `ratified-paths`, `review-threads`, bench-regression citation freshness, `directives.require_approval` (pull-request reviews), the `merged-pr-body` directive source on a push event, `discipline replay` (each replayed change's merged pull-request body) and `discipline doctor` read from the forge that hosts the repository; `check --comment` (opt-in) writes one pull-request comment. No gate needs the network otherwise. Requests are made by the binary itself over HTTPS (rustls; no OpenSSL, no `gh`, no `curl`), so they work the same in the static binary and the container.
 
 | Forge | API base | Token (optional for public repositories) |
 |---|---|---|
@@ -1796,7 +1813,7 @@ severity = "error"
 
 - **Transport rules:** HTTPS only; plain HTTP is accepted for a loopback address, or for any host with `DISCIPLINE_FORGE_ALLOW_HTTP=1` (the token then travels in clear). Redirects are followed only to the same scheme, host and port, at most three times, so a token never leaves the forge. API paths with empty, `.` or `..` segments are refused. Credentials embedded in a URL variable (`https://user:token@host`) are dropped; put tokens in a token variable. Certificates are verified with the platform's trust store (the system CA bundle; the macOS keychain), so a corporate CA installed there is honoured. `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` are honoured. Responses are capped at 25 MiB and each request at 30 seconds.
 - **Retries:** a read that gets no answer, or a 500, 502, 503 or 504, is tried three times in all, 0.5 s and then 1.5 s apart. A rate limit (429, or a 403 with `x-ratelimit-remaining: 0` or `Retry-After`) is waited out when the forge asks for at most 60 seconds (`Retry-After`, GitHub `x-ratelimit-reset`, GitLab `RateLimit-Reset`), and given up at once otherwise. A 401, 403, 404 or other status is answered at once. Writes are never retried. One run makes at most 500 requests. A read that still fails is exit 2 and its detail starts with the class of failure: `forge-unavailable`, `forge-rate-limited`, `forge-denied`, `forge-malformed`, `forge-partial-list`.
-- **GraphQL:** GitHub facts its REST API does not expose (a pull request's closing issues, who edited a comment) are read with a GraphQL query: a POST to `/graphql` (`<url>/api/graphql` on GitHub Enterprise Server). It is a read. It changes nothing on the forge, is retried like any read, and is never used to write.
+- **GraphQL:** GitHub facts its REST API does not expose (a pull request's closing issues, who edited a comment, whether a review thread is resolved) are read with a GraphQL query: a POST to `/graphql` (`<url>/api/graphql` on GitHub Enterprise Server). It is a read. It changes nothing on the forge, is retried like any read, and is never used to write.
 - **Lists** are read to the end or not at all: pages are requested with `per_page=100` (GitHub, GitLab) or `limit=50` (Gitea and Forgejo read `limit` and ignore `per_page`). With a stated total (`X-Total-Count`, GitLab `x-total`), pages are read until the items reach it; a short page is not an end, since a server may clamp the page size. An endpoint that ignores paging (Gitea's and Forgejo's issue comments) returns the whole list, with its total, on page 1. Without a total, GitHub and GitLab stop where no further page is stated (`Link: rel="next"`, `x-next-page`), and Gitea and Forgejo at an empty page. Pages that end before the total or overshoot it, a total that changes between pages, a page that only repeats earlier items when no total is sent, or more than 20 pages is `forge-partial-list`: never judged on what was read.
 - **No network:** `DISCIPLINE_NO_NETWORK=1` refuses every request that is not to a loopback address; the features that need the forge then exit 2.
 - **Other endpoint:** `DISCIPLINE_FORGE_API_URL` replaces the API base (an internal mirror or proxy, or a local mock).

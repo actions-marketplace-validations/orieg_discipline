@@ -36,6 +36,7 @@ pub fn generate_schema() -> Value {
             "shell-secrets" => "#/$defs/ShellSecretsGate",
             "issue-link" => "#/$defs/IssueLinkGate",
             "ratified-paths" => "#/$defs/RatifiedPathsGate",
+            "review-threads" => "#/$defs/ReviewThreadsGate",
             "commit-provenance" => "#/$defs/CommitProvenanceGate",
             "citation-metadata" => "#/$defs/CitationMetadataGate",
             "provenance-tags" => "#/$defs/ProvenanceTagsGate",
@@ -490,6 +491,15 @@ pub fn generate_schema() -> Value {
                     "waiver": { "type": "string", "enum": ["directive", "none"], "description": "Whether `no-issue: <reason>` is accepted (default: directive)" }
                 }
             },
+            "ReviewThreadsGate": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "Whether this gate is active" },
+                    "severity": { "$ref": "#/$defs/Severity" },
+                    "exempt_paths": { "$ref": "#/$defs/StringListOrReset", "description": "Threads on these paths are not counted" }
+                }
+            },
             "RatifiedPathsGate": {
                 "type": "object",
                 "additionalProperties": false,
@@ -534,13 +544,13 @@ pub fn generate_schema() -> Value {
                     "enabled": { "type": "boolean", "description": "Whether this gate is active" },
                     "severity": { "$ref": "#/$defs/Severity" },
                     "exempt_paths": { "$ref": "#/$defs/StringListOrReset" },
-                    "workflows": { "$ref": "#/$defs/StringListOrReset", "description": "Workflow file patterns to inspect" },
+                    "workflows": { "$ref": "#/$defs/StringListOrReset", "description": "Workflow file patterns to inspect; an action.yml / action.yaml outside a workflow directory is read as a composite action (its nested uses: only)" },
                     "rollup_job": { "type": "string", "description": "Name of the rollup job that must depend on all jobs" },
                     "excluded_jobs": { "$ref": "#/$defs/StringListOrReset", "description": "Job names excluded from rollup dependency requirements" },
-                    "pin_actions": { "type": "boolean", "description": "Ensure third-party GitHub actions are pinned by 40-character commit SHA" },
+                    "pin_actions": { "type": "boolean", "description": "Ensure third-party actions and reusable workflows are pinned by 40-character commit SHA, and container images by sha256 digest" },
                     "forbid_continue_on_error": { "type": "boolean", "description": "Forbid continue-on-error: true in workflow jobs or steps" },
                     "forbid_or_true": { "type": "boolean", "description": "Forbid || true and set +e error masking in run commands" },
-                    "diff_only": { "type": "boolean", "description": "When true, scans only modified workflow files rather than all workflows" },
+                    "diff_only": { "type": "boolean", "description": "When true, scans only modified workflow files rather than all workflows, and pins only references new relative to the base; false reports every unpinned reference, pre-existing ones included" },
                     "documented_job_count_path": { "type": "string", "description": "Path to catalog documentation stating job count" },
                     "documented_job_count_pattern": { "type": "string", "description": "Regex pattern to extract job count from documentation" },
                     "first_party_action_prefixes": { "$ref": "#/$defs/StringListOrReset", "description": "Action prefixes considered first-party and excused from commit SHA pinning" }
