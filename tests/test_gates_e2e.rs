@@ -3738,7 +3738,7 @@ fn a_push_run_reads_the_merged_pull_requests_body() {
     // A squash commit: the message carries the branch's subject, not the PR body.
     repo.commit("docs: never skip (#12)");
     let head = |repo: &Repo| {
-        let out = std::process::Command::new("git")
+        let out = common::git_command()
             .args(["rev-parse", "HEAD"])
             .current_dir(repo.dir.path())
             .output()
@@ -4658,6 +4658,70 @@ fn required_approval_is_read_from_the_forge_for_the_checked_head() {
 }
 
 #[test]
+fn gitea_required_approval_reads_every_review_page_to_the_total_count() {
+    let repo = repo_with_two_self_granted_overrides(
+        "require_approval = true\nallowed_override_actors = [\"lead\"]\n",
+    );
+    let event_dir = tempfile::tempdir().unwrap();
+    let event = event_dir.path().join("event.json");
+    std::fs::write(
+        &event,
+        r#"{"pull_request": {"number": 7, "user": {"login": "agent"}, "head": {"sha": "abc123"}}}"#,
+    )
+    .unwrap();
+    let event = event.to_str().unwrap().to_string();
+    let review = |login: &str, state: &str| serde_json::json!({"user": {"login": login}, "state": state, "commit_id": "abc123"});
+    // `lead` approves on page 1; page 2 holds the review that decides.
+    let check = |second: Option<serde_json::Value>| {
+        let api = FakeForge::start();
+        let page = |n: u32| format!("repos/o/r/pulls/7/reviews?limit=50&page={n}");
+        let one = serde_json::json!([review("lead", "APPROVED")]).to_string();
+        api.serve_raw(&page(1), 200, &[("X-Total-Count", "2")], &one);
+        if let Some(r) = second {
+            let two = serde_json::json!([r]).to_string();
+            api.serve_raw(&page(2), 200, &[("X-Total-Count", "2")], &two);
+        }
+        let url = api.url();
+        repo.run(
+            &["check", "--format", "json", "--base", "main"],
+            &[
+                ("DISCIPLINE_FORGE_API_URL", url.as_str()),
+                ("GITEA_ACTIONS", "true"),
+                ("GITHUB_SERVER_URL", "https://gitea.example"),
+                ("GITHUB_REPOSITORY", "o/r"),
+                ("GITHUB_EVENT_PATH", event.as_str()),
+            ],
+        )
+    };
+
+    // A later comment by someone else leaves the approval standing.
+    let ok = check(Some(review("c0", "COMMENT")));
+    assert_eq!(ok.code, 0, "stdout: {}\nstderr: {}", ok.stdout, ok.stderr);
+
+    // The approval withdrawn on page 2: refused.
+    let run = check(Some(review("lead", "REQUEST_CHANGES")));
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    let refusals = run.json()["policy_failures"].as_array().unwrap().clone();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(refusals[0]
+        .as_str()
+        .unwrap()
+        .contains("await an approving review"));
+
+    // Page 2 of the counted list cannot be read: could not check, not a pass.
+    let run = check(None);
+    assert_eq!(
+        run.code, 2,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+}
+
+#[test]
 fn policy_from_base_judges_a_change_by_the_configuration_it_did_not_write() {
     // The change adds a vacuous test and switches off the gate that would report it,
     // excusing the switch from its own commit body.
@@ -5054,7 +5118,7 @@ fn discipline_toml_with_nul_byte_fails_closed_exit_2() {
 fn empty_tree_first_commit_staged_mode_passes() {
     let dir = tempfile::tempdir().unwrap();
     let repo_path = dir.path();
-    std::process::Command::new("git")
+    common::git_command()
         .args(["init", "-q", "-b", "main"])
         .current_dir(repo_path)
         .status()
@@ -5071,7 +5135,7 @@ fn empty_tree_first_commit_staged_mode_passes() {
         std::os::unix::fs::symlink("AGENTS.md", repo_path.join("GEMINI.md")).unwrap();
     }
 
-    std::process::Command::new("git")
+    common::git_command()
         .args(["add", "-A"])
         .current_dir(repo_path)
         .status()
@@ -5116,7 +5180,7 @@ fn empty_tree_first_commit_staged_mode_passes() {
 fn empty_repo_unstaged_mode_fails_closed_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     let repo_path = dir.path();
-    std::process::Command::new("git")
+    common::git_command()
         .args(["init", "-q", "-b", "main"])
         .current_dir(repo_path)
         .status()
@@ -11329,7 +11393,7 @@ fn submodule_gitlink_entries_do_not_break_the_run() {
 
     // Build a real mode-160000 index entry without needing a second clone.
     let head = {
-        let out = std::process::Command::new("git")
+        let out = common::git_command()
             .args(["rev-parse", "HEAD"])
             .current_dir(repo.path())
             .output()
@@ -12509,7 +12573,13 @@ fn a_helper_refactored_into_a_thin_wrapper_is_not_an_assertion_reduction() {
     let helper = "use std::path::Path;\n\npub fn install(root: &Path, observe: bool) -> Result<u32> {\n    let a = write(root, observe)?;\n    let b = write(root, observe)?;\n    Ok(a + b)\n}\n\n";
     let wrapped = "use std::path::Path;\n\npub fn install(root: &Path, observe: bool) -> Result<u32> {\n    install_with(root, observe, false)\n}\n\npub fn install_with(root: &Path, observe: bool, force: bool) -> Result<u32> {\n    let a = write(root, observe || force)?;\n    let b = write(root, observe)?;\n    Ok(a + b)\n}\n\n";
     let hollow = "use std::path::Path;\n\npub fn install(root: &Path, observe: bool) -> Result<u32> {\n    install_with(root, observe, false)\n}\n\npub fn install_with(root: &Path, observe: bool, force: bool) -> Result<u32> {\n    Ok(2)\n}\n\n";
-    for (before, after, reported) in [(helper, wrapped, false), (wrapped, hollow, true)] {
+    // The wrapper forwards an empty slice instead of a named constant.
+    let forwarded = "use std::path::Path;\n\npub fn install(root: &Path, observe: bool) -> Result<u32> {\n    install_with(root, observe, &[])\n}\n\npub fn install_with(root: &Path, observe: bool, env: &[(&str, &str)]) -> Result<u32> {\n    let a = write(root, observe || !env.is_empty())?;\n    let b = write(root, observe)?;\n    Ok(a + b)\n}\n\n";
+    for (before, after, reported) in [
+        (helper, wrapped, false),
+        (wrapped, hollow, true),
+        (helper, forwarded, false),
+    ] {
         let repo = Repo::new();
         repo.git(&["checkout", "-q", "main"]);
         repo.write("src/install.rs", &format!("{before}{test}"));
