@@ -441,6 +441,7 @@ Discipline provides a standalone CLI for local developer workflows, pre-commit h
 | `mcp` | Serve the gates to an MCP client over stdio (read-only tools: check_diff, list_gates, explain_finding) |
 | `bench` | Benchmark tooling for the bench-regression gate |
 | `doctor` | Check that the repository and its platform enforce discipline: workflows, CODEOWNERS, branch protection. Exit 0 = healthy, 1 = a failing check, 2 = could not check |
+| `lease` | Claim this worktree's branches for one agent session, so other worktrees' sessions do not move them (kept in the common git directory, never committed) |
 <!-- /generated -->
 
 ### Options
@@ -560,6 +561,7 @@ Every option of every subcommand, generated from the binary's own definitions (`
 | `-b`, `--base` |  |  | Base to measure the change against (default: the merge base with origin's default branch, else main / master) |
 | `--if-configured` |  |  | Pass silently unless the working directory is in a git repository with a discipline.toml at its root (for a user-level hook, which runs in every folder) |
 | `--observe` |  |  | Observe mode: run the check but never block; what would have blocked is said on stderr and appended to &lt;git dir&gt;/discipline/hook-observe.log |
+| `--event` |  | `check` | The hook event: `pre-tool` checks the tool call on stdin before it runs (an edit into another worktree, into a worktree another session leases, or into forbidden_paths is refused); the default checks the change so far |
 
 **`discipline hook install`**
 
@@ -610,6 +612,28 @@ Every option of every subcommand, generated from the binary's own definitions (`
 | `--local-only` |  |  | Check only local files; skip the platform API |
 | `--strict` |  |  | Treat warnings as failures |
 | `-f`, `--format` |  | `text` | Output format |
+
+**`discipline lease take`**
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--branch` |  |  | A branch to claim (repeatable; default: the branch checked out here) |
+| `--agent` |  | `unknown` | The agent working here (claude-code, copilot, agy, ...) |
+| `--session` |  | `` | The agent's session id |
+| `--ttl` |  | `7200` | Seconds the lease stays live without a refresh |
+| `--steal` |  |  | Take branches another worktree's live lease claims, removing them from that lease (it is said, never silent) |
+
+**`discipline lease list`**
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--json` |  |  | Print the leases as JSON |
+
+**`discipline lease check`**
+
+| Option | Env | Default | Description |
+|---|---|---|---|
+| `--branch` |  |  | The branch to check |
 <!-- /generated -->
 
 `doctor` reads branch rules through the forge's API. Without a token, a shared IP (a CI runner, an office network) soon reaches GitHub's unauthenticated rate limit, and the platform checks come back `could not check` (exit 2); set `DISCIPLINE_FORGE_TOKEN` (or `GH_TOKEN`) to a token that can read the repository.
@@ -959,14 +983,14 @@ The hook file is project configuration: commit it so every contributor's agent r
 
 | Agent | File | Runs on | A finding |
 |---|---|---|---|
-| Claude Code | `.claude/settings.json`, and `.claude/hooks/discipline-bootstrap.sh` its `SessionStart` runs (below) | `PostToolUse` (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`) and `Stop` | exit 2, the report on stderr, which the agent reads |
+| Claude Code | `.claude/settings.json`, and `.claude/hooks/discipline-bootstrap.sh` its `SessionStart` runs (below) | `PreToolUse` (the pre-tool check, below), `PostToolUse` (`Edit`, `Write`, `MultiEdit`, `NotebookEdit`) and `Stop` | exit 2, the report on stderr, which the agent reads |
 | Codex CLI | `.codex/hooks.json` | `PostToolUse` (`apply_patch`, `Edit`, `Write`) and `Stop` | exit 2, the report on stderr |
 | Cursor | `.cursor/hooks.json` | `stop` (`loop_limit: 3`) | `{"followup_message": <report>}` on stdout, sent as the next message |
 | Aider | `.aider.conf.yml` | `lint-cmd` after each edit (`auto-lint: true`) | exit 1, the report on stdout |
-| GitHub Copilot CLI | `.github/hooks/discipline.json` | `postToolUse` (`create`, `edit`, `str_replace_editor`, `apply_patch`) and `agentStop`; only in a folder Copilot trusts (below) | after an edit, exit 0 with `{"additionalContext": <report>}`, appended to the tool result the model reads; at the end of a turn, `{"decision": "block", "reason": <report>}`, which forces another turn |
-| Antigravity CLI (`agy`) | `.agents/hooks.json` (a named hook whose `Stop` lists its handler directly) | `Stop` (a `PostToolUse` hook's output does not reach agy's model); a `SessionStart` handler warns when `discipline` is missing (below) | `{"decision": "continue", "reason": <report>}`, which re-enters the loop with the report as a system message |
+| GitHub Copilot CLI | `.github/hooks/discipline.json` | `preToolUse` (the pre-tool check, below), `postToolUse` (`create`, `edit`, `str_replace_editor`, `apply_patch`) and `agentStop`; only in a folder Copilot trusts (below) | after an edit, exit 0 with `{"additionalContext": <report>}`, appended to the tool result the model reads; at the end of a turn, `{"decision": "block", "reason": <report>}`, which forces another turn |
+| Antigravity CLI (`agy`) | `.agents/hooks.json` (a named hook whose `Stop` lists its handler directly) | `PreToolUse` (the pre-tool check, below) and `Stop` (a `PostToolUse` hook's output does not reach agy's model); a `SessionStart` handler warns when `discipline` is missing (below) | `{"decision": "continue", "reason": <report>}`, which re-enters the loop with the report as a system message |
 | Qwen Code | `.qwen/settings.json` | `PostToolUse` (`write_file`, `edit`) and `Stop` | exit 2, the report on stderr (Claude Code's contract) |
-| OpenCode | `.opencode/plugins/discipline.js` | a plugin on `tool.execute.after` for `edit`, `write`, `apply_patch` | the plugin appends the report to the tool's output; `hook run --agent opencode` exits 1 with the report on stdout |
+| OpenCode | `.opencode/plugins/discipline.js` | a plugin on `tool.execute.before` (the pre-tool check, below) and `tool.execute.after` for `edit`, `write`, `apply_patch` | the plugin appends the report to the tool's output; `hook run --agent opencode` exits 1 with the report on stdout |
 
 **Check timeouts.** The files for agy, Qwen Code and Copilot CLI give each check a timeout, after which the agent kills it: 300 s for agy's `Stop`, 120 s for the others. `hook install --timeout <seconds>` writes a longer one (or a shorter one, for an agent that should not wait) for those agents, the Copilot user-level file included, and is refused for the others. A hook's own check recognises a file with a longer timeout as generated; a timeout below the default is reported, since it can kill the hook before it answers.
 
@@ -991,6 +1015,10 @@ Loop guards at the end of a turn: Claude Code, Codex, Copilot CLI and Qwen Code 
 
 Live sessions (Claude Code 2.1, Copilot CLI 1.0, OpenCode 1.18, agy 1.2): in each, an agent asked to delete a test's assertions received the finding from the installed hook and restored them. Those sessions corrected two installed files (agy's `Stop` shape, Copilot's `apply_patch` edits); the recorded payloads are pinned in `src/hook.rs`'s tests. The Codex, Cursor and Qwen Code contracts are read from each tool's documentation (the module header of `src/hook.rs` cites the pages) and have not been run against a live session.
 
+
+**Several agents in one repository: leases and the ref guard.** Agents that share a repository usually work in separate git worktrees. Git refuses to check a branch out twice, but it does not stop one worktree from moving a branch another session is working on: a rebase with `--update-refs`, `branch -f` or `reset`. `discipline lease take --agent <agent> --session <id> [--branch <b>]...` records the claim in the common git directory, where every worktree sees it and nothing is committed. The claim lasts for a time-to-live (`--ttl`, default 7200 s), and taking it again refreshes it. `lease list` shows every claim, and `lease check --branch <b>` exits 1 when another worktree's live lease holds `<b>`. `discipline lease install-guard` adds a `reference-transaction` git hook that aborts any ref update moving such a branch, from any agent or a plain shell, and names the holder. A claim moves only when it is released, goes stale, or is taken with `lease take --steal`, and a steal is always reported. The leases and the guard are cooperative: they stop sessions stepping on each other by mistake. Deleting the lease file, or running git with hooks off, gets around them.
+
+**Refusing an edit before it runs.** `discipline hook run --agent <agent> --event pre-tool` reads the agent's pre-tool payload on stdin. An edit into another worktree of the repository, into a worktree another live session leases, or into `scope-confinement`'s `forbidden_paths` is refused in that agent's deny shape (the table below), before the file changes. An edit outside the repository, a read and a shell command pass. An edit whose target it cannot read, and a check it cannot make, are refused. `--observe` logs to `<git dir>/discipline/hook-observe.log` and lets the call through. `hook install` writes this entry for Claude Code (`PreToolUse`, the edit tools), Copilot CLI (`preToolUse`), agy (`PreToolUse`) and OpenCode (`tool.execute.before`), in observe mode with `--observe`. Each generated file was run live with its agent, and an edit into another worktree was refused while one in its own worktree was not. Without `discipline` on `PATH` the entry lets the call through. Codex and Qwen Code get no entry until their contracts are observed live, and the user-level Copilot hook (`--user`) gets none until the check honours `--if-configured`. A file an earlier release generated gains the entry with `hook install --upgrade`. This repository's own hook files run the installed release, so they gain it with the first release that has it.
 
 **What each agent can block before a tool runs.** `hook install` writes no pre-tool hook yet (docs/ROADMAP.md, Phase 13). The contracts a pre-tool check would use, recorded live on 2026-09-28 unless the row says otherwise. The payloads and deny answers are in `tests/fixtures/pretool/`, and `tests/test_pretool_fixtures.rs` pins the fields:
 

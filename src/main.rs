@@ -127,6 +127,7 @@ fn run_command(command: Commands) -> Result<bool> {
         }
         Commands::Bench(args) => discipline::guards::perf::paired_ratio::cli_bench(args),
         Commands::Doctor(args) => doctor(args),
+        Commands::Lease(args) => lease(args),
     }
 }
 
@@ -1260,6 +1261,157 @@ fn baseline(mut args: BaselineArgs) -> Result<bool> {
     }
 }
 
+fn lease(args: discipline::cli::LeaseArgs) -> Result<bool> {
+    use discipline::cli::LeaseCommand;
+    use discipline::lease::{now, open, Lease};
+    let (store, here) = open(Path::new("."))?;
+    let t = now();
+    match args.command {
+        LeaseCommand::Take(a) => {
+            let branches = if a.branches.is_empty() {
+                vec![here.branch.clone().ok_or_else(|| {
+                    anyhow::anyhow!("no branch is checked out here; name one with --branch")
+                })?]
+            } else {
+                a.branches
+            };
+            let taken = store.take(
+                &here.key,
+                Lease {
+                    agent: a.agent,
+                    session: a.session,
+                    worktree: here.root.display().to_string(),
+                    branches,
+                    taken_at: t,
+                    heartbeat: t,
+                    ttl_secs: a.ttl,
+                },
+                t,
+                a.steal,
+            )?;
+            for (other, branch) in &taken.stolen {
+                eprintln!("lease: took `{branch}` from worktree `{other}` (--steal)");
+            }
+            println!(
+                "lease: worktree `{}` holds {} for {} (live {}s without a refresh)",
+                here.key,
+                taken.lease.branches.join(", "),
+                taken.lease.agent,
+                taken.lease.ttl_secs
+            );
+            Ok(true)
+        }
+        LeaseCommand::Release => {
+            if store.release(&here.key)? {
+                println!("lease: released worktree `{}`", here.key);
+            } else {
+                println!("lease: worktree `{}` held no lease", here.key);
+            }
+            Ok(true)
+        }
+        LeaseCommand::List(a) => {
+            let all = store.list()?;
+            if a.json {
+                let rows: Vec<serde_json::Value> = all
+                    .iter()
+                    .map(|(k, l)| {
+                        let mut v = serde_json::to_value(l).unwrap_or_default();
+                        v["key"] = serde_json::json!(k);
+                        v["live"] = serde_json::json!(l.is_live(t));
+                        v["here"] = serde_json::json!(*k == here.key);
+                        v
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if all.is_empty() {
+                println!("lease: no leases");
+            } else {
+                for (k, l) in &all {
+                    println!(
+                        "{:<8} {}{:<24} {:<14} {}  heartbeat {}s ago",
+                        if l.is_live(t) { "live" } else { "stale" },
+                        if *k == here.key { "*" } else { " " },
+                        k,
+                        l.agent,
+                        l.branches.join(","),
+                        t - l.heartbeat
+                    );
+                }
+            }
+            Ok(true)
+        }
+        LeaseCommand::InstallGuard => {
+            let repo = discipline::gitctx::discover_repository(".")?;
+            let hooks = match repo
+                .config()
+                .ok()
+                .and_then(|c| c.get_path("core.hooksPath").ok())
+            {
+                Some(p) if p.is_absolute() => p,
+                Some(p) => here.root.join(p),
+                None => repo.commondir().join("hooks"),
+            };
+            let path = hooks.join("reference-transaction");
+            match std::fs::read_to_string(&path) {
+                Ok(existing) if existing.contains(discipline::lease::GUARD_MARKER) => {
+                    println!("lease: the guard is already installed at {}", path.display());
+                    return Ok(true);
+                }
+                Ok(_) => anyhow::bail!(
+                    "{} already exists and is not the lease guard; add `discipline lease guard \"$1\"` to it (when $1 is `prepared`, a non-zero exit aborts the update)",
+                    path.display()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            std::fs::create_dir_all(&hooks)?;
+            std::fs::write(&path, discipline::lease::guard_hook())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            println!("lease: installed the guard at {}", path.display());
+            Ok(true)
+        }
+        LeaseCommand::Guard(a) => {
+            if a.state != "prepared" {
+                return Ok(true);
+            }
+            let mut stdin = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin)?;
+            let refused = discipline::lease::refused_updates(&store, &here.key, &stdin, t)?;
+            for r in &refused {
+                eprintln!(
+                    "discipline lease guard: `{}` is leased by worktree `{}` ({} session {}, heartbeat {}s ago); this worktree (`{}`) may not move it. Hand the work over to that session, or take the branch with `discipline lease take --branch {} --steal`.",
+                    r.branch,
+                    r.holder,
+                    r.lease.agent,
+                    if r.lease.session.is_empty() { "-" } else { &r.lease.session },
+                    t - r.lease.heartbeat,
+                    here.key,
+                    r.branch
+                );
+            }
+            Ok(refused.is_empty())
+        }
+        LeaseCommand::Check(a) => match store.holder(&a.branch, &here.key, t)? {
+            None => Ok(true),
+            Some((other, l)) => {
+                eprintln!(
+                    "lease: `{}` is leased by worktree `{other}` ({} session {}, heartbeat {}s ago); hand the work over to that session, or take it with `discipline lease take --branch {} --steal`",
+                    a.branch,
+                    l.agent,
+                    if l.session.is_empty() { "-" } else { &l.session },
+                    t - l.heartbeat,
+                    a.branch
+                );
+                Ok(false)
+            }
+        },
+    }
+}
+
 fn doctor(args: discipline::cli::DoctorArgs) -> Result<bool> {
     use discipline::doctor::{run, DoctorInput};
     let git = GitCtx::open_whole_tree()?;
@@ -1401,8 +1553,11 @@ fn hook(args: discipline::cli::HookArgs) -> Result<bool> {
                     .read_to_string(&mut stdin)
                     .context("cannot read the hook payload on stdin")?;
             }
-            let out =
-                discipline::hook::run_with(a.agent, a.base, &stdin, a.if_configured, a.observe)?;
+            let out = if a.event == discipline::cli::HookEvent::PreTool {
+                discipline::pretool::run(a.agent, &stdin, a.observe)
+            } else {
+                discipline::hook::run_with(a.agent, a.base, &stdin, a.if_configured, a.observe)?
+            };
             print!("{}", out.stdout);
             eprint!("{}", out.stderr);
             std::io::stdout()

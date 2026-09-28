@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH discipline 1  "discipline 0.14.4" 
+.TH discipline 1  "discipline 0.15.0-rc.2" 
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH NAME
@@ -627,7 +627,7 @@ Check the change so far and answer in the agent\*(Aqs hook contract (reads the h
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .PP
-\fBdiscipline hook run\fR <\fB\-\-agent\fR> [\fB\-b\fR|\fB\-\-base\fR] [\fB\-\-if\-configured\fR] [\fB\-\-observe\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIFILES\fR] 
+\fBdiscipline hook run\fR <\fB\-\-agent\fR> [\fB\-b\fR|\fB\-\-base\fR] [\fB\-\-if\-configured\fR] [\fB\-\-observe\fR] [\fB\-\-event\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fIFILES\fR] 
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .PP
@@ -666,6 +666,19 @@ Pass silently unless the working directory is in a git repository with a discipl
 .TP
 \fB\-\-observe\fR
 Observe mode: run the check but never block; what would have blocked is said on stderr and appended to <git dir>/discipline/hook\-observe.log
+.TP
+\fB\-\-event\fR \fI<EVENT>\fR [default: check]
+The hook event: `pre\-tool` checks the tool call on stdin before it runs (an edit into another worktree, into a worktree another session leases, or into forbidden_paths is refused); the default checks the change so far
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+check: After an edit or at the end of a turn: check the change so far
+.IP \(bu 2
+pre\-tool: Before a tool runs: refuse an edit outside this session\*(Aqs worktree
+.RE
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
@@ -893,6 +906,117 @@ json
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
+.SS "discipline lease"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+Claim this worktree\*(Aqs branches for one agent session, so other worktrees\*(Aq sessions do not move them (kept in the common git directory, never committed)
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBdiscipline lease\fR [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBOPTIONS\fR
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SS "discipline lease take"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+Take or refresh this worktree\*(Aqs lease. A branch another worktree\*(Aqs live lease claims is refused unless \-\-steal
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBdiscipline lease take\fR [\fB\-\-branch\fR] [\fB\-\-agent\fR] [\fB\-\-session\fR] [\fB\-\-ttl\fR] [\fB\-\-steal\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBOPTIONS\fR
+.TP
+\fB\-\-branch\fR \fI<BRANCHES>\fR
+A branch to claim (repeatable; default: the branch checked out here)
+.TP
+\fB\-\-agent\fR \fI<AGENT>\fR [default: unknown]
+The agent working here (claude\-code, copilot, agy, ...)
+.TP
+\fB\-\-session\fR \fI<SESSION>\fR [default: ]
+The agent\*(Aqs session id
+.TP
+\fB\-\-ttl\fR \fI<TTL>\fR [default: 7200]
+Seconds the lease stays live without a refresh
+.TP
+\fB\-\-steal\fR
+Take branches another worktree\*(Aqs live lease claims, removing them from that lease (it is said, never silent)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SS "discipline lease release"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+Remove this worktree\*(Aqs lease
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBdiscipline lease release\fR [\fB\-h\fR|\fB\-\-help\fR] 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBOPTIONS\fR
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SS "discipline lease list"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+List every worktree\*(Aqs lease and whether it is live
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBdiscipline lease list\fR [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBOPTIONS\fR
+.TP
+\fB\-\-json\fR
+Print the leases as JSON
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SS "discipline lease check"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+Whether a branch is claimed by another worktree\*(Aqs live lease. Exit 0 = free (or ours), 1 = claimed by another worktree, 2 = could not check
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBdiscipline lease check\fR <\fB\-\-branch\fR> [\fB\-h\fR|\fB\-\-help\fR] 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBOPTIONS\fR
+.TP
+\fB\-\-branch\fR \fI<BRANCH>\fR
+The branch to check
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.SS "discipline lease install-guard"
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+Install the reference\-transaction git hook that refuses a branch update another worktree\*(Aqs live lease claims (an existing hook is never rewritten)
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBdiscipline lease install\-guard\fR [\fB\-h\fR|\fB\-\-help\fR] 
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.PP
+\fBOPTIONS\fR
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
 .SH EXIT STATUS
 .TP
 .B 0
@@ -921,4 +1045,4 @@ Gate reference: https://orieg.github.io/discipline/
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
 .SH VERSION
-v0.14.4
+v0.15.0\-rc.2

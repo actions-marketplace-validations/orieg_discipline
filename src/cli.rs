@@ -45,6 +45,8 @@ pub enum Commands {
     Bench(BenchArgs),
     /// Check that the repository and its platform enforce discipline: workflows, CODEOWNERS, branch protection. Exit 0 = healthy, 1 = a failing check, 2 = could not check
     Doctor(DoctorArgs),
+    /// Claim this worktree's branches for one agent session, so other worktrees' sessions do not move them (kept in the common git directory, never committed)
+    Lease(LeaseArgs),
 }
 
 #[derive(Args, Debug)]
@@ -97,6 +99,7 @@ impl Commands {
             Commands::Explain(_) => "explain",
             Commands::Bench(_) => "bench",
             Commands::Doctor(_) => "doctor",
+            Commands::Lease(_) => "lease",
         }
     }
 }
@@ -149,6 +152,68 @@ pub struct HookArgs {
     pub command: HookCommand,
 }
 
+#[derive(Args, Debug)]
+pub struct LeaseArgs {
+    #[command(subcommand)]
+    pub command: LeaseCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LeaseCommand {
+    /// Take or refresh this worktree's lease. A branch another worktree's live lease claims is refused unless --steal
+    Take(LeaseTakeArgs),
+    /// Remove this worktree's lease
+    Release,
+    /// List every worktree's lease and whether it is live
+    List(LeaseListArgs),
+    /// Whether a branch is claimed by another worktree's live lease. Exit 0 = free (or ours), 1 = claimed by another worktree, 2 = could not check
+    Check(LeaseCheckArgs),
+    /// Install the reference-transaction git hook that refuses a branch update another worktree's live lease claims (an existing hook is never rewritten)
+    InstallGuard,
+    /// The reference-transaction hook's body: reads the updates on stdin and exits 1, aborting the transaction, when one moves a branch another worktree's live lease claims
+    #[command(hide = true)]
+    Guard(LeaseGuardArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LeaseGuardArgs {
+    /// The transaction state git passes (prepared, committed, aborted); only `prepared` is checked
+    pub state: String,
+}
+
+#[derive(Args, Debug)]
+pub struct LeaseTakeArgs {
+    /// A branch to claim (repeatable; default: the branch checked out here)
+    #[arg(long = "branch")]
+    pub branches: Vec<String>,
+    /// The agent working here (claude-code, copilot, agy, ...)
+    #[arg(long, default_value = "unknown")]
+    pub agent: String,
+    /// The agent's session id
+    #[arg(long, default_value = "")]
+    pub session: String,
+    /// Seconds the lease stays live without a refresh
+    #[arg(long, default_value_t = crate::lease::DEFAULT_TTL_SECS)]
+    pub ttl: u64,
+    /// Take branches another worktree's live lease claims, removing them from that lease (it is said, never silent)
+    #[arg(long)]
+    pub steal: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LeaseListArgs {
+    /// Print the leases as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LeaseCheckArgs {
+    /// The branch to check
+    #[arg(long)]
+    pub branch: String,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum HookCommand {
     /// Check the change so far and answer in the agent's hook contract (reads the hook payload on stdin)
@@ -175,9 +240,22 @@ pub struct HookRunArgs {
     #[arg(long)]
     pub observe: bool,
 
+    /// The hook event: `pre-tool` checks the tool call on stdin before it runs (an edit into another worktree, into a worktree another session leases, or into forbidden_paths is refused); the default checks the change so far
+    #[arg(long, value_enum, default_value_t = HookEvent::Check)]
+    pub event: HookEvent,
+
     /// Files an agent appends to the command (Aider's lint-cmd); ignored, the whole change is checked
     #[arg(hide = true, trailing_var_arg = true)]
     pub files: Vec<String>,
+}
+
+/// Which hook event `hook run` answers.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookEvent {
+    /// After an edit or at the end of a turn: check the change so far
+    Check,
+    /// Before a tool runs: refuse an edit outside this session's worktree
+    PreTool,
 }
 
 #[derive(Args, Debug)]
