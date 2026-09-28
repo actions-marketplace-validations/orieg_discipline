@@ -148,6 +148,15 @@ findings! {
     ISSUE_REFERENCE_NOT_FOUND = ["issue-link"], "issue-reference-not-found", "Tracking Issue Reference Not Found", Same;
     ISSUE_REFERENCE_CLOSED = ["issue-link"], "issue-reference-closed", "Tracking Issue Reference Closed", Same;
 
+    // ratified-paths
+    PROTECTED_PATH_UNRATIFIED = ["ratified-paths"], "protected-path-unratified", "Protected Path Edited Without Ratification", Same;
+    NEVER_RATIFIABLE_PATH_CHANGED = ["ratified-paths"], "never-ratifiable-path-changed", "Never-Ratifiable Path Edited", Same;
+    RATIFICATION_ENTRY_MALFORMED = ["ratified-paths"], "ratification-entry-malformed", "Ratification Entry Refused", Same;
+    RATIFICATION_NAMES_NEVER_RATIFIABLE_PATH = ["ratified-paths"], "ratification-names-never-ratifiable-path", "Ratification Names A Never-Ratifiable Path", Same;
+    RATIFICATION_AUTHOR_NOT_ACCEPTED = ["ratified-paths"], "ratification-author-not-accepted", "Ratification Author Not Accepted", Same;
+    RATIFICATION_COMMENT_EDITED = ["ratified-paths"], "ratification-comment-edited", "Ratification Comment Not Accepted", Same;
+    RATIFICATION_OUTSIDE_WINDOW = ["ratified-paths"], "ratification-outside-window", "Ratification Outside Its Window", Same;
+
     // citation-metadata
     CFF_INVALID = ["citation-metadata"], "cff-invalid", "CITATION.cff Is Not Valid", Same;
     ZENODO_INVALID = ["citation-metadata"], "zenodo-invalid", "Zenodo Metadata Is Not Valid", Same;
@@ -237,6 +246,7 @@ findings! {
     VERIFICATION_JOB_MASKED_BY_CONDITION = ["ci-integrity"], "verification-job-masked-by-condition", "Verification Job Masked By Condition", Was("Conditional Masking on Verification Job");
     UNPINNED_ACTION = ["ci-integrity"], "unpinned-action", "Unpinned Third-Party Action", Same;
     DISCIPLINE_ACTION_POLICY_FROM = ["ci-integrity"], "discipline-action-policy-from-weakened", "Discipline Action Weakened (policy_from)", Same;
+    DISCIPLINE_VERSION_CHANGED = ["ci-integrity"], "discipline-version-changed", "Discipline Version Chosen By The Change", Same;
     DISCIPLINE_ACTION_DISABLE_INPUT = ["ci-integrity"], "discipline-action-disable-input", "Discipline Action Weakened (disable input)", Same;
     DISCIPLINE_ACTION_ADVISORY = ["ci-integrity"], "discipline-action-advisory", "Discipline Action Weakened (advisory: true)", Same;
     DISCIPLINE_ACTION_FAIL_ON_WARNINGS_OFF = ["ci-integrity"], "discipline-action-fail-on-warnings-off", "Discipline Action Weakened (fail_on_warnings: false)", Same;
